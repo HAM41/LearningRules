@@ -42,6 +42,9 @@ def reward(X, Y) -> np.ndarray:
 
     return r
 
+def effective_reward(X):
+    return np.sum([sign(y) * reward(X, y) for y in [0,1]])
+
 def cumulative_gaussian(x, sigma=1.0, mu=0.0):
     return 0.5*(1+sp.special.erf((x-mu)/(sigma*np.sqrt(2))))
 
@@ -158,8 +161,10 @@ class QLearningModel():
         return X, Y, m, Vs
     
 class PolicyGradientGLM():
-    def __init__(self, alpha):
-        self.alpha = alpha 
+    def __init__(self, alpha, sigma_w):
+        self.alpha = alpha
+        self.sigma_w = sigma_w
+        self.w_0 = np.array([0.0, 1.0]) # bias = 0, weight = 1
 
     def emission_likelihood(self, w, x, y=1):
         '''p(y | w, x), default p(y=1 | w, x)'''
@@ -169,21 +174,40 @@ class PolicyGradientGLM():
         return p
 
     def decision(self, w, x):
-        p_R = self.emission_likelihood(y=1, w, x)
+        p_R = self.emission_likelihood(w, x)
         y = np.random.binomial(1, p=p_R)
         return y
 
-    def policy_gradient_vectorized(self, w, x):
+    def policy_gradient(self, w, x):
         p_R = self.emission_likelihood(w, x, y=1)
-        p_L = 1 - p_R 
+        return effective_reward(x) * np.outer(np.multiply(p_R, 1 - p_R), vec(x)).squeeze()
+    
+    def update_weights(self, w, x):
+        learning_rule = self.alpha * self.policy_gradient(w, x)
+        update_noise = self.sigma_w * np.random.randn(*w.shape)
+        return w + learning_rule + update_noise
+    
+    def simulate(self, T):
+        # Generate stimulus uniformly from range
+        x_range = np.linspace(-1,1,12)
+        X = np.random.choice(x_range, size=T, replace=True)
 
-        x = unvec(vx)
-        effective_reward = np.sum([
-            eps(y) * reward(x, y) for y in [0,1]
-        ])
-        return effective_reward * p_R * p_L * np.array(vx)
+        # Encode percept and define initial values
+        w = self.w_0
 
+        # Generate decisions and weights sequentially
+        Y, Ws = [], []
+        for t in range(T):
+            y = self.decision(w, X[t])
+            Y.append(y)
+            Ws.append(w)
+
+            w = self.update_weights(w, x=X[t])
+        return X, Y, Ws
 
 if __name__=='__main__':
-    true_model = QLearningModel(sigma=0.3, alpha=0.5, softmax=True)
-    X, Y, m, Vs = true_model.simulate(10)
+    # true_model = QLearningModel(sigma=0.3, alpha=0.5, softmax=True)
+    # X, Y, m, Vs = true_model.simulate(10)
+
+    true_model = PolicyGradientGLM(sigma_w=0.1, alpha=0.1)
+    X, Y, Ws = true_model.simulate(10)
