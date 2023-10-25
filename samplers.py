@@ -1,20 +1,31 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from models import QLearningModel, PolicyGradientGLM
+from models import QLearningModel, GLMLearn
 import scipy as sp
 
-def bootstrap_filter(N, inputs, data, model):
+def bootstrap_filter(N: int, X, Y, model):
     '''
-    returns N samples, equally weighted, to evaluate integrals
+    Bootstrap Filter / Particle filtering algorithm from [1], along with likelihood evaluation,
+    specifically tailored for models regression models from X to Y.
+    [1]: An Introduction to Sequential Monte Carlo. A. Doucet, N. de Freitas, N. Gordon.
+    
+    Args:
+        N: int. Number of particles
+        X: array, (T,). Inputs
+        Y: array, (T,). Data/emissions. 
+        model: needs to implement some form of forward method, and some for of emission likelihood
+    Returns:
+        z_history: List (T,), each element containing N samples, 
+            Equally weighted latent samples to evalute integrals with MC methods
+        loglik: scalar,
+            Estimate of the marginal log-likelihood
     '''
-    X = inputs
-    Y = data
     T = len(X)
 
     z_history = []
-
     loglik_running_estimate = 0.
-    if isinstance(model, PolicyGradientGLM):
+
+    if isinstance(model, GLMLearn):
         z_t = np.stack([model.w_0 for _ in range(N)])
     else:
         z_t = None
@@ -26,7 +37,7 @@ def bootstrap_filter(N, inputs, data, model):
         #   {tilde z_t^i, 1/N} is an approximation to p(z_t|y_{1:t-1})
         if isinstance(model, QLearningModel):
             tilde_z_t = model.forward(t, N, z_t, X[t-1], Y[t], X[t])
-        elif isinstance(model, PolicyGradientGLM):
+        elif isinstance(model, GLMLearn):
             tilde_z_t = model.update_weights(z_t, X[t])
 
         # 2. Evaluate importance weights p(y_t | xhat_t, V_t)
@@ -34,36 +45,33 @@ def bootstrap_filter(N, inputs, data, model):
         if isinstance(model, QLearningModel):
             tilde_V_t, tilde_m_t = tilde_z_t
             tilde_w_t = model.emission_likelihood(y=Y[t], m=tilde_m_t, V=tilde_V_t) 
-        elif isinstance(model, PolicyGradientGLM):
+        elif isinstance(model, GLMLearn):
             tilde_w_t = model.emission_likelihood(y=Y[t], w=tilde_z_t, x=X[t]) 
         else:
             raise NotImplementedError
         
-        # Normalize
-        if np.sum(tilde_w_t) == 0.:
-            choices = np.arange(N)
-        else:
-            normalized_tilde_w_t = sp.special.softmax(tilde_w_t)
-            # normalized_tilde_w_t = tilde_w_t/np.sum(tilde_w_t)
-            # if np.sum(tilde_w_t) == 0.:
-            #     xhat_history.append(tilde_xhat_t)
-            #     V_history.append(tilde_V_t)
-            #     continue
+        # 3. Resampling step: 
 
-            # 3. Resampling step: 
-            #   Resample with replacement N particles according the importance weights
+        # 3.1. Calculate importance weights
+        if np.sum(tilde_w_t) == 0.:
+            choices = np.arange(N) # Nil likelihood, so no resampling
+        else:
+            # Normalize importance weights
+            normalized_tilde_w_t = sp.special.softmax(tilde_w_t) # Softmax
+            # normalized_tilde_w_t = tilde_w_t/np.sum(tilde_w_t) # L1 normalization
+
             choices = np.random.choice(N, size=N, p=normalized_tilde_w_t)
+        
+        # 3.2. Resample with replacement N particles according the importance weights
         if isinstance(model, QLearningModel):
-            # print(tilde_m_t.shape)
             V_t = np.array([list(tilde_V_t[:,c]) for c in choices]).T
             m_t = np.array([tilde_m_t[c] for c in choices])
             z_t = V_t, m_t
-        elif isinstance(model, PolicyGradientGLM):
+        elif isinstance(model, GLMLearn):
             z_t = np.array([tilde_z_t[c] for c in choices])
         else:
             raise NotImplementedError
 
-        # print(np.mean([emission_likelihood(y=Y[t], x_hat=_xhat, V=_V, sigma=sigma, softmax=softmax) for _xhat, _V in zip(xhat_t, V_t)]))
 
         # lik_estimate = np.mean([emission_likelihood(y=Y[t], x_hat=_xhat, V=_V, sigma=sigma, softmax=softmax) for _xhat, _V in zip(xhat_t, V_t)])
         lik_estimate = np.mean(tilde_w_t)
@@ -77,7 +85,7 @@ if __name__=='__main__':
     true_alpha = 0.05
     true_sigma = 0.01
     # true_model = QLearningModel(sigma=true_sigma, alpha=true_alpha, softmax=True)
-    true_model = PolicyGradientGLM(sigma_w=true_sigma, alpha=true_alpha)
+    true_model = GLMLearn(sigma_w=true_sigma, alpha=true_alpha)
 
     T = 200
     N = 500
@@ -92,7 +100,7 @@ if __name__=='__main__':
         _vals = []
         for alpha in alpha_range:
             # model = QLearningModel(sigma=true_sigma, alpha=alpha, softmax=True)
-            model = PolicyGradientGLM(sigma_w=true_sigma, alpha=alpha)
+            model = GLMLearn(sigma_w=true_sigma, alpha=alpha)
 
             _, log_liks = bootstrap_filter(N, inputs=X, data=Y, model=model)
             _vals.append(log_liks)
