@@ -4,10 +4,17 @@ import scipy as sp
 def sigmoid(x, w=1.0, b=0.0, g=1.0):
     return 1/(1+np.exp(-g*(w*x + b)))
 
+def safe_sigmoid(X, threshold=80.):
+    return np.where(X > threshold, np.ones_like(X), np.where(X < -threshold, np.zeros_like(X), sigmoid(X)))
+
 def vec(x):
-    return np.array([1,x])
+    if isinstance(x, float):
+        return np.array([1,x])
+    else:
+        return np.concatenate(([1.0],x))
+    
 def unvec(x):
-    return x[1]
+    return x[1:]
 
 def sign(y) -> float:
     y = float(y)
@@ -52,9 +59,9 @@ def Phi(x):
     return cumulative_gaussian(x)
 
 class QLearningModel():
-    def __init__(self, sigma, alpha, softmax):
-        self.sigma = sigma
+    def __init__(self, alpha, sigma, softmax):
         self.alpha = alpha
+        self.sigma = sigma
 
         self.V_init = 0.2       # Initialize values at 0.2
 
@@ -160,17 +167,18 @@ class QLearningModel():
             V = self.update_values(V, x=X[t], y=Y[t], m=m[t])
         return X, Y, m, Vs
     
-class PolicyGradientGLM():
-    def __init__(self, alpha, sigma_w):
+class GLMLearn():
+    def __init__(self, alpha, sigma_w, learning_rule='policy_gradient'):
         self.alpha = alpha
         self.sigma_w = sigma_w
         self.w_0 = np.array([0.0, 1.0]) # bias = 0, weight = 1
+        self.learning_rule = learning_rule
 
     def emission_likelihood(self, w, x, y=1):
         '''p(y | w, x), default p(y=1 | w, x)'''
         vx = vec(x)
         LM = np.dot(w, vx)
-        p = sigmoid(sign(y) * LM)
+        p = safe_sigmoid(sign(y) * LM)
         return p
 
     def decision(self, w, x):
@@ -182,10 +190,42 @@ class PolicyGradientGLM():
         p_R = self.emission_likelihood(w, x, y=1)
         return effective_reward(x) * np.outer(np.multiply(p_R, 1 - p_R), vec(x)).squeeze()
     
-    def update_weights(self, w, x):
-        learning_rule = self.alpha * self.policy_gradient(w, x)
+    def reinforce(self, w, x, y):
+        p = self.emission_likelihood(w, x, y)
+        return reward(x,y) * np.outer(1-p, vec(x)).squeeze()
+
+    def update_weights(self, w, x, y=None):
+        if self.learning_rule == 'reinforce':
+            learning_signal = self.alpha * self.reinforce(w, x, y)
+        else: # use Policy gradient
+            learning_signal = self.alpha * self.policy_gradient(w, x)
         update_noise = self.sigma_w * np.random.randn(*w.shape)
-        return w + learning_rule + update_noise
+        return w + learning_signal + update_noise
+    
+    def dynamics_loglikelihood(self, z_next, z_prev, inputs, data):
+        '''log p(z_t | z_{t-1})
+        In our case, the latents z are the GLM weights w
+        '''
+        if self.learning_rule == 'reinforce':
+            learning_signal = self.alpha * self.reinforce(z_prev, inputs, data)
+        else: # use Policy gradient
+            learning_signal =self.alpha * self.policy_gradient(z_prev, inputs)
+        mean = z_prev + learning_signal
+        std = self.sigma_w
+        N = mean.shape[0]
+        log_lik = lambda z: sp.stats.multivariate_normal.pdf(z, mean=mean, cov=std*np.eye(N))
+        return log_lik(z_next)
+    
+    def complete_data_loglikelihood(self, data, Z, inputs):
+        T = len(data)
+        #! Handle initial
+
+        L_CD = 0.
+        for t in range(1,T):
+            log_pzz = self.dynamics_loglikelihood(Z[t], Z[t-1], inputs[t-1], data[t-1])
+            log_pyz = np.log(self.emission_likelihood(Z[t], inputs[t], data[t]))
+            L_CD += log_pzz + log_pyz
+        return L_CD
     
     def simulate(self, T):
         # Generate stimulus uniformly from range
@@ -202,12 +242,14 @@ class PolicyGradientGLM():
             Y.append(y)
             Ws.append(w)
 
-            w = self.update_weights(w, x=X[t])
+            w = self.update_weights(w, x=X[t], y=Y[t])
         return X, Y, Ws
 
 if __name__=='__main__':
     # true_model = QLearningModel(sigma=0.3, alpha=0.5, softmax=True)
     # X, Y, m, Vs = true_model.simulate(10)
 
-    true_model = PolicyGradientGLM(sigma_w=0.1, alpha=0.1)
+    true_model = GLMLearn(sigma_w=0.1, alpha=1.0)
     X, Y, Ws = true_model.simulate(10)
+
+    t = 5
