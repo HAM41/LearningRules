@@ -59,13 +59,14 @@ def Phi(x):
     return cumulative_gaussian(x)
 
 class QLearningModel():
-    def __init__(self, alpha, sigma, softmax):
+    def __init__(self, alpha: float, sigma: float, beta: float=1.0, softmax: bool=True) -> None:
         self.alpha = alpha
         self.sigma = sigma
+        self.beta = beta        # "Inverse temperature" parameter for the softmax decision.
 
         self.V_init = 0.2       # Initialize values at 0.2
 
-        # Use softmax for stochastic decisions 
+        # Use softmax for stochastic decisions. Defaults to True.
         self.softmax = softmax
 
     def p_R(self, m):
@@ -88,7 +89,7 @@ class QLearningModel():
             # Compute Q values for each state
             Qs = np.stack([np.multiply(1-p_R, V_L), np.multiply(p_R, V_R)])
             
-            p = sp.special.softmax(Qs, axis=0)
+            p = sp.special.softmax(self.beta * Qs, axis=0)
             if p.ndim > 1:
                 Y = np.array([np.random.binomial(1, p=_p[1]) for _p in p]).astype(int)
             else:
@@ -168,10 +169,13 @@ class QLearningModel():
         return X, Y, m, Vs
     
 class GLMLearn():
-    def __init__(self, alpha, sigma_w, learning_rule='policy_gradient'):
+    def __init__(self, 
+                 alpha: float, sigma_w: np.ndarray, w_init: np.ndarray=np.array([0.0, 1.0]), 
+                 learning_rule='policy_gradient'
+                 ) -> None:
         self.alpha = alpha
         self.sigma_w = sigma_w
-        self.w_0 = np.array([0.0, 1.0]) # bias = 0, weight = 1
+        self.w_0 = w_init # np.array([0.0, 1.0]) # bias = 0, weight = 1
         self.learning_rule = learning_rule
 
     def emission_likelihood(self, w, x, y=1):
@@ -199,7 +203,7 @@ class GLMLearn():
             learning_signal = self.alpha * self.reinforce(w, x, y)
         else: # use Policy gradient
             learning_signal = self.alpha * self.policy_gradient(w, x)
-        update_noise = self.sigma_w * np.random.randn(*w.shape)
+        update_noise = np.multiply(self.sigma_w, np.random.randn(*w.shape))
         return w + learning_signal + update_noise
     
     def dynamics_loglikelihood(self, z_next, z_prev, inputs, data):
@@ -213,7 +217,7 @@ class GLMLearn():
         mean = z_prev + learning_signal
         std = self.sigma_w
         N = mean.shape[0]
-        log_lik = lambda z: sp.stats.multivariate_normal.pdf(z, mean=mean, cov=std*np.eye(N))
+        log_lik = lambda z: sp.stats.multivariate_normal.pdf(z, mean=mean, cov=np.multiply(std, np.eye(N)))
         return log_lik(z_next)
     
     def complete_data_loglikelihood(self, data, Z, inputs):
@@ -238,10 +242,12 @@ class GLMLearn():
         # Generate decisions and weights sequentially
         Y, Ws = [], []
         for t in range(T):
+            # Sample
             y = self.decision(w, X[t])
             Y.append(y)
             Ws.append(w)
 
+            # Update
             w = self.update_weights(w, x=X[t], y=Y[t])
         return X, Y, Ws
 
