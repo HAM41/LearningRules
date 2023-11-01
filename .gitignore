@@ -1,3 +1,7 @@
+# Folders
 figures/
 __pycache__/
 data/
+
+# Files
+learningrules.ipynb

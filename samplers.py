@@ -22,23 +22,25 @@ def bootstrap_filter(N: int, X, Y, model):
     '''
     T = len(X)
 
+
     z_history = []
     loglik_running_estimate = 0.
-
-    if isinstance(model, GLMLearn):
-        z_t = np.stack([model.w_0 for _ in range(N)])
-    else:
-        z_t = None
-
+    
     for t in range(0,T):
 
         # 1. Prediction step : tilde z_t ~ p(z_t | z_{t-1})
         #   Sample proposal N particles from previous N particles
         #   {tilde z_t^i, 1/N} is an approximation to p(z_t|y_{1:t-1})
-        if isinstance(model, QLearningModel):
-            tilde_z_t = model.forward(t, N, z_t, X[t-1], Y[t], X[t])
-        elif isinstance(model, GLMLearn):
-            tilde_z_t = model.update_weights(z_t, X[t])
+        if t == 0:
+            if isinstance(model, GLMLearn):
+                tilde_z_t = np.stack([model.w_0 for _ in range(N)])
+            else:
+                tilde_z_t = np.stack([model.V_init for _ in range(N)])
+        else:
+            if isinstance(model, QLearningModel):
+                tilde_z_t = model.forward(t, N, z_t, X[t-1], Y[t], X[t])
+            elif isinstance(model, GLMLearn):
+                tilde_z_t = model.update_weights(z_t, x=X[t-1], y=Y[t-1])
 
         # 2. Evaluate importance weights p(y_t | xhat_t, V_t)
         #   {tilde z_t^i, tilde w^i} is an approximation to p(z_t|y_{1:t})
@@ -75,7 +77,11 @@ def bootstrap_filter(N: int, X, Y, model):
 
         # lik_estimate = np.mean([emission_likelihood(y=Y[t], x_hat=_xhat, V=_V, sigma=sigma, softmax=softmax) for _xhat, _V in zip(xhat_t, V_t)])
         lik_estimate = np.mean(tilde_w_t)
-        loglik_running_estimate += np.log(lik_estimate)
+        if np.linalg.norm(lik_estimate) == 0.:
+            loglik_running_estimate = np.nan
+            break
+        else:
+            loglik_running_estimate += np.log(lik_estimate)
 
         z_history.append(z_t)
 
