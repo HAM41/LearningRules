@@ -29,7 +29,7 @@ def reward(X, Y) -> np.ndarray:
     Returns reward 
         r(x,y)= 1. if (x < 0 and y == 0) or (x > 0 and y==1)
                 0. else
-    for all x,y pairs in X, Y
+    for all (x,y) pairs in X, Y
     '''
     X = np.array(X)
     Y = np.array(Y).astype(int)
@@ -50,12 +50,19 @@ def reward(X, Y) -> np.ndarray:
     return r
 
 def effective_reward(X):
-    return np.sum([sign(y) * reward(X, y) for y in [0,1]])
+    r'''
+    Returns effective reward R(x) = \sum_y r(x,y) sign(y), for all x in X. 
+    Output `RX` is of same shape as `X`.
+    '''
+    RX = np.sum([sign(y) * reward(X, y) for y in [0,1]])
+    return RX
 
 def cumulative_gaussian(x, sigma=1.0, mu=0.0):
+    '''Cumulative distribution function for the Gaussian distribution.'''
     return 0.5*(1+sp.special.erf((x-mu)/(sigma*np.sqrt(2))))
 
 def Phi(x):
+    '''Cumulative distribution function for the standard Gaussian.'''
     return cumulative_gaussian(x)
 
 class QLearningModel():
@@ -169,6 +176,13 @@ class QLearningModel():
         return X, Y, m, Vs
     
 class GLMLearn():
+    r'''
+    GLM-Learn behavioral model. 
+
+    This models decision (`y`) making as a Bernoulli-GLM with regressors `x` and weigths `w`. 
+    The weights evolve according to a learning rule. We consider here either the REINFORCE 
+        learning rule, or a closed-form policy gradient update.
+    '''
     def __init__(self, 
                  alpha: float, sigma_w: np.ndarray, w_init: np.ndarray=np.array([0.0, 1.0]), 
                  learning_rule='policy_gradient'
@@ -186,7 +200,7 @@ class GLMLearn():
         return p
 
     def decision(self, w, x):
-        p_R = self.emission_likelihood(w, x)
+        p_R = self.emission_likelihood(w, x, y=1.0)
         y = np.random.binomial(1, p=p_R)
         return y
 
