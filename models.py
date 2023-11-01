@@ -4,6 +4,9 @@ import jax.scipy as jsp
 import numpy as np
 import scipy as sp
 
+import os
+os.environ['JAX_PLATFORMS']='cpu'
+
 # def sigmoid(x, w=1.0, b=0.0, g=1.0):
 #     return 1/(1+np.exp(-g*(w*x + b)))
 def sigmoid(x):
@@ -194,13 +197,16 @@ class GLMLearn():
         learning rule, or a closed-form policy gradient update.
     '''
     def __init__(self, 
-                 alpha: float, sigma_w: np.ndarray, w_init: np.ndarray=np.array([0.0, 1.0]), 
-                 learning_rule='policy_gradient'
+                 alpha: float, sigma_w: jnp.ndarray, w_init_mean: jnp.ndarray=np.array([0.0, 1.0]), 
+                 learning_rule: str='policy_gradient', seed: int=0,
                  ) -> None:
         self.alpha = alpha
         self.sigma_w = sigma_w
-        self.w_0 = w_init # np.array([0.0, 1.0]) # bias = 0, weight = 1
         self.learning_rule = learning_rule
+
+        # Initialization for latents and key for reproducibility
+        self.key = jax.random.PRNGKey(seed)
+        self.w_init_mean = w_init_mean
 
     def emission_likelihood(self, w, x, y=1):
         '''p(y | w, x), default p(y=1 | w, x)'''
@@ -211,7 +217,7 @@ class GLMLearn():
 
     def decision(self, w, x):
         p_R = self.emission_likelihood(w, x, y=1.0)
-        y = jax.random.bernoulli(key, p_R).astype(int)
+        y = jax.random.bernoulli(self.key, p_R).astype(int)
         return y
 
     def policy_gradient(self, w, x):
@@ -227,22 +233,38 @@ class GLMLearn():
             learning_signal = self.alpha * self.reinforce(w, x, y)
         else: # use Policy gradient
             learning_signal = self.alpha * self.policy_gradient(w, x)
-        update_noise = jax.random.normal(key, shape=w.shape)
+        update_noise = jax.random.normal(self.key, shape=w.shape)
         update_noise = jnp.multiply(self.sigma_w, update_noise)
         return w + learning_signal + update_noise
     
-    def dynamics_loglikelihood(self, z_next, z_prev, inputs, data):
-        '''log p(z_t | z_{t-1})
+    def initial_loglikelihood(self, z_0, w_init_mean=None | jnp.ndarray):
+        """log p(z_0)"""
+        if w_init_mean is None:
+            w_init_mean = self.w_init_mean
+        if w_init_mean.shape == (1,):
+            log_lik = lambda z: jsp.stats.norm.logpdf(z, loc=w_init_mean, scale=1.0)
+        else:
+            N = w_init_mean.shape[0]
+            log_lik = lambda z: jsp.stats.multivariate_normal.logpdf(z, mean=w_init_mean, cov=np.eye(N))
+        return log_lik(z_0)
+    
+    def dynamics_loglikelihood(self, z_next, z_prev, inputs, data, alpha=None, sigma_w=None):
+        '''p(z_t | z_{t-1})
         In our case, the latents z are the GLM weights w
         '''
+        if alpha is None:
+            alpha = self.alpha
+        if sigma_w is None:
+            sigma_w = self.sigma_w
+
         if self.learning_rule == 'reinforce':
-            learning_signal = self.alpha * self.reinforce(z_prev, inputs, data)
+            learning_signal = alpha * self.reinforce(z_prev, inputs, data)
         else: # use Policy gradient
-            learning_signal =self.alpha * self.policy_gradient(z_prev, inputs)
+            learning_signal = alpha * self.policy_gradient(z_prev, inputs)
         mean = z_prev + learning_signal
-        cov = jnp.multiply(self.sigma_w, jnp.eye(N))
         N = mean.shape[0]
-        log_lik = lambda z: jsp.stats.multivariate_normal.pdf(z, mean=mean, cov=cov)
+        cov = jnp.multiply(sigma_w, jnp.eye(N))
+        log_lik = lambda z: jsp.stats.multivariate_normal.logpdf(z, mean=mean, cov=cov)
         return log_lik(z_next)
     
     def complete_data_loglikelihood(self, data, Z, inputs):
@@ -259,10 +281,10 @@ class GLMLearn():
     def simulate(self, T):
         # Generate stimulus uniformly from range
         x_range = jnp.linspace(-1,1,12)
-        X = jax.random.choice(key, x_range, shape=(T,), replace=True)
+        X = jax.random.choice(self.key, x_range, shape=(T,), replace=True)
 
         # Encode percept and define initial values
-        w = self.w_0
+        w = self.w_init_mean + jax.random.normal(self.key, shape=self.w_init_mean.shape) # w_0 ~ N(w_init, 1)
 
         # Generate decisions and weights sequentially
         Y, Ws = [], []
@@ -278,13 +300,14 @@ class GLMLearn():
 
 if __name__=='__main__':
     # Seed for reproducibility
-    key = jax.random.PRNGKey(0)
+    seed = 0
+    key = jax.random.PRNGKey(seed)
 
     # true_model = QLearningModel(sigma=0.3, alpha=0.5, softmax=False)
     # X, Y, m, Vs = true_model.simulate(10)
     # print(X, Y, m, Vs)
 
-    true_model = GLMLearn(sigma_w=0.1, alpha=1.0)
+    true_model = GLMLearn(sigma_w=0.1, alpha=1.0, seed=seed)
     X, Y, Ws = true_model.simulate(10)
     print(X, Y, Ws)
 

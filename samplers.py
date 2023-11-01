@@ -3,7 +3,10 @@ import matplotlib.pyplot as plt
 from models import QLearningModel, GLMLearn
 import scipy as sp
 
-def bootstrap_filter(N: int, X, Y, model):
+import jax
+import jax.numpy as jnp
+
+def bootstrap_filter(N: int, X, Y, model, seed=0):
     '''
     Bootstrap Filter / Particle filtering algorithm from [1], along with likelihood evaluation,
     specifically tailored for models regression models from X to Y.
@@ -21,7 +24,7 @@ def bootstrap_filter(N: int, X, Y, model):
             Estimate of the marginal log-likelihood
     '''
     T = len(X)
-
+    key = jax.random.PRNGKey(seed)
 
     z_history = []
     loglik_running_estimate = 0.
@@ -33,9 +36,10 @@ def bootstrap_filter(N: int, X, Y, model):
         #   {tilde z_t^i, 1/N} is an approximation to p(z_t|y_{1:t-1})
         if t == 0:
             if isinstance(model, GLMLearn):
-                tilde_z_t = np.stack([model.w_0 for _ in range(N)])
+                tilde_z_t = jnp.tile(model.w_init_mean[jnp.newaxis, :],(N,1)) + jax.random.normal(key, shape=(N, model.w_init_mean.shape[0]))
+                # tilde_z_t = np.stack([model.w_0 for _ in range(N)])
             else:
-                tilde_z_t = np.stack([model.V_init for _ in range(N)])
+                tilde_z_t = jnp.stack([model.V_init for _ in range(N)])
         else:
             if isinstance(model, QLearningModel):
                 tilde_z_t = model.forward(t, N, z_t, X[t-1], Y[t], X[t])
@@ -55,7 +59,7 @@ def bootstrap_filter(N: int, X, Y, model):
         # 3. Resampling step: 
 
         # 3.1. Calculate importance weights
-        if np.sum(tilde_w_t) == 0.:
+        if jnp.sum(tilde_w_t) == 0.:
             choices = np.arange(N) # Nil likelihood, so no resampling
         else:
             # Normalize importance weights
