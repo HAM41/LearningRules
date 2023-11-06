@@ -11,8 +11,9 @@ import models
 import sys
 import jax 
 import jax.numpy as jnp
-import os
-os.environ['JAX_PLATFORMS']='cpu'
+import jax.scipy as jsp
+# import os
+# os.environ['JAX_PLATFORMS']='cpu'
 
 def grid_search(X, Y, N_bootstrap=200):
     alpha_range = np.concatenate(([0.0], np.exp(np.linspace(-7,1,10))))
@@ -109,27 +110,35 @@ def grad_log_joint(model, Z, X, Y, theta):
     grad_log_joint = jnp.zeros_like(theta)
     log_joint = 0.
 
+    # Initial t=0 joint likelihood terms
+    # Dynamics
     log_pz0 = lambda _theta: model.initial_loglikelihood(Z[0], w_init_mean=_theta[:2])
     log_pz0_val, log_pz0_grad = jax.value_and_grad(log_pz0)(theta)
-    
-    log_joint += log_pz0_val
-    grad_log_joint += log_pz0_grad
 
+    # Emissions
+    log_pyz0_val = jnp.log(model.emission_likelihood(Z[0], X[0], Y[0]))
+    grad_log_pyz0_val = jnp.zeros_like(grad_log_joint)
+    
+    log_joint += log_pz0_val + log_pyz0_val
+    grad_log_joint += log_pz0_grad + grad_log_pyz0_val
+
+    # Loop over time steps 
     for t in range(1,T):
+        # Dynamics
         log_pzz = lambda _theta: model.dynamics_loglikelihood(
             Z[t], Z[t-1], X[t-1], Y[t-1], 
             alpha=jnp.exp(_theta[-2]), sigma_w=jnp.exp(_theta[-1])
             )
         log_pzz_val, log_pzz_grad = jax.value_and_grad(log_pzz)(theta)
-        # log_pzz = grad_log_pzz(X[t-1], Y[t-1])
 
-        # Emissions do not depend on parameters
+        # Emissions, do not depend on hyper-parameters
         log_pyz_val = jnp.log(model.emission_likelihood(Z[t], X[t], Y[t]))
         grad_log_pyz_val = jnp.zeros_like(grad_log_joint)
 
-        # Both dynamics and emissions do not depend w_init. Set 0th entry to 0.
+        # Update value and gradient of log joint
         log_joint += log_pzz_val + log_pyz_val
         grad_log_joint += log_pzz_grad + grad_log_pyz_val
+
     return log_joint, grad_log_joint
 
 def test_grad_loglik():
@@ -140,33 +149,69 @@ def test_grad_loglik():
     print(true_theta)
 
     T = 200
-    X, Y, Z = true_model.simulate(T)
+    X, Y, _ = true_model.simulate(T)
 
+
+    theta_init = jnp.array([0.0, 1.0, -2.0, -2.0])
     model = models.GLMLearn(sigma_w=true_sigma, alpha=true_alpha, seed=seed)
-    z_hist, _ = samplers.bootstrap_filter(5, X, Y, model)
+    # model = models.GLMLearn(sigma_w=np.exp(theta_init[-1]), alpha=np.exp(theta_init[-2]), w_init_mean=theta_init[:2], seed=seed)
+    z_hist, _l = samplers.bootstrap_filter(10, X, Y, model)
     SMC_Z_samples = jnp.transpose(jnp.stack(z_hist), (1,0,2))
 
-    theta_init = jnp.array([0.0, 1.0, -1.0, -1.0])
+    # theta_init = jnp.array([true_model.w_init_mean[0], true_model.w_init_mean[1], np.log(true_alpha), np.log(true_sigma)])
     theta = theta_init
     learning_rate = 1e-02
-    for _ in range(100):
+    for k in range(1,100):
+        # learning_rate = np.power(k, -2/3)
+        # model = models.GLMLearn(sigma_w=jnp.exp(theta[-1]), alpha=jnp.exp(theta[-2]), w_init_mean=theta[:2], seed=seed)
+        # print(_l)
         # for Z in SMC_Z_samples:
         #     val, grad = grad_log_joint(model, Z, X, Y, theta)
         #     print(val, grad)
         # Apply grad_log_joint to all elements of SMC_Z_samples in parallel
-        values, gradients = jax.vmap(lambda Z: grad_log_joint(model, Z, X, Y, theta))(SMC_Z_samples)
+        # values, gradients = jax.vmap(lambda Z: grad_log_joint(model, Z, X, Y, theta))(SMC_Z_samples)
+        values, gradients = jax.vmap(lambda Z: model.joint_loglikelihood(X, Y, Z, theta))(SMC_Z_samples)
 
         value = jnp.mean(values)
         grad = jnp.mean(gradients, axis=0)
+        # print(gradients)
         # # Extract values and gradients from the results
         # values = jnp.array([result[0] for result in results])
         # gradients = jnp.array([result[1] for result in results])
         # print(values, gradients)
         theta += learning_rate * grad
         print(value, theta)
+        # print(values, theta, gradients)
     
     # print(grad_log_joint(model, Z, X, Y, theta=np.array([0.0, 1.0, -1.0, -1.0])))#, theta=jnp.array([0.01, 0.01, 0.01, 0.01])))
 
+def test_grad_SMC():
+    true_alpha = 0.05
+    true_sigma = 0.01
+    true_model = models.GLMLearn(sigma_w=true_sigma, alpha=true_alpha, seed=seed)
+    true_theta = true_model.w_init_mean, np.log(true_alpha), np.log(true_sigma)
+    print(true_theta)
+
+    T = 100
+    X, Y, _ = true_model.simulate(T)
+
+    def loglik(log_theta):
+        model = models.GLMLearn(sigma_w=jnp.exp(log_theta[0]), alpha=jnp.exp(log_theta[1]), seed=seed)
+        _, value = samplers.bootstrap_filter(1000, X, Y, model)
+        return value
+    
+    # print(jsp.optimize.minimize(loglik, jnp.array([-1., -1.]), method='Powell'))
+    
+    log_theta_init = jnp.array([-1., -1.])
+    theta = log_theta_init
+    for _ in range(10):
+        gradient = jnp.asarray(jax.grad(loglik)(theta))
+        gradient = jnp.multiply(jnp.exp(theta), gradient)
+        theta = theta + 0.01 * gradient
+        print(theta)
+    # print(jax.grad(loglik)([-1., -1.]))
+    print(np.multiply(np.exp([-1., -1.]), jax.grad(loglik)([-1., -1.])))
+    
 def test_simplex():
     # Generate dummy data
     true_alpha = 0.05
@@ -199,4 +244,26 @@ def test_simplex():
 if __name__=='__main__':
     seed = 0
     key = jax.random.PRNGKey(seed)
-    test_grad_loglik()
+    # test_grad_loglik()
+    test_grad_SMC()
+
+    # true_alpha = 0.05
+    # true_sigma = 0.01
+    # T = 100
+    # true_model = models.GLMLearn(sigma_w=true_sigma, alpha=true_alpha)
+    # X, Y, _ = true_model.simulate(T)
+
+    # z_hist, _l = samplers.bootstrap_filter(10, X, Y, true_model)
+    # # print(jnp.stack(z_hist).shape)
+    # print(jnp.stack(z_hist)[:,0,:].shape)
+    # # SMC_Z_samples = jnp.array([jnp.stack(z_hist)[:,i,:] for i in range(10)])
+    # # sys.exit()
+    # # SMC_Z_samples = jnp.stack(z_hist)
+    # SMC_Z_samples = jnp.transpose(jnp.stack(z_hist), (1,0,2))
+    # print(SMC_Z_samples.shape)
+    # values, gradients = jax.vmap(
+    #     lambda Z: true_model.joint_loglikelihood(
+    #         X, Y, Z, jnp.array([true_model.w_init_mean[0], true_model.w_init_mean[1], np.log(true_alpha), np.log(true_sigma)])
+    #         ))(SMC_Z_samples)
+    
+    # print(_l, values)

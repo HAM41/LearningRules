@@ -3,6 +3,7 @@ import jax.numpy as jnp
 import jax.scipy as jsp
 import numpy as np
 import scipy as sp
+from typing import Tuple
 
 import os
 os.environ['JAX_PLATFORMS']='cpu'
@@ -297,6 +298,58 @@ class GLMLearn():
             # Update
             w = self.update_weights(w, x=X[t], y=Y[t])
         return X, jnp.stack(Y), jnp.stack(Ws)
+    
+    def joint_loglikelihood(
+            self, X: jnp.ndarray, Y: jnp.ndarray, Z: jnp.ndarray, theta: jnp.ndarray
+            ) -> Tuple[float, jnp.ndarray]:
+        '''
+        Returns the value and the gradient of joint log likelihood of the data (X,Y) and
+        latent variables Z, `log p(X, Y, Z | theta)`, evaluated for the parameters `theta`. 
+
+        Args:
+            X: array, stimulus, of shape (T, _)
+            Y: array, decisions, of shape (T,)
+            Z: array, latent variables, of shape (T, _)
+            theta: array, the parameters {w_init, log_alpha, log_sigma}, of shape (M,)
+
+        Returns: 
+            log_joint: float, value of log joint likelihood
+            grad_log_joint: np.ndarray (M,), gradient of log joint likelihood
+        '''
+        T = len(Y)
+        grad_log_joint = jnp.zeros_like(theta)
+        log_joint = 0.
+
+        # Initial t=0 joint likelihood terms
+        # Dynamics
+        log_pz0 = lambda _theta: self.initial_loglikelihood(Z[0], w_init_mean=_theta[:2])
+        log_pz0_val, log_pz0_grad = jax.value_and_grad(log_pz0)(theta)
+
+        # Emissions
+        log_pyz0_val = jnp.log(self.emission_likelihood(Z[0], X[0], Y[0]))
+        grad_log_pyz0_val = jnp.zeros_like(grad_log_joint)
+        
+        log_joint += log_pz0_val + log_pyz0_val
+        grad_log_joint += log_pz0_grad + grad_log_pyz0_val
+
+        # Loop over time steps 
+        for t in range(1,T):
+            # Dynamics
+            log_pzz = lambda _theta: self.dynamics_loglikelihood(
+                Z[t], Z[t-1], X[t-1], Y[t-1], 
+                alpha=jnp.exp(_theta[-2]), sigma_w=jnp.exp(_theta[-1])
+                )
+            log_pzz_val, log_pzz_grad = jax.value_and_grad(log_pzz)(theta)
+
+            # Emissions, do not depend on hyper-parameters
+            log_pyz_val = jnp.log(self.emission_likelihood(Z[t], X[t], Y[t]))
+            grad_log_pyz_val = jnp.zeros_like(grad_log_joint)
+
+            # Update value and gradient of log joint
+            log_joint += log_pzz_val + log_pyz_val
+            grad_log_joint += log_pzz_grad + grad_log_pyz_val
+
+        return log_joint, grad_log_joint
 
 if __name__=='__main__':
     # Seed for reproducibility
