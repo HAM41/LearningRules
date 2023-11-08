@@ -23,18 +23,14 @@ def vec(x):
     else:
         if x.ndim > 1:
             raise NotImplementedError
-        return jnp.concatenate(([1.0],x))
+        return jnp.concatenate((jnp.array([1.0]),x))
     
 def unvec(x):
     return x[1:]
 
-def sign(y) -> float:
-    y = float(y)
-    assert y in [0., 1.], 'y must be 0 or 1'
-    if y==0.:
-        return -1.
-    elif y==1:
-        return 1.
+def sign(y):
+    y = jnp.asarray(y).astype(bool)
+    return jnp.where(y == 0., -1., 1.)
 
 def reward(X, Y) -> np.ndarray:
     '''
@@ -268,24 +264,16 @@ class GLMLearn():
         log_lik = lambda z: jsp.stats.multivariate_normal.logpdf(z, mean=mean, cov=cov)
         return log_lik(z_next)
     
-    def complete_data_loglikelihood(self, data, Z, inputs):
-        T = len(data)
-        #! Handle initial
+    def sample(self, T, key=None):
+        if key is None:
+            key = self.key
 
-        L_CD = 0.
-        for t in range(1,T):
-            log_pzz = self.dynamics_loglikelihood(Z[t], Z[t-1], inputs[t-1], data[t-1])
-            log_pyz = jnp.log(self.emission_likelihood(Z[t], inputs[t], data[t]))
-            L_CD += log_pzz + log_pyz
-        return L_CD
-    
-    def simulate(self, T):
         # Generate stimulus uniformly from range
         x_range = jnp.linspace(-1,1,12)
-        X = jax.random.choice(self.key, x_range, shape=(T,), replace=True)
+        X = jax.random.choice(key, x_range, shape=(T,), replace=True)
 
         # Encode percept and define initial values
-        w = self.w_init_mean + jax.random.normal(self.key, shape=self.w_init_mean.shape) # w_0 ~ N(w_init, 1)
+        w = self.w_init_mean + jax.random.normal(key, shape=self.w_init_mean.shape) # w_0 ~ N(w_init, 1)
 
         # Generate decisions and weights sequentially
         Y, Ws = [], []
@@ -299,20 +287,20 @@ class GLMLearn():
             w = self.update_weights(w, x=X[t], y=Y[t])
         return X, jnp.stack(Y), jnp.stack(Ws)
     
-    def joint_loglikelihood(
+    def value_and_grad_joint(
             self, X: jnp.ndarray, Y: jnp.ndarray, Z: jnp.ndarray, theta: jnp.ndarray
             ) -> Tuple[float, jnp.ndarray]:
         '''
-        Returns the value and the gradient of joint log likelihood of the data (X,Y) and
+        Returns the value and the gradient of model joint forthe data (X,Y) and
         latent variables Z, `log p(X, Y, Z | theta)`, evaluated for the parameters `theta`. 
 
-        Args:
-            X: array, stimulus, of shape (T, _)
-            Y: array, decisions, of shape (T,)
-            Z: array, latent variables, of shape (T, _)
+        parameters:
+            X: array, stimulus, of shape (T, input_dim)
+            Y: array, decisions, of shape (T, output_dim)
+            Z: array, latent variables, of shape (T, latent_dim)
             theta: array, the parameters {w_init, log_alpha, log_sigma}, of shape (M,)
 
-        Returns: 
+        returns: 
             log_joint: float, value of log joint likelihood
             grad_log_joint: np.ndarray (M,), gradient of log joint likelihood
         '''
@@ -337,19 +325,66 @@ class GLMLearn():
             # Dynamics
             log_pzz = lambda _theta: self.dynamics_loglikelihood(
                 Z[t], Z[t-1], X[t-1], Y[t-1], 
-                alpha=jnp.exp(_theta[-2]), sigma_w=jnp.exp(_theta[-1])
+                alpha=_theta[-2], sigma_w=_theta[-1]
                 )
             log_pzz_val, log_pzz_grad = jax.value_and_grad(log_pzz)(theta)
 
             # Emissions, do not depend on hyper-parameters
-            log_pyz_val = jnp.log(self.emission_likelihood(Z[t], X[t], Y[t]))
-            grad_log_pyz_val = jnp.zeros_like(grad_log_joint)
+            log_pyz = lambda _theta: jnp.log(self.emission_likelihood(Z[t], X[t], Y[t]))
+            log_pyz_val, log_pyz_grad = jax.value_and_grad(log_pyz)(theta)
+            assert jnp.linalg.norm(log_pyz_grad) == 0. # test
+
+            # log_pyz_val = jnp.log(self.emission_likelihood(Z[t], X[t], Y[t]))
+            # grad_log_pyz_val = jnp.zeros_like(grad_log_joint)
 
             # Update value and gradient of log joint
             log_joint += log_pzz_val + log_pyz_val
-            grad_log_joint += log_pzz_grad + grad_log_pyz_val
+            grad_log_joint += log_pzz_grad + log_pyz_grad
 
         return log_joint, grad_log_joint
+
+    def log_joint(
+            self, X: jnp.ndarray, Y: jnp.ndarray, Z: jnp.ndarray, theta: jnp.ndarray
+            ) -> float:
+        '''
+        Evaluate `log p(X, Y, Z | theta)`. 
+
+        parameters:
+            X: array, stimulus, of shape (T, input_dim)
+            Y: array, decisions, of shape (T, output_dim)
+            Z: array, latent variables, of shape (T, latent_dim)
+            theta: array, the parameters {w_init, log_alpha, log_sigma}, of shape (M,)
+
+        returns: 
+            log_joint: float, value of log joint likelihood
+            grad_log_joint: np.ndarray (M,), gradient of log joint likelihood
+        '''
+        T = len(Y)
+        w_init = theta[:2]
+        alpha = jnp.exp(theta[-2])
+        sigma = jnp.exp(theta[-1])
+
+        # Initial t=0 joint likelihood terms
+        # Dynamics
+        log_pz0 = self.initial_loglikelihood(Z[0], w_init_mean=w_init)
+
+        # Emissions
+        log_pyz0 = jnp.log(self.emission_likelihood(Z[0], X[0], Y[0]))
+
+        log_joint = log_pz0 + log_pyz0
+
+        # Loop over time steps 
+        for t in range(1,T):
+            # Dynamics
+            log_pzz = self.dynamics_loglikelihood(Z[t], Z[t-1], X[t-1], Y[t-1], alpha=alpha, sigma_w=sigma)
+
+            # Emissions
+            log_pyz = jnp.log(self.emission_likelihood(Z[t], X[t], Y[t]))
+
+            # Update value and gradient of log joint
+            log_joint += log_pzz + log_pyz
+
+        return log_joint
 
 if __name__=='__main__':
     # Seed for reproducibility
