@@ -152,18 +152,22 @@ def test_grad_loglik():
     X, Y, _ = true_model.simulate(T)
 
 
-    theta_init = jnp.array([0.0, 1.0, -2.0, -2.0])
+    theta_init = jnp.array([0.0, 1.0, -3.0, -3.0])
     model = models.GLMLearn(sigma_w=true_sigma, alpha=true_alpha, seed=seed)
     # model = models.GLMLearn(sigma_w=np.exp(theta_init[-1]), alpha=np.exp(theta_init[-2]), w_init_mean=theta_init[:2], seed=seed)
-    z_hist, _l = samplers.bootstrap_filter(10, X, Y, model)
-    SMC_Z_samples = jnp.transpose(jnp.stack(z_hist), (1,0,2))
+    SMC_Z_samples, _l = samplers.bootstrap_filter(100, X, Y, model)
+    # print(_l)
+
+    theta = theta_init
+    # values, gradients = jax.vmap(lambda Z: model.joint_loglikelihood(X, Y, Z, theta))(SMC_Z_samples)
+    # print(values, gradients)
+    # sys.exit()
 
     # theta_init = jnp.array([true_model.w_init_mean[0], true_model.w_init_mean[1], np.log(true_alpha), np.log(true_sigma)])
-    theta = theta_init
-    learning_rate = 1e-02
+    learning_rate = 1e-03
     for k in range(1,100):
         # learning_rate = np.power(k, -2/3)
-        # model = models.GLMLearn(sigma_w=jnp.exp(theta[-1]), alpha=jnp.exp(theta[-2]), w_init_mean=theta[:2], seed=seed)
+        model = models.GLMLearn(sigma_w=jnp.exp(theta[-1]), alpha=jnp.exp(theta[-2]), w_init_mean=theta[:2], seed=seed)
         # print(_l)
         # for Z in SMC_Z_samples:
         #     val, grad = grad_log_joint(model, Z, X, Y, theta)
@@ -187,30 +191,78 @@ def test_grad_loglik():
 
 def test_grad_SMC():
     true_alpha = 0.05
-    true_sigma = 0.01
+    true_sigma = 0.02
     true_model = models.GLMLearn(sigma_w=true_sigma, alpha=true_alpha, seed=seed)
     true_theta = true_model.w_init_mean, np.log(true_alpha), np.log(true_sigma)
     print(true_theta)
 
-    T = 100
+    T = 500
     X, Y, _ = true_model.simulate(T)
 
     def loglik(log_theta):
         model = models.GLMLearn(sigma_w=jnp.exp(log_theta[0]), alpha=jnp.exp(log_theta[1]), seed=seed)
-        _, value = samplers.bootstrap_filter(1000, X, Y, model)
+        _, value = samplers.bootstrap_filter(100, X, Y, model)
         return value
     
     # print(jsp.optimize.minimize(loglik, jnp.array([-1., -1.]), method='Powell'))
-    
-    log_theta_init = jnp.array([-1., -1.])
-    theta = log_theta_init
-    for _ in range(10):
-        gradient = jnp.asarray(jax.grad(loglik)(theta))
-        gradient = jnp.multiply(jnp.exp(theta), gradient)
-        theta = theta + 0.01 * gradient
-        print(theta)
-    # print(jax.grad(loglik)([-1., -1.]))
-    print(np.multiply(np.exp([-1., -1.]), jax.grad(loglik)([-1., -1.])))
+
+    # # Define the function that returns the gradient at a given point
+    # def gradient_func(log_theta):
+    #     # Compute the gradient of the log-likelihood function at the given point
+    #     value, gradient = jax.value_and_grad(jax.grad_and_value(loglik)(log_theta))
+    #     # Scale the gradient by the exponential of the log_theta values
+    #     gradient = jnp.divide(gradient, jnp.exp(log_theta))
+    #     return gradient
+
+    # Define the range of log_theta values to plot
+    log_sigmas = np.linspace(-5, 0, 10)
+    log_alphas = np.linspace(-5, 0, 10)
+    # sigmas, alphas = np.meshgrid(_sigmas, _alphas)
+    # log_theta_values = np.stack([sigmas, alphas], axis=-1)
+
+    entries =[]
+    for log_sigma in log_sigmas:
+        for log_alpha in log_alphas:
+            value, gradient = jax.value_and_grad(loglik)([log_sigma, log_alpha])
+            entry = {'log_sigma': log_sigma, 'log_alpha': log_alpha, 'value': float(value), 'gradient_x': float(gradient[0]), 'gradient_y': float(gradient[1])}
+            entries.append(entry)
+
+    df = pd.DataFrame(entries)
+    df_heatmap = df.pivot(columns="log_sigma", index="log_alpha", values="value")
+    print(df)
+
+    fig, axs = plt.subplots(figsize=[8,4], ncols=2, constrained_layout=True)
+    sns.heatmap(df_heatmap, ax=axs[0])
+    axs[1].quiver(df['log_sigma'].values, df['log_alpha'].values, df['gradient_x'].values, df['gradient_y'].values)
+    plt.savefig('figures/grad_field_pd.png', dpi=300)
+    plt.close()
+
+    # # Compute the gradient at each point in the range
+    # gradients = np.stack([gradient_func(log_theta) for log_theta in log_theta_values.reshape(-1, 2)], axis=0)
+    # values = np.stack([loglik(log_theta) for log_theta in log_theta_values.reshape(-1, 2)], axis=0)
+    # gradients = gradients.reshape(len(_sigmas), len(_alphas), 2)
+    # values = values.reshape(len(_alphas), len(_sigmas))
+
+    # # Plot the gradient field
+    # fig, axs = plt.subplots(figsize=[8,4], ncols=2, constrained_layout=True)
+    # axs[0].contourf(sigmas, alphas, values, levels=20)
+    # axs[1].quiver(sigmas, alphas, gradients[..., 0], gradients[..., 1])
+    # for ax in axs:
+    #     ax.set_xlabel('log(sigma_w)')
+    #     ax.set_ylabel('log(alpha)')
+    # plt.savefig('figures/grad_field.png', dpi=300)
+    # plt.close()
+
+    # log_theta_init = jnp.array([-1., -1.])
+    # theta = log_theta_init
+    # for _ in range(10):
+    #     gradient = jnp.asarray(jax.grad(loglik)(theta))
+    #     print(gradient)
+    #     gradient = jnp.multiply(jnp.exp(theta), gradient)
+    #     theta = theta + 0.01 * gradient
+    #     print(theta)
+    # # print(jax.grad(loglik)([-1., -1.]))
+    # print(np.multiply(np.exp([-1., -1.]), jax.grad(loglik)([-1., -1.])))
     
 def test_simplex():
     # Generate dummy data
@@ -244,8 +296,8 @@ def test_simplex():
 if __name__=='__main__':
     seed = 0
     key = jax.random.PRNGKey(seed)
-    # test_grad_loglik()
-    test_grad_SMC()
+    test_grad_loglik()
+    # test_grad_SMC()
 
     # true_alpha = 0.05
     # true_sigma = 0.01
