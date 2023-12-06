@@ -13,7 +13,7 @@ os.environ['JAX_PLATFORMS']='cpu'
 def sigmoid(x):
     return 0.5 * (jnp.tanh(x / 2) + 1)
 
-def safe_sigmoid(X, threshold=80.):
+def safe_sigmoid(X, threshold=100.):
     return jnp.where(X > threshold, jnp.ones_like(X), jnp.where(X < -threshold, jnp.zeros_like(X), sigmoid(X)))
 
 def vec(x):
@@ -108,7 +108,7 @@ class QLearningModel():
             
             p = jax.nn.softmax(self.beta * Qs, axis=0)
             if p.ndim > 1:
-                Y = np.array([np.random.binomial(1, p=_p[1]) for _p in p]).astype(int) #! jax
+                Y = np.array([np.random.binomial(1, p=_p[1]) for _p in p]).astype(int) #! make jax
             else:
                 Y = jax.random.bernoulli(key, p[1]).astype(int)
         else:
@@ -146,7 +146,21 @@ class QLearningModel():
             return p
         else:
             return jnp.array(y==jnp.argmax(Qs, axis=0), dtype=float)
-        
+
+    def joint_dynamics_loglikelihood(self, M, X, **params):
+        '''log p(m_{1:T} | x_{1:T})'''
+        pass
+
+    def joint_emission_loglikelihood(self, M, X, Y,  **params):
+        '''log p(y_{1:T} | m_{1:T}, x_{1:T})'''
+        pass
+
+    def log_joint(self, X, Y, M, **params):
+        '''log p(Y, M | X, theta)'''
+        log_pM = self.joint_dynamics_loglikelihood(M, X, **params)
+        log_pyM = self.joint_emission_loglikelihood(M, Y, X, **params)
+        return log_pyM + log_pM
+
     def forward(self, t, N_samples, prev_latent, X_prev, Y_prev, X):
         '''
         Treating the values V and the percept m as the latents
@@ -165,7 +179,7 @@ class QLearningModel():
             m = self.encode(X)
         return V, m
     
-    def simulate(self, T):
+    def sample(self, T):
         # Generate stimulus uniformly from range
         x_range = jnp.linspace(-1,1,12)
         X = jax.random.choice(key, x_range, shape=(T,), replace=True)
@@ -212,9 +226,14 @@ class GLMLearn():
         p = safe_sigmoid(sign(y) * LM)
         return p
 
-    def decision(self, w, x):
+    def decision(self, w, x, key=None):
+        if key is None:
+            self.key, subkey = jax.random.split(self.key)
+        else:
+            subkey = key
+
         p_R = self.emission_likelihood(w, x, y=1.0)
-        y = jax.random.bernoulli(self.key, p_R).astype(int)
+        y = jax.random.bernoulli(subkey, p_R).astype(int)
         return y
 
     def policy_gradient(self, w, x):
@@ -225,12 +244,17 @@ class GLMLearn():
         p = self.emission_likelihood(w, x, y)
         return reward(x,y) * jnp.outer(1-p, vec(x)).squeeze()
 
-    def update_weights(self, w, x, y=None):
+    def update_weights(self, w, x, y=None, key=None):
+        if key is None:
+            self.key, subkey = jax.random.split(self.key)
+        else:
+            subkey = key
+        
         if self.learning_rule == 'reinforce':
             learning_signal = self.alpha * self.reinforce(w, x, y)
         else: # use Policy gradient
             learning_signal = self.alpha * self.policy_gradient(w, x)
-        update_noise = jax.random.normal(self.key, shape=w.shape)
+        update_noise = jax.random.normal(subkey, shape=w.shape)
         update_noise = jnp.multiply(self.sigma_w, update_noise)
         return w + learning_signal + update_noise
     
@@ -239,10 +263,10 @@ class GLMLearn():
         if w_init_mean is None:
             w_init_mean = self.w_init_mean
         if w_init_mean.shape == (1,):
-            log_lik = lambda z: jsp.stats.norm.logpdf(z, loc=w_init_mean, scale=1.0)
+            log_lik = lambda z: jsp.stats.norm.logpdf(z, loc=w_init_mean, scale=0.1)
         else:
             N = w_init_mean.shape[0]
-            log_lik = lambda z: jsp.stats.multivariate_normal.logpdf(z, mean=w_init_mean, cov=np.eye(N))
+            log_lik = lambda z: jsp.stats.multivariate_normal.logpdf(z, mean=w_init_mean, cov=(0.1)**2 * np.eye(N))
         return log_lik(z_0)
     
     def dynamics_loglikelihood(self, z_next, z_prev, inputs, data, alpha=None, sigma_w=None):
@@ -260,108 +284,57 @@ class GLMLearn():
             learning_signal = alpha * self.policy_gradient(z_prev, inputs)
         mean = z_prev + learning_signal
         N = mean.shape[0]
-        cov = jnp.multiply(sigma_w, jnp.eye(N))
+        cov = jnp.multiply(jnp.square(sigma_w), jnp.eye(N))
         log_lik = lambda z: jsp.stats.multivariate_normal.logpdf(z, mean=mean, cov=cov)
         return log_lik(z_next)
     
     def sample(self, T, key=None):
         if key is None:
-            key = self.key
+            self.key, subkey = jax.random.split(self.key)
+        else:
+            subkey = key
+
+        subkey, init_key = jax.random.split(subkey)
 
         # Generate stimulus uniformly from range
         x_range = jnp.linspace(-1,1,12)
-        X = jax.random.choice(key, x_range, shape=(T,), replace=True)
+        X = jax.random.choice(init_key, x_range, shape=(T,), replace=True)
 
         # Encode percept and define initial values
-        w = self.w_init_mean + jax.random.normal(key, shape=self.w_init_mean.shape) # w_0 ~ N(w_init, 1)
+        w = self.w_init_mean + 0.1*jax.random.normal(init_key, shape=self.w_init_mean.shape) # w_0 ~ N(w_init, 0.1^2)
 
         # Generate decisions and weights sequentially
         Y, Ws = [], []
         for t in range(T):
+            subkey, decision_key, update_key = jax.random.split(subkey, num=3)
+
             # Sample
-            y = self.decision(w, X[t])
+            y = self.decision(w, X[t], key=decision_key)
             Y.append(y)
             Ws.append(w)
 
             # Update
-            w = self.update_weights(w, x=X[t], y=Y[t])
+            w = self.update_weights(w, x=X[t], y=Y[t], key=update_key)
         return X, jnp.stack(Y), jnp.stack(Ws)
-    
-    def value_and_grad_joint(
-            self, X: jnp.ndarray, Y: jnp.ndarray, Z: jnp.ndarray, theta: jnp.ndarray
-            ) -> Tuple[float, jnp.ndarray]:
-        '''
-        Returns the value and the gradient of model joint forthe data (X,Y) and
-        latent variables Z, `log p(X, Y, Z | theta)`, evaluated for the parameters `theta`. 
-
-        parameters:
-            X: array, stimulus, of shape (T, input_dim)
-            Y: array, decisions, of shape (T, output_dim)
-            Z: array, latent variables, of shape (T, latent_dim)
-            theta: array, the parameters {w_init, log_alpha, log_sigma}, of shape (M,)
-
-        returns: 
-            log_joint: float, value of log joint likelihood
-            grad_log_joint: np.ndarray (M,), gradient of log joint likelihood
-        '''
-        T = len(Y)
-        grad_log_joint = jnp.zeros_like(theta)
-        log_joint = 0.
-
-        # Initial t=0 joint likelihood terms
-        # Dynamics
-        log_pz0 = lambda _theta: self.initial_loglikelihood(Z[0], w_init_mean=_theta[:2])
-        log_pz0_val, log_pz0_grad = jax.value_and_grad(log_pz0)(theta)
-
-        # Emissions
-        log_pyz0_val = jnp.log(self.emission_likelihood(Z[0], X[0], Y[0]))
-        grad_log_pyz0_val = jnp.zeros_like(grad_log_joint)
-        
-        log_joint += log_pz0_val + log_pyz0_val
-        grad_log_joint += log_pz0_grad + grad_log_pyz0_val
-
-        # Loop over time steps 
-        for t in range(1,T):
-            # Dynamics
-            log_pzz = lambda _theta: self.dynamics_loglikelihood(
-                Z[t], Z[t-1], X[t-1], Y[t-1], 
-                alpha=_theta[-2], sigma_w=_theta[-1]
-                )
-            log_pzz_val, log_pzz_grad = jax.value_and_grad(log_pzz)(theta)
-
-            # Emissions, do not depend on hyper-parameters
-            log_pyz = lambda _theta: jnp.log(self.emission_likelihood(Z[t], X[t], Y[t]))
-            log_pyz_val, log_pyz_grad = jax.value_and_grad(log_pyz)(theta)
-            assert jnp.linalg.norm(log_pyz_grad) == 0. # test
-
-            # log_pyz_val = jnp.log(self.emission_likelihood(Z[t], X[t], Y[t]))
-            # grad_log_pyz_val = jnp.zeros_like(grad_log_joint)
-
-            # Update value and gradient of log joint
-            log_joint += log_pzz_val + log_pyz_val
-            grad_log_joint += log_pzz_grad + log_pyz_grad
-
-        return log_joint, grad_log_joint
 
     def log_joint(
             self, X: jnp.ndarray, Y: jnp.ndarray, Z: jnp.ndarray, theta: jnp.ndarray
             ) -> float:
         '''
-        Evaluate `log p(X, Y, Z | theta)`. 
+        Evaluate `log p(Y, Z | X, theta) = log p(y_{1:T}, z_{1:T} | x_{1:T}, theta)`. 
 
         parameters:
             X: array, stimulus, of shape (T, input_dim)
             Y: array, decisions, of shape (T, output_dim)
             Z: array, latent variables, of shape (T, latent_dim)
-            theta: array, the parameters {w_init, log_alpha, log_sigma}, of shape (M,)
+            theta: array of floats, the parameters {w_init, alpha, log_sigma}
 
         returns: 
             log_joint: float, value of log joint likelihood
-            grad_log_joint: np.ndarray (M,), gradient of log joint likelihood
         '''
         T = len(Y)
         w_init = theta[:2]
-        alpha = jnp.exp(theta[-2])
+        alpha = theta[-2]
         sigma = jnp.exp(theta[-1])
 
         # Initial t=0 joint likelihood terms
@@ -392,11 +365,11 @@ if __name__=='__main__':
     key = jax.random.PRNGKey(seed)
 
     # true_model = QLearningModel(sigma=0.3, alpha=0.5, softmax=False)
-    # X, Y, m, Vs = true_model.simulate(10)
+    # X, Y, m, Vs = true_model.sample(10)
     # print(X, Y, m, Vs)
 
     true_model = GLMLearn(sigma_w=0.1, alpha=1.0, seed=seed)
-    X, Y, Ws = true_model.simulate(10)
+    X, Y, Ws = true_model.sample(10)
     print(X, Y, Ws)
 
     t = 5
