@@ -7,7 +7,7 @@ from tqdm import tqdm
 import jax
 import jax.numpy as jnp
 
-def bootstrap_filter(N: int, X, Y, model, seed=0):
+def bootstrap_filter(N: int, X, Y, model, seed=0, return_history=True, R=None):
     '''
     Bootstrap Filter / Particle filtering algorithm from [1], along with likelihood evaluation,
     specifically tailored for models regression models from X to Y.
@@ -15,7 +15,7 @@ def bootstrap_filter(N: int, X, Y, model, seed=0):
     
     Args:
         N: int. Number of particles
-        X: array, (T,). Inputs
+        X: array, (T,M,). Inputs
         Y: array, (T,). Data/emissions. 
         model: needs to implement some form of forward method, and some for of emission likelihood
     Returns:
@@ -24,63 +24,71 @@ def bootstrap_filter(N: int, X, Y, model, seed=0):
         loglik: scalar,
             Estimate of the marginal log-likelihood
     '''
-    T = len(X)
+    if X.ndim == 1:
+        T = len(X)
+        M = 1
+    else:
+        T, M = X.shape
+    if R is None:
+        R = [None for _ in range(T)]
     key = jax.random.PRNGKey(seed)
 
     z_history = []
     loglik_running_estimate = 0.
     
     for t in tqdm(range(0,T), desc='Bootstrap filter'):
+        key, subkey = jax.random.split(key)
 
         # 1. Prediction step : tilde z_t ~ p(z_t | z_{t-1})
         #   Sample proposal N particles from previous N particles
         #   {tilde z_t^i, 1/N} is an approximation to p(z_t|y_{1:t-1})
         if t == 0:
-            if isinstance(model, GLMLearn):
-                tilde_z_t = jnp.tile(model.w_init_mean[jnp.newaxis, :],(N,1)) + jax.random.normal(key, shape=(N, model.w_init_mean.shape[0]))
+            # if isinstance(model, GLMLearn):
+            tilde_z_t = jax.random.normal(subkey, shape=(N, M+1,))
                 # tilde_z_t = np.stack([model.w_0 for _ in range(N)])
-            else:
-                tilde_z_t = jnp.stack([model.V_init for _ in range(N)])
+            # else:
+            #     tilde_z_t = jnp.stack([model.V_init for _ in range(N)])
         else:
-            if isinstance(model, QLearningModel):
-                tilde_z_t = model.forward(t, N, z_t, X[t-1], Y[t], X[t])
-            elif isinstance(model, GLMLearn):
-                tilde_z_t = model.update_weights(z_t, x=X[t-1], y=Y[t-1])
+            # if isinstance(model, QLearningModel):
+                # tilde_z_t = model.forward(t, N, z_t, X[t-1], Y[t], X[t])
+            # elif isinstance(model, GLMLearn):
+            tilde_z_t = model.update_weights(z_t, x=X[t-1], y=Y[t-1], r=R[t-1])
 
         # 2. Evaluate importance weights p(y_t | xhat_t, V_t)
         #   {tilde z_t^i, tilde w^i} is an approximation to p(z_t|y_{1:t})
-        if isinstance(model, QLearningModel):
-            tilde_V_t, tilde_m_t = tilde_z_t
-            tilde_w_t = model.emission_likelihood(y=Y[t], m=tilde_m_t, V=tilde_V_t) 
-        elif isinstance(model, GLMLearn):
-            tilde_w_t = model.emission_likelihood(y=Y[t], w=tilde_z_t, x=X[t]) 
-        else:
-            raise NotImplementedError
+        # if isinstance(model, QLearningModel):
+        #     tilde_V_t, tilde_m_t = tilde_z_t
+        #     tilde_w_t = model.emission_likelihood(y=Y[t], m=tilde_m_t, V=tilde_V_t) 
+        # elif isinstance(model, GLMLearn):
+        tilde_w_t = model.emission_likelihood(y=Y[t], w=tilde_z_t, x=X[t]) 
+        # else:
+        #     raise NotImplementedError
         
         # 3. Resampling step: 
 
         # 3.1. Calculate importance weights
-        if jnp.sum(tilde_w_t) == 0.:
-            choices = jnp.arange(N) # Nil likelihood, so no resampling
-        else:
-            # Normalize importance weights
-            normalized_tilde_w_t = jax.nn.softmax(tilde_w_t) # Softmax
-            # normalized_tilde_w_t = tilde_w_t/np.sum(tilde_w_t) # L1 normalization
+        # if jnp.sum(tilde_w_t) == 0.:
+        #     choices = jnp.arange(N) # Nil likelihood, so no resampling
+        # else:
+        # Normalize importance weights
+        # normalized_tilde_w_t = jax.nn.softmax(tilde_w_t) # Softmax
+        normalized_tilde_w_t = tilde_w_t/np.sum(tilde_w_t) # L1 normalization
 
-            # choices = np.random.choice(N, size=N, p=normalized_tilde_w_t)
-            choices = jax.random.choice(key, N, shape=(N,), p=normalized_tilde_w_t)
+
+        # choices = np.random.choice(N, size=N, p=normalized_tilde_w_t)
+        choices = jax.random.choice(subkey, N, shape=(N,), p=normalized_tilde_w_t)
 
         # 3.2. Resample with replacement N particles according the importance weights
         # if t==0:
-        if isinstance(model, QLearningModel):
-            V_t = np.array([list(tilde_V_t[:,c]) for c in choices]).T
-            m_t = np.array([tilde_m_t[c] for c in choices])
-            z_t = V_t, m_t
-        elif isinstance(model, GLMLearn):
-            z_t = jnp.array([tilde_z_t[c] for c in choices])
-        else:
-            raise NotImplementedError
-            # z_history = jnp.array([z_t])
+        # if isinstance(model, QLearningModel):
+        #     V_t = np.array([list(tilde_V_t[:,c]) for c in choices]).T
+        #     m_t = np.array([tilde_m_t[c] for c in choices])
+        #     z_t = V_t, m_t
+        # elif isinstance(model, GLMLearn):
+        #     z_t = jnp.array([tilde_z_t[c] for c in choices])
+        # else:
+        #     raise NotImplementedError
+        #     z_history = jnp.array([z_t])
         # else:
         #     # z_history.append(tilde_z_t)
         #     z_history = jnp.concatenate((z_history, z_t[jnp.newaxis,:]), axis=0)
@@ -97,16 +105,38 @@ def bootstrap_filter(N: int, X, Y, model, seed=0):
         #         # print([z_n.shape for z_n in z_history])
         #     else:
         #         raise NotImplementedError
+        #         z_history of shape (N, t+1, latent_dim)
+        _, latent_dim = tilde_z_t.shape
+
+        if return_history:
+            if t==0:
+                z_history = jnp.array([tilde_z_t[c] for c in choices])
+                z_history = z_history.reshape(N, 1, latent_dim)
+            else:
+                # z_history of shape (N, t+1, latent_dim)
+                z_history = jnp.concatenate((z_history, tilde_z_t[:, np.newaxis, :]), axis=1)
+                z_history = jnp.array([z_history[c] for c in choices])
+            z_t = z_history[:,-1,:]
+        else:
+            z_t = jnp.array([tilde_z_t[c] for c in choices])
+            # z_history.append(z_t)
         
         # lik_estimate = np.mean([emission_likelihood(y=Y[t], x_hat=_xhat, V=_V, sigma=sigma, softmax=softmax) for _xhat, _V in zip(xhat_t, V_t)])
-        lik_estimate = np.mean(tilde_w_t)
-        if jnp.linalg.norm(lik_estimate) == 0.:
-            loglik_running_estimate = np.nan
-            break
-        else:
-            loglik_running_estimate += jnp.log(lik_estimate)
+        lik_estimate = jnp.mean(tilde_w_t)
+        # if jnp.linalg.norm(lik_estimate) == 0.:
+        #     loglik_running_estimate = np.nan
+        #     break
+        # else:
+        loglik_running_estimate += jnp.log(lik_estimate)
 
-        z_history.append(z_t)
+        # # Check for NaN or Inf
+        # if jnp.isnan(normalized_tilde_w_t).any() or jnp.isinf(normalized_tilde_w_t).any():
+        #     raise ValueError("Normalized importance weights contain NaN or Inf.")
+
+        
+
+    # if not return_history:
+    #     z_history = jnp.stack(z_history).transpose(1,0,2)
 
     return z_history, loglik_running_estimate
 
