@@ -2,3 +2,5 @@
 figures/
 __pycache__/
 data/
+saves/
+notebooks/

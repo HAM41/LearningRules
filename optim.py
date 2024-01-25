@@ -15,6 +15,12 @@ import jax.scipy as jsp
 # import os
 # os.environ['JAX_PLATFORMS']='cpu'
 
+import logging
+logging.basicConfig(level=logging.INFO, format='[%(filename)s][%(asctime)s] %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+from parameters import ParamsGLMLearn
+
 def grid_search(X, Y, N_bootstrap=200):
     alpha_range = np.concatenate(([0.0], np.exp(np.linspace(-7,1,10))))
     sigma_range = np.exp(np.linspace(-8,1,10))
@@ -59,6 +65,32 @@ def grid_search(X, Y, N_bootstrap=200):
 
     print(argmin)
     return 
+
+
+def score_approx(theta, Z_samples, X, Y, model=None, seed=0):
+    if model is None:
+        model = models.GLMLearn(
+            sigma_w=np.exp(theta[-1]), 
+            alpha=theta[-2], 
+            w_init_mean=theta[:2], 
+            seed=seed
+            )
+    def grad_log_joint(x,y,Z):
+        # grad = jax.grad(lambda __theta: model.log_joint(x, y, Z, __theta))(theta)
+        grad = jax.grad(lambda log_sigma: model.log_joint(
+            x,y,Z,
+            jnp.array([theta[0], theta[1], theta[2], log_sigma])
+            ))(theta[-1])
+        return grad 
+    
+    def integrand(z):
+        print(len(X))
+        score_per_run = jax.vmap(lambda _x, _y: grad_log_joint(_x,_y,z), (0, 0))(X, Y)
+        return jnp.sum(score_per_run, axis=0)
+    
+    vals = jax.vmap(integrand)(Z_samples)
+    return jnp.mean(vals, axis=0)
+
 
 def simplex(X, Y, N_bootstrap=200, B=1):
     '''
@@ -143,15 +175,15 @@ def grad_log_joint(model, Z, X, Y, theta):
 
 def test_grad_loglik():
     # Generate simulated data
-    true_alpha = 1.0
-    true_sigma = 0.01
+    true_alpha = 0.5
+    true_sigma = 0.2
     true_model = models.GLMLearn(sigma_w=true_sigma, alpha=true_alpha, seed=seed)
     true_theta = jnp.array([true_model.w_init_mean[0], true_model.w_init_mean[1], true_alpha, true_sigma])
 
     T = 200
     for i in range(1):
         X, Y, Z_true = true_model.sample(T, key=jax.random.PRNGKey(i))
-        _, true_ll = samplers.bootstrap_filter(1000, X, Y, true_model)
+        _, true_ll = samplers.bootstrap_filter(100, X, Y, true_model)
         val, _ = true_model.value_and_grad_joint(X, Y, Z_true, true_theta)
         print(true_theta, true_ll, val)
 
@@ -171,7 +203,7 @@ def test_grad_loglik():
     for k in range(1,100):
         # learning_rate = np.power(k, -2/3)
         model = models.GLMLearn(sigma_w=theta[-1], alpha=theta[-2], w_init_mean=theta[:2], seed=seed)
-        SMC_Z_samples, _l = samplers.bootstrap_filter(1000, X, Y, model, return_history=False)
+        SMC_Z_samples, _l = samplers.bootstrap_filter(100, X, Y, model, return_history=True)
         # print(_l)
         # for Z in SMC_Z_samples:ç
         #     val, grad = grad_log_joint(model, Z, X, Y, theta)
@@ -226,20 +258,54 @@ def compare_models():
         theta += learning_rate * grad
         print(value, theta)
 
+# def test_SMC():
+#     # Generate simulated data
+#     true_log_alpha = np.log(0.1)
+#     true_log_sigma = np.log(0.01)
+#     true_model = models.GLMLearn(sigma_w=np.exp(true_log_sigma), alpha=np.exp(true_log_alpha), seed=seed)
+#     # true_model = models.QLearning(sigma=np.exp(true_log_sigma), alpha=np.exp(true_log_alpha), seed=seed)
+#     true_theta = jnp.array([true_model.w_init_mean[0], true_model.w_init_mean[1], true_log_alpha, true_log_sigma])
+#     logger.info(f'True: {true_theta}')
+
+
+#     T = 200
+#     N_runs = 10
+#     X = np.zeros((N_runs, T))
+#     Y = np.zeros((N_runs, T))
+#     for n in range(10):
+#         x, y, _ = true_model.sample(T)
+#         X[n] = x
+#         Y[n] = y
+
 
 def test_grad_SMC():
-    true_alpha = 0.05
-    true_sigma = 0.02
-    true_model = models.GLMLearn(sigma_w=true_sigma, alpha=true_alpha, seed=seed)
-    true_theta = true_model.w_init_mean, np.log(true_alpha), np.log(true_sigma)
+
+    log_sigmas = np.linspace(-5, 1, 6)
+    log_alphas = np.linspace(-5, 1, 6)
+    true_sigma_index = 3
+    true_alpha_index = 2
+    true_log_sigma = log_sigmas[true_sigma_index]
+    true_log_alpha = log_alphas[true_alpha_index]
+
+    true_model = models.GLMLearn(sigma_w=np.exp(true_log_sigma), alpha=np.exp(true_log_alpha), seed=seed)
+    true_theta = true_model.w_init_mean, true_log_sigma, true_log_alpha
     print(true_theta)
 
-    T = 500
-    X, Y, _ = true_model.sample(T)
+    T = 200
+    N_runs = 20
+    X = np.zeros((N_runs, T))
+    Y = np.zeros((N_runs, T))
+    for n in range(N_runs):
+        x, y, _ = true_model.sample(T)
+        X[n] = x
+        Y[n] = y
 
     def loglik(log_theta):
         model = models.GLMLearn(sigma_w=jnp.exp(log_theta[0]), alpha=jnp.exp(log_theta[1]), seed=seed)
-        _, value = samplers.bootstrap_filter(100, X, Y, model)
+        def evidence(x,y):
+            return samplers.bootstrap_filter(1000, x, y, model, return_history=False)[1]
+        evidence_per_run = jax.vmap(evidence, (0, 0))(X, Y)
+        value = np.sum(evidence_per_run)
         return value
     
     # print(jsp.optimize.minimize(loglik, jnp.array([-1., -1.]), method='Powell'))
@@ -253,27 +319,50 @@ def test_grad_SMC():
     #     return gradient
 
     # Define the range of log_theta values to plot
-    log_sigmas = np.linspace(-5, 0, 10)
-    log_alphas = np.linspace(-5, 0, 10)
+    # log_sigmas = np.linspace(-5, 2, 4)
+    # log_alphas = np.linspace(-5, 2, 4)
     # sigmas, alphas = np.meshgrid(_sigmas, _alphas)
     # log_theta_values = np.stack([sigmas, alphas], axis=-1)
 
-    entries =[]
-    for log_sigma in log_sigmas:
-        for log_alpha in log_alphas:
-            value, gradient = jax.value_and_grad(loglik)([log_sigma, log_alpha])
-            entry = {'log_sigma': log_sigma, 'log_alpha': log_alpha, 'value': float(value), 'gradient_x': float(gradient[0]), 'gradient_y': float(gradient[1])}
-            entries.append(entry)
+    # entries =[]
+    # for log_alpha in log_alphas:
+    #     values, gradients = jax.vmap(lambda log_sigma: jax.value_and_grad(loglik)([log_sigma, log_alpha]))(log_sigmas)
 
-    df = pd.DataFrame(entries)
-    df_heatmap = df.pivot(columns="log_sigma", index="log_alpha", values="value")
-    print(df)
+    #     for i in range(len(log_sigmas)):
+    #         grad = np.array([gradients[0][i], gradients[1][i]]).astype(float)
+    #         grad_norm = np.linalg.norm(grad)
+    #         entry = {'log_sigma': round(log_sigmas[i],3), 'log_alpha': round(log_alpha, 3), 'value': float(values[i]), 'gradient_x': grad[0], 'gradient_y': grad[1], 'grad_norm': grad_norm}
+    #         entries.append(entry)
+    #         print(entry)
+    # df = pd.DataFrame(entries)
 
-    fig, axs = plt.subplots(figsize=[8,4], ncols=2, constrained_layout=True)
-    sns.heatmap(df_heatmap, ax=axs[0])
-    axs[1].quiver(df['log_sigma'].values, df['log_alpha'].values, df['gradient_x'].values, df['gradient_y'].values)
-    plt.savefig('figures/grad_field_pd.png', dpi=300)
-    plt.close()
+    # entries =[]
+    # for log_sigma in log_sigmas:
+    #     for log_alpha in log_alphas:
+    #         value, gradient = jax.value_and_grad(loglik)([log_sigma, log_alpha])
+    #         entry = {'log_sigma': log_sigma, 'log_alpha': log_alpha, 'value': float(value), 'gradient_x': float(gradient[0]), 'gradient_y': float(gradient[1])}
+    #         entries.append(entry)
+    #         print(entry)
+    
+
+    # # df = pd.DataFrame(entries)
+    # df_heatmap1 = df.pivot(columns="log_sigma", index="log_alpha", values="value")
+    # df_heatmap2 = df.pivot(columns="log_sigma", index="log_alpha", values="grad_norm")
+    # print(df)
+
+    # from matplotlib.colors import LogNorm
+
+    # _, axs = plt.subplots(figsize=[10,4], ncols=3, constrained_layout=True)
+    # sns.heatmap(df_heatmap1, ax=axs[0], square=True)
+    # axs[1].quiver(df['log_sigma'].values, df['log_alpha'].values, df['gradient_x'].values, df['gradient_y'].values)
+    # axs[1].set_aspect('equal')
+    # sns.heatmap(df_heatmap2, ax=axs[2], square=True, norm=LogNorm())
+    
+    # axs[0].scatter([true_sigma_index + 0.5], [true_alpha_index+0.5], marker='^', c='white', edgecolors='black')
+    # axs[2].scatter([true_sigma_index + 0.5], [true_alpha_index+0.5], marker='^', c='white', edgecolors='black')
+
+    # plt.savefig('figures/grad_field_pd.png', dpi=300)
+    # plt.close()
 
     # # Compute the gradient at each point in the range
     # gradients = np.stack([gradient_func(log_theta) for log_theta in log_theta_values.reshape(-1, 2)], axis=0)
@@ -291,14 +380,19 @@ def test_grad_SMC():
     # plt.savefig('figures/grad_field.png', dpi=300)
     # plt.close()
 
-    # log_theta_init = jnp.array([-1., -1.])
-    # theta = log_theta_init
-    # for _ in range(10):
-    #     gradient = jnp.asarray(jax.grad(loglik)(theta))
-    #     print(gradient)
-    #     gradient = jnp.multiply(jnp.exp(theta), gradient)
-    #     theta = theta + 0.01 * gradient
-    #     print(theta)
+    log_theta_init = jnp.array([-1., -1.])
+    learning_rate = 1e-05
+    theta = log_theta_init
+    for _ in range(10):
+        value, gradient = jax.value_and_grad(loglik)(theta)
+        print(value)
+
+        value, gradient = jax.value_and_grad(loglik)(theta)
+        gradient = jnp.divide(gradient, jnp.exp(theta))
+
+        # gradient = jnp.multiply(jnp.exp(theta), gradient)
+        theta = theta + learning_rate * gradient
+        print(theta)
     # # print(jax.grad(loglik)([-1., -1.]))
     # print(np.multiply(np.exp([-1., -1.]), jax.grad(loglik)([-1., -1.])))
     
@@ -333,44 +427,99 @@ def test_simplex():
 
 def test_Laplace():
     # Generate simulated data
-    true_log_alpha = np.log(0.1)
-    true_log_sigma = np.log(0.01)
-    true_model = models.GLMLearn(sigma_w=np.exp(true_log_sigma), alpha=np.exp(true_log_alpha), seed=seed)
-    true_theta = jnp.array([true_model.w_init_mean[0], true_model.w_init_mean[1], true_log_alpha, true_log_sigma])
-    print('True: ', true_theta)
+    true_alpha = 0.0 #np.log(0.2)
+    true_log_sigma = np.log(0.1)
+    true_model = models.GLMLearn(sigma_w=np.exp(true_log_sigma), alpha=true_alpha, seed=seed)
+    # true_model = models.QLearning(sigma=np.exp(true_log_sigma), alpha=np.exp(true_log_alpha), seed=seed)
+    true_theta = jnp.array([true_model.w_init_mean[0], true_model.w_init_mean[1], true_alpha, true_log_sigma])
+    logger.info(f'True: {true_theta}')
 
-    factor = jnp.array([0.1, 0.1, 1.0, 1.0])
-    theta_init = true_theta + jnp.multiply(factor, jnp.abs(jax.random.normal(key, shape=true_theta.shape))) # perturb true theta
-    # theta_init = jnp.array([0.0, 1.0, -3.0, -3.0])
-    print('Theta init: ', theta_init)
-    
+    # theta_perturbation = jnp.multiply(
+    #     jnp.array([0.1, 0.1, 1.0, 1.0]), 
+    #     jnp.abs(jax.random.normal(key, shape=true_theta.shape))
+    #     )
+    # theta_init = true_theta + theta_perturbation 
+
+    # Only log sigma
+    theta_init = true_log_sigma + jax.random.normal(key)
+
+    logger.info(f'Theta init: {theta_init}')
+
     T = 200
-    N_runs = 10
+    N_runs = 20
     X = np.zeros((N_runs, T))
     Y = np.zeros((N_runs, T))
-    for n in range(10):
-        x, y, _ = true_model.sample(T)
+    for i, n in enumerate(range(N_runs)):
+        x, y, _ = true_model.sample(T, key=jax.random.PRNGKey(i))
         X[n] = x
         Y[n] = y
     
-    _, _, Z_init = true_model.sample(T, key=jax.random.PRNGKey(2))
+    _, _, Z_init = true_model.sample(T, key=jax.random.PRNGKey(i+1))
+
+    def MAP_objective(Z, _theta, model=true_model):
+        def log_joint(x,y):
+            return model.log_joint(
+                x, y, Z.reshape(T,2), 
+                theta = jnp.array([true_model.w_init_mean[0], true_model.w_init_mean[1], true_alpha, _theta])
+                )
+    
+        evidence_per_run = jax.vmap(log_joint, (0, 0))(X, Y)
+        evidence = jnp.sum(evidence_per_run)
+        return -evidence
+    
+    def theta_objective(_theta, Z_samples, model=true_model):
+        # value = 0.
+        # N_MC_samples = len(Z_samples)
+        def log_joint_func(x,y,Z):
+            value = model.log_joint(
+                x, y, Z, 
+                theta = jnp.array([true_model.w_init_mean[0], true_model.w_init_mean[1], true_alpha, _theta[0]])
+                )
+            return value
+        
+        def log_joint_func_per_z(z):
+            evidence_per_run = jax.vmap(lambda _x, _y: log_joint_func(_x, _y, z), (0, 0))(X, Y)
+            evidence = jnp.sum(evidence_per_run)
+            return evidence
+        
+        vals = jax.vmap(log_joint_func_per_z)(Z_samples)
+        value = jnp.mean(vals)
+        return -value
+
+        # def log_joint(x, y, Z):
+        #     return true_model.log_joint(x, y, Z, _theta)
+
+        # log_joint_vec = jax.vmap(log_joint, in_axes=(0, 0, None))
+
+        # evidence_per_MCsample = log_joint_vec(X, Y, Z_samples)
+        # print(evidence_per_MCsample.shape)
+        # value = jnp.sum(evidence_per_trial, axis=0)
+        # value /= N_MC_samples
 
     theta = theta_init
     Z_estimate = Z_init
-    for _ in range(10):
-        # Find MAP
-        def objective(Z):
-            def log_joint(x,y):
-                return true_model.log_joint(x, y, Z.reshape(T,2), theta)
-            
-            evidence_per_trial = jax.vmap(log_joint, (0, 0))(X, Y)
-            evidence = jnp.sum(evidence_per_trial)
-            return -evidence
+    for e in range(10):
+        logger.info(f'Epoch {e}')
+        # model = models.GLMLearn(sigma_w=np.exp(theta[-1]), alpha=np.exp(theta[-2]), w_init_mean=theta[:2], seed=seed)
+        model = models.GLMLearn(
+            sigma_w=np.exp(theta), 
+            alpha=true_alpha,
+            seed=seed
+            )
 
-        # objective = lambda Z: -true_model.log_joint(X, Y, Z.reshape(T,2), theta)
-        res = sp.optimize.minimize(objective, Z_estimate.flatten(), jac=jax.grad(objective), hess=jax.hessian(objective), method='Newton-CG', options={'disp':True, 'xtol':0.1})
-        Z_estimate = res.x
-        # print(np.linalg.norm(Z_estimate - Z_true))
+        # Find MAP
+
+        logger.info('Determine MAP estimate of Z')
+        
+        _MAP_objective = lambda _Z: MAP_objective(_Z, _theta=theta, model=model) 
+        res = sp.optimize.minimize(
+            _MAP_objective, Z_estimate.flatten(),
+            jac=jax.grad(_MAP_objective), hess=jax.hessian(_MAP_objective), 
+            method='Newton-CG', options={'disp':False, 'xtol':0.001}
+            )
+        Z_estimate = res.x #.reshape(T,2)
+        logger.info(f'\tMAP optim success: {res.success}, fun: {-res.fun:.2f}')
+        # # print(np.linalg.norm(Z_estimate - Z_true))
 
         # Use MAP to update parameters
         # def objective(_theta):
@@ -379,31 +528,73 @@ def test_Laplace():
         #         out = out + true_model.log_joint(x, y, Z_estimate, theta)
         #     return out
 
-        Hinv = jnp.linalg.inv(jax.hessian(objective)(Z_estimate))
+        logger.info('Define Laplace approximation and sample latents.')
+        Hinv = jnp.linalg.inv(jax.hessian(_MAP_objective)(Z_estimate))
 
-        N_MC_samples = 1
+        N_MC_samples = 10
         Z_samples = jax.random.multivariate_normal(key, Z_estimate, Hinv, shape=(N_MC_samples,))
         Z_samples = Z_samples.reshape(N_MC_samples, T, 2)
-        # Z_estimate = Z_estimate.reshape(T,2)
+        
+        # Z_samples = jnp.array([Z_estimate.reshape(T,2)])
 
-        def objective(_theta):
-            value = 0.
-            for Z in Z_samples:
-                def log_joint(x,y):
-                    return true_model.log_joint(x, y, Z, _theta)
+        # def score_approx(_theta):
+        #     _model = models.GLMLearn(
+        #         sigma_w=np.exp(_theta[-1]), 
+        #         alpha=np.exp(_theta[-2]), 
+        #         w_init_mean=_theta[:2], 
+        #         seed=seed
+        #         )
+        #     # val = 0.
+        #     def grad_log_joint(x,y,Z):
+        #         grad = jax.grad(lambda __theta: _model.log_joint(x, y, Z, __theta))(_theta)
+        #         # print('Grad shape:', grad.shape)
+        #         return grad 
+        #     def integrand(z):
+        #         score_per_run = jax.vmap(lambda _x, _y: grad_log_joint(_x,_y,z), (0, 0))(X, Y)
+        #         # print('score_per_run shape:', score_per_run.shape)
+        #         # print('jnp.sum(score_per_run, axis=0) shape:', jnp.sum(score_per_run, axis=0).shape)
+        #         return jnp.sum(score_per_run, axis=0)
+        #     vals = jax.vmap(integrand)(Z_samples)
+        #     # print('vals shape', vals.shape)
+        #     # print(vals)
+        #     return jnp.mean(vals, axis=0)
+
+            # for Z in Z_samples:
+            #     # score = 0.
+            #     # for x, y in zip(X,Y):
+            #     #     score += jax.grad(lambda __theta: model.log_joint(x, y, Z, __theta))(_theta)
+
                 
-                evidence_per_trial = jax.vmap(log_joint, (0, 0))(X, Y)
-                evidence = jnp.sum(evidence_per_trial)
-                value += evidence
-            value /= N_MC_samples
-            return value
-        # objective = lambda _theta: true_model.log_joint(X, Y, Z_estimate, _theta)
+            #     score_per_run = jax.vmap(grad_log_joint, (0, 0))(X, Y)
+
+            #     val += jnp.sum(score_per_run)
+            # val /= N_MC_samples
+            # return val
+                
         
-        for _ in range(10):
-            theta = theta + 1e-05 * jax.grad(objective)(theta)
-            print(theta)
-        
-        print('---', objective(theta))
+        logger.info('Update parameters: ')
+
+        _theta_objective = lambda _theta: theta_objective(_theta, Z_samples, model)
+        # for i in range(10):
+        #     theta = theta - 1e-05 * jax.grad(_theta_objective)(theta)
+        #     # theta = theta + 1e-05 * score_approx(theta)
+        #     logger.info(f'\t[{i}] Theta: {theta}')
+
+        res = sp.optimize.minimize(
+            _theta_objective, theta,
+            jac=jax.grad(_theta_objective), hess=jax.hessian(_theta_objective), 
+            method='Newton-CG', options={'disp':False, 'xtol':0.001}, bounds=[(-8,2)] #[(-10,10), (-10,10), (-8,2), (-8,2)]
+            )
+
+        theta = res.x[0]
+        # print(res)
+        # print(theta)
+
+        # logger.info(f'Log-likelihood : {-_theta_objective(theta):.2f}')
+        logger.info(f'\tTheta optim success: {res.success}, fun: {-res.fun:.2f}')
+        logger.info(f'\tTheta: {theta}')
+        logger.info('')
+
     # res = sp.optimize.minimize(objective, theta_init, jac=jax.grad(objective), options={'disp':True})#, hess=jax.hessian(objective), method='Newton-CG', options={'disp':True, 'xtol':0.001})
     # print(res)
     # print(res.x)
@@ -413,13 +604,164 @@ def test_Laplace():
     #     print(objective(Z_init))
     # print(jax.value_and_grad(objective)(Z_init))
 
+def test_score():
+    r'''
+    d_\theta log p_theta(y) = E_{p_theta(x | y)} [d_\theta log p_theta(x, y)]
+    '''
+    key = jax.random.PRNGKey(seed)
+
+    # Generate simulated data
+    true_alpha = 0.0 #np.log(0.2)
+    true_log_sigma = np.log(0.01)
+    true_model = models.GLMLearn(sigma_w=np.exp(true_log_sigma), alpha=true_alpha, seed=seed)
+    # true_model = models.QLearning(sigma=np.exp(true_log_sigma), alpha=np.exp(true_log_alpha), seed=seed)
+    true_theta = jnp.array([true_model.w_init_mean[0], true_model.w_init_mean[1], true_alpha, true_log_sigma])
+    logger.info(f'True: {true_theta}')
+
+    # theta_perturbation = jnp.multiply(
+    #     jnp.array([0.1, 0.1, 1.0, 1.0]), 
+    #     jnp.abs(jax.random.normal(key, shape=true_theta.shape))
+    #     )
+    # theta_init = true_theta + theta_perturbation 
+
+    # Only log sigma
+    theta_init = true_log_sigma + jnp.abs(jax.random.normal(key))
+
+    logger.info(f'Theta init: {theta_init}')
+
+    T = 200
+    N_runs = 20
+    X = np.zeros((N_runs, T))
+    Y = np.zeros((N_runs, T))
+    for n in range(N_runs):
+        key, subkey = jax.random.split(key)
+        x, y, _ = true_model.sample(T, key=subkey)
+        X[n] = x
+        Y[n] = y
+    
+    key, subkey = jax.random.split(key)
+    _, _, Z_init = true_model.sample(T, key=subkey)
+
+    theta = theta_init
+    model = models.GLMLearn(
+        sigma_w=np.exp(theta), 
+        alpha=true_alpha,
+        seed=seed
+        )
+    
+    score_vals = []
+    for x, y in zip(X,Y):
+        for N_samples in [100, 500, 1000, 5000]:
+            SMC_Z_samples, _l = samplers.bootstrap_filter(N_samples, x, y, model, return_history=True)
+            score_val = score_approx(
+                jnp.array([true_model.w_init_mean[0], true_model.w_init_mean[1], true_alpha, theta]),
+                SMC_Z_samples, X, Y, #model=model
+                )
+            logging.info("N samples {:}, Likelihood {:.2f}, Score {:.2f}".format(N_samples, _l, score_val))
+        score_vals.append(score_val)
+    # values, gradients = jax.vmap(lambda Z: model.joint_loglikelihood(X, Y, Z, theta))(SMC_Z_samples)
+
+def test_MAP():
+    # Generate simulated data
+    true_alpha = 0.0 #np.log(0.2)
+    true_log_sigma = np.log(0.1)
+    true_model = models.GLMLearn(sigma_w=np.exp(true_log_sigma), alpha=true_alpha, seed=seed)
+    # true_model = models.QLearning(sigma=np.exp(true_log_sigma), alpha=np.exp(true_log_alpha), seed=seed)
+    true_theta = jnp.array([true_model.w_init_mean[0], true_model.w_init_mean[1], true_alpha, true_log_sigma])
+    logger.info(f'True: {true_theta}')
+
+    # theta_perturbation = jnp.multiply(
+    #     jnp.array([0.1, 0.1, 1.0, 1.0]), 
+    #     jnp.abs(jax.random.normal(key, shape=true_theta.shape))
+    #     )
+    # theta_init = true_theta + theta_perturbation 
+
+    # Only log sigma
+    theta_init = true_log_sigma + jax.random.normal(key)
+
+    logger.info(f'Theta init: {theta_init}')
+    T = 200
+
+    X, Y, Z = true_model.sample(T, key=jax.random.PRNGKey(0))
+    
+    def MAP_objective(Z, _theta, model=true_model):
+        def _log_joint(x,y):
+            return model.log_joint(
+                x, y, Z.reshape(T,2), 
+                theta = jnp.array([true_model.w_init_mean[0], true_model.w_init_mean[1], true_alpha, _theta])
+                )
+    
+        # evidence_per_run = jax.vmap(log_joint, (0, 0))(X, Y)
+        # evidence = jnp.sum(evidence_per_run)
+        evidence = _log_joint(X, Y)
+        return -evidence
+    
+    theta = theta_init
+    
+    model = models.GLMLearn(
+        sigma_w=np.exp(theta), 
+        alpha=true_alpha,
+        seed=seed
+        )
+    _, _, Z_init = model.sample(T, key=jax.random.PRNGKey(1))
+
+    # Find MAP
+
+    logger.info('Determine MAP estimate of Z')
+    
+    _MAP_objective = lambda _Z: MAP_objective(_Z, _theta=theta, model=model) 
+    res = sp.optimize.minimize(
+        _MAP_objective, Z_init.flatten(),
+        jac=jax.grad(_MAP_objective), hess=jax.hessian(_MAP_objective), 
+        method='Newton-CG', options={'disp':True, 'xtol':0.01}
+        )
+    Z_estimate = res.x.reshape(T,2)
+    print(Z_estimate)
+    print(res)
+
+    fig, ax = plt.subplots();
+
+def fit_bootstrap_simplex(model, X, Y):
+    N_particles = 10000
+
+def callback_f(intermediate_result):
+    val = intermediate_result.fun
+    params = intermediate_result.x
+    logging.info(f'Likelihood: {-val:5.2f}, params: {ParamsGLMLearn(*params)}')
+    # print(intermediate_result.nit, intermediate_result.x, intermediate_result.fun)
+
+def fit(X, Y):
+    def neg_evidence(_params):
+        '''params = [log_sigma, alpha]'''
+        # _params = ParamsGLMLearn(log_sigma=-2.0, alpha=alpha)
+        _model = models.GLMLearn(
+            dynamics_logscale=_params[0],
+            alpha=_params[1], 
+            seed=seed,
+            )
+        _, lik = samplers.bootstrap_filter(N_particles, X, Y, _model, return_history=False, verbose=False)
+        # print(alpha, val)
+        return -lik
+
+    from scipy.optimize import minimize
+    res = minimize(
+        neg_evidence, 
+        x0 = jnp.array([-2.0, 0.0]), 
+        method='Nelder-Mead', 
+        tol=1e-3, 
+        options={'disp':True, 'return_all':True, 'initial_simplex':jnp.array([[-4.0, 0.0], [-2.0, 1.0], [1.0, 0.0]])},
+        callback=callback_f
+        )
+    return res
 
 if __name__=='__main__':
     seed = 0
     key = jax.random.PRNGKey(seed)
-    test_Laplace()
+    # test_Laplace()
+    test_score()
     # test_grad_loglik()
     # test_grad_SMC()
+    # test_MAP()
 
     # true_alpha = 0.05
     # true_sigma = 0.01
