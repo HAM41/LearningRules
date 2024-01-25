@@ -57,13 +57,14 @@ def fit(X, Y):
     return res
 
 def fit_single_trajectory_search():
+    T = 10000
     alpha_values = [0.0, 0.01, 0.1, 0.5]
     sigma_values = [-5.0, -3.0, -1.0]
 
     convergence_dicts = []
     for true_alpha in alpha_values:
         for true_logsigma in sigma_values:
-            conv_dict = fit_single_trajectory(true_alpha, true_logsigma)
+            conv_dict = fit_single_trajectory(true_alpha, true_logsigma, T=T)
             print('-'*50)
             print(conv_dict)
             print('-'*50)
@@ -73,11 +74,10 @@ def fit_single_trajectory_search():
     with open(f'saves/convergence_dicts_w_initial_simplex_T{T}.pkl', 'wb') as f:
         pickle.dump(convergence_dicts, f)
 
-def fit_single_trajectory(true_alpha, true_logsigma):
+def fit_single_trajectory(true_alpha, true_logsigma, T=1000):
     true_model = models.GLMLearn(dynamics_logscale=true_logsigma, alpha=true_alpha)
     logging.info(f'True model: {true_model.params}')
             
-    T = 1000
     X, Y, _ = true_model.sample(T)
 
     res = fit(X,Y)
