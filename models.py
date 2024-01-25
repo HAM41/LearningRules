@@ -3,13 +3,13 @@ import jax.numpy as jnp
 import jax.scipy as jsp
 import numpy as np
 import scipy as sp
-from typing import Tuple
+from typing import Tuple, Optional, Iterable
 
 import os
 os.environ['JAX_PLATFORMS']='cpu'
 
-# def sigmoid(x, w=1.0, b=0.0, g=1.0):
-#     return 1/(1+np.exp(-g*(w*x + b)))
+from parameters import ParamsGLMLearn, ParameterProperties, handle_none_params
+
 def sigmoid(x):
     return 0.5 * (jnp.tanh(x / 2) + 1)
 
@@ -32,11 +32,11 @@ def sign(y):
     y = jnp.asarray(y).astype(bool)
     return jnp.where(y == 0., -1., 1.)
 
-def reward(X, Y) -> np.ndarray:
+def reward(X, Y, r1=1.0, r0=0.0) -> np.ndarray:
     '''
     Returns reward 
-        r(x,y)= 1. if (x < 0 and y == 0) or (x > 0 and y==1)
-                0. else
+        r(x,y)= r1 if (x < 0 and y == 0) or (x > 0 and y==1)
+                r0 else
     for all (x,y) pairs in X, Y
     '''
     X = jnp.array(X)
@@ -49,12 +49,12 @@ def reward(X, Y) -> np.ndarray:
         Y = jnp.full(X.shape, Y).astype(int)
 
     # Initialize an array for the rewards with the same shape as x and y
-    r = jnp.zeros_like(X, dtype=float)
+    r = r0 * jnp.ones_like(X, dtype=float)
 
     # Calculate rewards element-wise
     mask_condition = (X < 0) & (Y == 0) | (X > 0) & (Y == 1)
     # r = r.at[mask_condition].set(1.0)
-    r = jnp.where(mask_condition, 1.0, r)
+    r = jnp.where(mask_condition, r1, r)
 
     return r
 
@@ -63,7 +63,7 @@ def effective_reward(X):
     Returns effective reward R(x) = \sum_y r(x,y) sign(y), for all x in X. 
     Output `RX` is of same shape as `X`.
     '''
-    RX = jnp.sum(jnp.array([sign(y) * reward(X, y) for y in [0,1]]))
+    RX = jnp.sum(jnp.array([sign(y) * reward(X, y) for y in [0,1]]), axis=0)
     return RX
 
 def cumulative_gaussian(x, sigma=1.0, mu=0.0):
@@ -208,17 +208,38 @@ class GLMLearn():
         learning rule, or a closed-form policy gradient update.
     '''
     def __init__(self, 
-                 alpha: float, sigma_w: jnp.ndarray, w_init_mean: jnp.ndarray=np.array([0.0, 1.0]), 
+                 alpha: float=0.0, dynamics_logscale: float=-1.0, 
+                 not_trainable: list=[],
                  learning_rule: str='policy_gradient', seed: int=0,
                  ) -> None:
-        self.alpha = alpha
-        self.sigma_w = sigma_w
+        # self.alpha = alpha
+        # self.sigma_w = sigma_w
         self.learning_rule = learning_rule
+
+        self.params = ParamsGLMLearn(log_sigma=dynamics_logscale, alpha=alpha)
+        self.props = ParamsGLMLearn(log_sigma=ParameterProperties(), alpha=ParameterProperties())
+        for param in not_trainable:
+            getattr(self.props, param).trainable = False
 
         # Initialization for latents and key for reproducibility
         self.key = jax.random.PRNGKey(seed)
-        self.w_init_mean = w_init_mean
 
+    def update_params(self, **kwargs) -> None:
+        '''passes trainable kwargs to self.params._replace
+        #? Add to parent class?
+        '''
+        for key in kwargs:
+            if not getattr(self.props, key).trainable:
+                raise ValueError(f"Parameter '{key}' is not trainable")
+        
+        self.params = self.params._replace(**kwargs)
+
+    def update_params_from_array(self, params_array: Iterable) -> None:
+        '''Standardize way to set parameters from array.'''
+        # params_dict = {'log_sigma': params_array[0], 'alpha': params_array[1]}
+        # self.update_params(**params_dict)
+        self.params = ParamsGLMLearn._make(params_array)
+        
     def emission_likelihood(self, w, x, y=1):
         '''p(y | w, x), default p(y=1 | w, x)'''
         vx = vec(x)
@@ -236,77 +257,87 @@ class GLMLearn():
         y = jax.random.bernoulli(subkey, p_R).astype(int)
         return y
 
-    def policy_gradient(self, w, x):
+    def policy_gradient(self, w, x, r=None):
         p_R = self.emission_likelihood(w, x, y=1)
-        return effective_reward(x) * jnp.outer(jnp.multiply(p_R, 1 - p_R), vec(x)).squeeze()
+        if r is None:
+            r = effective_reward(x)
+        return r * jnp.outer(jnp.multiply(p_R, 1 - p_R), vec(x)).squeeze()
     
-    def reinforce(self, w, x, y):
+    def reinforce(self, w, x, y, r=None):
         p = self.emission_likelihood(w, x, y)
-        return reward(x,y) * jnp.outer(1-p, vec(x)).squeeze()
-
-    def update_weights(self, w, x, y=None, key=None):
+        if r is None:
+            r = reward(x,y)
+        return r * jnp.outer(1-p, sign(y) * vec(x)).squeeze()
+    
+    @handle_none_params
+    def update_weights(
+            self, 
+            w, x, 
+            params: Optional[ParamsGLMLearn]=None, y=None, r=None,
+            key=None):
         if key is None:
             self.key, subkey = jax.random.split(self.key)
         else:
             subkey = key
         
         if self.learning_rule == 'reinforce':
-            learning_signal = self.alpha * self.reinforce(w, x, y)
+            learning_signal = params.alpha * self.reinforce(w, x, y, r)
         else: # use Policy gradient
-            learning_signal = self.alpha * self.policy_gradient(w, x)
+            learning_signal = params.alpha * self.policy_gradient(w, x, r)
+
         update_noise = jax.random.normal(subkey, shape=w.shape)
-        update_noise = jnp.multiply(self.sigma_w, update_noise)
+        update_noise = jnp.multiply(jnp.exp(params.log_sigma), update_noise)
         return w + learning_signal + update_noise
     
-    def initial_loglikelihood(self, z_0, w_init_mean=None | jnp.ndarray):
-        """log p(z_0)"""
-        if w_init_mean is None:
-            w_init_mean = self.w_init_mean
-        if w_init_mean.shape == (1,):
-            log_lik = lambda z: jsp.stats.norm.logpdf(z, loc=w_init_mean, scale=0.1)
+    def initial_loglikelihood(self, z_0):
+        """log p(z_0). We use p(z_0) = N(0,I)."""
+        if z_0.shape == (1,):
+            log_lik = lambda z: jsp.stats.norm.logpdf(z)#, loc=z_0_mean, scale=1.0)
         else:
-            N = w_init_mean.shape[0]
-            log_lik = lambda z: jsp.stats.multivariate_normal.logpdf(z, mean=w_init_mean, cov=(0.1)**2 * np.eye(N))
+            # N = w_init_mean.shape[0]
+            log_lik = lambda z: jsp.stats.multivariate_normal.logpdf(z)#, mean=w_init_mean, cov=np.eye(N))
         return log_lik(z_0)
     
-    def dynamics_loglikelihood(self, z_next, z_prev, inputs, data, alpha=None, sigma_w=None):
+    @handle_none_params
+    def dynamics_loglikelihood(self, z_next, z_prev, inputs, data, 
+                               params: Optional[ParamsGLMLearn]=None, r=None):
         '''p(z_t | z_{t-1})
         In our case, the latents z are the GLM weights w
         '''
-        if alpha is None:
-            alpha = self.alpha
-        if sigma_w is None:
-            sigma_w = self.sigma_w
-
         if self.learning_rule == 'reinforce':
-            learning_signal = alpha * self.reinforce(z_prev, inputs, data)
+            learning_signal = params.alpha * self.reinforce(z_prev, inputs, data, r=r)
         else: # use Policy gradient
-            learning_signal = alpha * self.policy_gradient(z_prev, inputs)
+            learning_signal = params.alpha * self.policy_gradient(z_prev, inputs, r=r)
         mean = z_prev + learning_signal
         N = mean.shape[0]
-        cov = jnp.multiply(jnp.square(sigma_w), jnp.eye(N))
+        cov = jnp.multiply(jnp.square(jnp.exp(params.log_sigma)), jnp.eye(N))
         log_lik = lambda z: jsp.stats.multivariate_normal.logpdf(z, mean=mean, cov=cov)
         return log_lik(z_next)
     
     def sample(self, T, key=None):
+        '''
+        Samples from the model, focusing only on univariate stimuli (stimulus intensity).
+        Returns:
+            X: array, stimulus, of shape (T,)
+            Y: array, decisions, of shape (T,)
+            W: array, weights, of shape (T, 2)
+        '''
         if key is None:
-            self.key, subkey = jax.random.split(self.key)
-        else:
-            subkey = key
+            key = self.key
 
-        subkey, init_key = jax.random.split(subkey)
+        key, init_key = jax.random.split(key)
 
         # Generate stimulus uniformly from range
         x_range = jnp.linspace(-1,1,12)
         X = jax.random.choice(init_key, x_range, shape=(T,), replace=True)
 
         # Encode percept and define initial values
-        w = self.w_init_mean + 0.1*jax.random.normal(init_key, shape=self.w_init_mean.shape) # w_0 ~ N(w_init, 0.1^2)
+        w = jax.random.normal(init_key, shape=(2,)) # w_0 ~ N(0, 1)
 
         # Generate decisions and weights sequentially
         Y, Ws = [], []
         for t in range(T):
-            subkey, decision_key, update_key = jax.random.split(subkey, num=3)
+            key, decision_key, update_key = jax.random.split(key, num=3)
 
             # Sample
             y = self.decision(w, X[t], key=decision_key)
@@ -316,11 +347,13 @@ class GLMLearn():
             # Update
             w = self.update_weights(w, x=X[t], y=Y[t], key=update_key)
         return X, jnp.stack(Y), jnp.stack(Ws)
-
+    
+    @handle_none_params
     def log_joint(
-            self, X: jnp.ndarray, Y: jnp.ndarray, Z: jnp.ndarray, theta: jnp.ndarray
+            self, X: jnp.ndarray, Y: jnp.ndarray, Z: jnp.ndarray, params: Optional[ParamsGLMLearn]=None
             ) -> float:
         '''
+        #! add rewards
         Evaluate `log p(Y, Z | X, theta) = log p(y_{1:T}, z_{1:T} | x_{1:T}, theta)`. 
 
         parameters:
@@ -333,13 +366,14 @@ class GLMLearn():
             log_joint: float, value of log joint likelihood
         '''
         T = len(Y)
-        w_init = theta[:2]
-        alpha = theta[-2]
-        sigma = jnp.exp(theta[-1])
+        # w_init = self.w_init_mean
+        # w_init = theta[:2]
+        # alpha = theta[-2]
+        # sigma = jnp.exp(theta[-1])
 
         # Initial t=0 joint likelihood terms
         # Dynamics
-        log_pz0 = self.initial_loglikelihood(Z[0], w_init_mean=w_init)
+        log_pz0 = self.initial_loglikelihood(Z[0]) #, w_init_mean=w_init)
 
         # Emissions
         log_pyz0 = jnp.log(self.emission_likelihood(Z[0], X[0], Y[0]))
@@ -349,7 +383,7 @@ class GLMLearn():
         # Loop over time steps 
         for t in range(1,T):
             # Dynamics
-            log_pzz = self.dynamics_loglikelihood(Z[t], Z[t-1], X[t-1], Y[t-1], alpha=alpha, sigma_w=sigma)
+            log_pzz = self.dynamics_loglikelihood(Z[t], Z[t-1], X[t-1], Y[t-1], params=params)
 
             # Emissions
             log_pyz = jnp.log(self.emission_likelihood(Z[t], X[t], Y[t]))
@@ -368,8 +402,6 @@ if __name__=='__main__':
     # X, Y, m, Vs = true_model.sample(10)
     # print(X, Y, m, Vs)
 
-    true_model = GLMLearn(sigma_w=0.1, alpha=1.0, seed=seed)
+    true_model = GLMLearn(dynamics_logscale=-1.0, alpha=1.0, seed=seed)
     X, Y, Ws = true_model.sample(10)
     print(X, Y, Ws)
-
-    t = 5
