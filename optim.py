@@ -245,9 +245,6 @@ def compare_models():
     model = models.GLMLearn(sigma_w=true_sigma, alpha=true_alpha, seed=seed)
     SMC_Z_samples, _l = samplers.bootstrap_filter(100, X, Y, model)
     # print(_l)
-
-    GLM_theta = theta_init
-    GLM
     learning_rate = 1e-03
     for k in range(1,100):
         model = models.GLMLearn(sigma_w=jnp.exp(theta[-1]), alpha=jnp.exp(theta[-2]), w_init_mean=theta[:2], seed=seed)
@@ -720,39 +717,6 @@ def test_MAP():
     print(res)
 
     fig, ax = plt.subplots();
-
-def fit_bootstrap_simplex(model, X, Y):
-    N_particles = 10000
-
-def callback_f(intermediate_result):
-    val = intermediate_result.fun
-    params = intermediate_result.x
-    logging.info(f'Likelihood: {-val:5.2f}, params: {ParamsGLMLearn(*params)}')
-    # print(intermediate_result.nit, intermediate_result.x, intermediate_result.fun)
-
-def fit(X, Y):
-    def neg_evidence(_params):
-        '''params = [log_sigma, alpha]'''
-        # _params = ParamsGLMLearn(log_sigma=-2.0, alpha=alpha)
-        _model = models.GLMLearn(
-            dynamics_logscale=_params[0],
-            alpha=_params[1], 
-            seed=seed,
-            )
-        _, lik = samplers.bootstrap_filter(N_particles, X, Y, _model, return_history=False, verbose=False)
-        # print(alpha, val)
-        return -lik
-
-    from scipy.optimize import minimize
-    res = minimize(
-        neg_evidence, 
-        x0 = jnp.array([-2.0, 0.0]), 
-        method='Nelder-Mead', 
-        tol=1e-3, 
-        options={'disp':True, 'return_all':True, 'initial_simplex':jnp.array([[-4.0, 0.0], [-2.0, 1.0], [1.0, 0.0]])},
-        callback=callback_f
-        )
-    return res
 
 if __name__=='__main__':
     seed = 0
