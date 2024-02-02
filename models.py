@@ -10,10 +10,12 @@ os.environ['JAX_PLATFORMS']='cpu'
 
 from parameters import ParamsGLMLearn, ParameterProperties, handle_none_params
 
+@jax.jit
 def sigmoid(x):
     return 0.5 * (jnp.tanh(x / 2) + 1)
 
-def safe_sigmoid(X, threshold=100.):
+@jax.jit
+def safe_sigmoid(X, threshold=80.):
     return jnp.where(X > threshold, jnp.ones_like(X), jnp.where(X < -threshold, jnp.zeros_like(X), sigmoid(X)))
 
 def vec(x):
@@ -25,10 +27,13 @@ def vec(x):
             raise NotImplementedError
         return jnp.concatenate((jnp.array([1.0]),x))
     
-def unvec(x):
-    return x[1:]
+# def unvec(x): # has to be consistent with vec(). remove if not used
+#     return x[1:]
 
 def sign(y):
+    '''
+    y: array-like, 
+    '''
     y = jnp.asarray(y).astype(bool)
     return jnp.where(y == 0., -1., 1.)
 
@@ -73,6 +78,28 @@ def cumulative_gaussian(x, sigma=1.0, mu=0.0):
 def Phi(x):
     '''Cumulative distribution function for the standard Gaussian.'''
     return cumulative_gaussian(x)
+
+@jax.jit
+def bernoulli_GLM_likelihood(w, x, y):
+    '''Log-likelihood for a Bernoulli GLM'''
+    vx = vec(x)
+    LM = jnp.dot(w, vx)
+    p = safe_sigmoid(sign(y) * LM)
+    return p
+
+@jax.jit
+def policy_gradient(w, x, r=None):
+    p_R = bernoulli_GLM_likelihood(w, x, y=1.0)
+    if r is None:
+        r = effective_reward(x)
+    return r * jnp.outer(jnp.multiply(p_R, 1 - p_R), vec(x)).squeeze()
+
+@jax.jit
+def reinforce(w, x, y, r=None):
+    p = bernoulli_GLM_likelihood(w, x, y)
+    if r is None:
+        r = reward(x,y)
+    return r * jnp.outer(1-p, sign(y) * vec(x)).squeeze()
 
 class QLearningModel():
     def __init__(self, alpha: float, sigma: float, beta: float=1.0, softmax: bool=True) -> None:
@@ -240,34 +267,15 @@ class GLMLearn():
         # self.update_params(**params_dict)
         self.params = ParamsGLMLearn._make(params_array)
         
-    def emission_likelihood(self, w, x, y=1):
-        '''p(y | w, x), default p(y=1 | w, x)'''
-        vx = vec(x)
-        LM = jnp.dot(w, vx)
-        p = safe_sigmoid(sign(y) * LM)
-        return p
-
     def decision(self, w, x, key=None):
         if key is None:
             self.key, subkey = jax.random.split(self.key)
         else:
             subkey = key
 
-        p_R = self.emission_likelihood(w, x, y=1.0)
+        p_R = bernoulli_GLM_likelihood(w, x, y=1)
         y = jax.random.bernoulli(subkey, p_R).astype(int)
         return y
-
-    def policy_gradient(self, w, x, r=None):
-        p_R = self.emission_likelihood(w, x, y=1)
-        if r is None:
-            r = effective_reward(x)
-        return r * jnp.outer(jnp.multiply(p_R, 1 - p_R), vec(x)).squeeze()
-    
-    def reinforce(self, w, x, y, r=None):
-        p = self.emission_likelihood(w, x, y)
-        if r is None:
-            r = reward(x,y)
-        return r * jnp.outer(1-p, sign(y) * vec(x)).squeeze()
     
     @handle_none_params
     def update_weights(
@@ -281,9 +289,9 @@ class GLMLearn():
             subkey = key
         
         if self.learning_rule == 'reinforce':
-            learning_signal = params.alpha * self.reinforce(w, x, y, r)
+            learning_signal = params.alpha * reinforce(w, x, y, r)
         else: # use Policy gradient
-            learning_signal = params.alpha * self.policy_gradient(w, x, r)
+            learning_signal = params.alpha * policy_gradient(w, x, r)
 
         update_noise = jax.random.normal(subkey, shape=w.shape)
         update_noise = jnp.multiply(jnp.exp(params.log_sigma), update_noise)
@@ -305,9 +313,9 @@ class GLMLearn():
         In our case, the latents z are the GLM weights w
         '''
         if self.learning_rule == 'reinforce':
-            learning_signal = params.alpha * self.reinforce(z_prev, inputs, data, r=r)
+            learning_signal = params.alpha * reinforce(z_prev, inputs, data, r=r)
         else: # use Policy gradient
-            learning_signal = params.alpha * self.policy_gradient(z_prev, inputs, r=r)
+            learning_signal = params.alpha * policy_gradient(z_prev, inputs, r=r)
         mean = z_prev + learning_signal
         N = mean.shape[0]
         cov = jnp.multiply(jnp.square(jnp.exp(params.log_sigma)), jnp.eye(N))
