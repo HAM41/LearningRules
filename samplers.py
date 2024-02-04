@@ -13,7 +13,16 @@ from functools import partial
 import time 
 
 # @partial(jax.jit, static_argnums=(0,4,)) #! jitting raises OOM errors. Because of N?
-def bootstrap_filter(N: int, X, Y, model, seed=0, return_history=True, R=None, verbose=True):
+def bootstrap_filter(
+        N: int, 
+        X, Y, 
+        model, 
+        seed=0, 
+        return_history=True, 
+        R=None, 
+        session_indices=None,
+        verbose=True
+        ):
     '''
     Bootstrap Filter / Particle filtering algorithm from [1], along with likelihood evaluation,
     specifically tailored for models regression models from X to Y.
@@ -38,10 +47,16 @@ def bootstrap_filter(N: int, X, Y, model, seed=0, return_history=True, R=None, v
         T, M = X.shape
     if R is None:
         R = [None for _ in range(T)]
+
+    assert jnp.max(session_indices) < T, "Session indices exceed length of data."
+    if session_indices is None:
+        day_flags = [False for _ in range(T)]
+    else:
+        day_flags = [True if i in session_indices else False for i in range(T)]
     key = jax.random.PRNGKey(seed)
 
-    z_history = []
-    z_history_2 = []
+    posterior_history = []
+    filtering_history = []
     log_lik = 0.
     p_t = jnp.ones(N)
     ps = [p_t]
@@ -51,7 +66,6 @@ def bootstrap_filter(N: int, X, Y, model, seed=0, return_history=True, R=None, v
     
     for t in range(0,T):
         key, subkey = jax.random.split(key)
-        start_time = time.time()
 
         # 1. Prediction step : tilde z_t ~ p(z_t | z_{t-1})
         #   Sample proposal N particles from previous N particles
@@ -61,7 +75,7 @@ def bootstrap_filter(N: int, X, Y, model, seed=0, return_history=True, R=None, v
             tilde_z_t = jax.random.normal(subkey, shape=(N, M+1,))
         else:
             # tilde_z_t = models.policy_gradient(z_t, x=X[t-1], y=Y[t-1], r=R[t-1])
-            tilde_z_t = model.update_weights(z_t, x=X[t-1], y=Y[t-1], r=R[t-1])
+            tilde_z_t = model.update_weights(z_t, x=X[t-1], y=Y[t-1], r=R[t-1], day_flag=day_flags[t-1])
             # tilde_z_t = models.policy_gradient(z_t, x=X[t-1], r=R[t-1])
 
         # 2. Evaluate importance weights p(y_t | xhat_t, V_t)
@@ -78,24 +92,17 @@ def bootstrap_filter(N: int, X, Y, model, seed=0, return_history=True, R=None, v
             # If return_history, also keep track and resample entire z trajectories 
             #! Slow.
             if t==0:
-                z_history = jax.random.choice(subkey, tilde_z_t, shape=(N,), p=tilde_w_t)
-                z_history = z_history.reshape(N, 1, latent_dim)
+                posterior_history = jax.random.choice(subkey, tilde_z_t, shape=(N,), p=tilde_w_t)
+                posterior_history = posterior_history.reshape(N, 1, latent_dim)
             else:
-                # start = time.time()
-                z_history = jnp.concatenate((z_history, tilde_z_t[:, np.newaxis, :]), axis=1)
-                # print(f'Concatenation time: {time.time()-start:1.2e} seconds')
-                # start_2 = time.time()
-                z_history = jax.random.choice(subkey, z_history, shape=(N,), p=tilde_w_t)
-
-                p_t = jnp.multiply(p_t, tilde_w_t)
-                ps.append(p_t)
-                # print(f'Resampling time: {time.time()-start_2:1.2e} seconds')
-            z_t = z_history[:,-1,:]
+                posterior_history = jnp.concatenate((posterior_history, tilde_z_t[:, np.newaxis, :]), axis=1)
+                posterior_history = jax.random.choice(subkey, posterior_history, shape=(N,), p=tilde_w_t)
+            z_t = posterior_history[:,-1,:]
         else:
             z_t = jax.random.choice(subkey, tilde_z_t, shape=(N,), p=tilde_w_t)
         z_t = jax.random.choice(subkey, tilde_z_t, shape=(N,), p=tilde_w_t)
         if return_history:
-            z_history_2.append(z_t)
+            filtering_history.append(z_t)
 
         # 4. Update log-likelihood estimate
         # p(y_t | y_{1:t-1}) = \int p(y_t | z_t) p(z_t | y_{1:t-1}) dz_t
@@ -111,40 +118,14 @@ def bootstrap_filter(N: int, X, Y, model, seed=0, return_history=True, R=None, v
 
         if verbose:
             pbar.update(1)
-            # print(f'Time elapsed: {time.time()-start_time:1.2e} seconds')
-            # if t==20:
-            #     break
 
-    ps = jnp.stack(ps, axis=0)
+    if return_history:
+        filtering_history = jnp.stack(filtering_history, axis=0)
+        assert filtering_history.shape == (T, N, M+1)
 
-    z_history_2 = jnp.stack(z_history_2, axis=0)
-    assert z_history_2.shape == (T, N, M+1)
+        filtering_history = filtering_history.transpose(1,0,2)
 
-    # # z_history = jax.random.choice(subkey, z_history, shape=(N,T,), p=ps)
-    # # print(z_history.shape)
-    
-    # #! this tries to remedy the slow return history, but I think it doesn't work.
-    # #! it removes any temporal t-> t+1 dependencies between the z_history particles.
-    # out = jax.vmap(
-    #     lambda z, p: jax.random.choice(subkey, z, shape=(N,), p=p),
-    #     in_axes=(0,0)
-    # )(z_history_2, ps)
-    z_history_2 = z_history_2.transpose(1,0,2)
-
-    print(z_history_2.shape)
-    print(z_history.shape)
-
-    # z_history = resample(z_history, ps, subkey)
-    # print(z_history)
-
-    # if return_history:
-    #     z_history = jnp.stack(z_history, axis=0).transpose(1,0,2)
-
-    #     # Resample entire trajectories. Only need to do it once, at the end.
-    #     z_history = jax.random.choice(subkey, z_history, shape=(N,), p=tilde_w_t)
-
-
-    return (z_history, z_history_2), log_lik
+    return (posterior_history, filtering_history), log_lik
 
 def test_bootstrap_filter():
     true_alpha = 0.05
