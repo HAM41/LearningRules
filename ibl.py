@@ -141,11 +141,17 @@ def get_mouse_design(
 
 if __name__=='__main__':
     df = pd.read_csv('./data/ibl_learning_processed.csv')
-    df = df[df['lab']=='wittenlab']
 
-    X, Y, sess_ind = get_mouse_design(
-        df, subject='ibl_witten_02', 
-        regressors=['contrastLeft', 'contrastRight', 'previousChoice', 'previousRewarded']
-        )
+    labs = np.unique(df['lab'].values)
 
-    print(len(sess_ind))
+    for lab in labs:
+        lab_df = df[df['lab']==lab]
+        subjects = np.unique(lab_df['subject'].values)
+        print(lab, len(subjects))
+
+    # X, Y, sess_ind = get_mouse_design(
+    #     df, subject='ibl_witten_02', 
+    #     regressors=['contrastLeft', 'contrastRight', 'previousChoice', 'previousRewarded']
+    #     )
+
+    # print(len(sess_ind))

@@ -4,3 +4,9 @@ __pycache__/
 data/
 saves/
 notebooks/
+slurm_outs/
+figures/
+X/ # folder for little scripts and tests
+
+# Files
+*.slurm

@@ -7,7 +7,11 @@ class ParameterProperties():
 
 class ParamsGLMLearn(NamedTuple):
     log_sigma: Union[float, ParameterProperties]
+    log_sigma_day: Union[float, ParameterProperties]
     alpha: Union[float, ParameterProperties]
+
+    def __repr__(self) -> str:
+        return f'ParamsGLMLearn(log_sigma={self.log_sigma:1.2e}, log_sigma_day={self.log_sigma:1.2e}, alpha={self.alpha:2.6f})'
     
     @property
     def alpha(self) -> float:
@@ -20,7 +24,7 @@ class ParamsGLMLearn(NamedTuple):
         self._alpha = value
 
     def to_array(self) -> jnp.ndarray:
-        return jnp.array([self.log_sigma, self.alpha])
+        return jnp.array([self.log_sigma, self.log_sigma_day, self.alpha])
     
 def handle_none_params(func):
     def wrapper(self, *args, params=None, **kwargs):
