@@ -440,30 +440,30 @@ def parallel_fit():
     logging.info('Starting parallel fitting. PG learning rule.')
     logging.info(f'CPU count: {os.cpu_count()}.')
     with Pool() as pool:
-        results = pool.map(fit, zip(Xs, Ys, Rs))
+        results = pool.map(fit_MLL, zip(Xs, Ys, Rs))
 
     for i, res in enumerate(results):
         logging.info(f'Subject {lab_subjects[i]}: {res.x} at {res.nit} iterations. Likelihood: {-res.fun}')
     
     return results
 
-def fit_single_trajectory_search():
-    T = 10000
-    alpha_values = [0.0, 0.01, 0.1, 0.5]
-    sigma_values = [-5.0, -3.0, -1.0]
+# def fit_single_trajectory_search():
+#     T = 10000
+#     alpha_values = [0.0, 0.01, 0.1, 0.5]
+#     sigma_values = [-5.0, -3.0, -1.0]
 
-    convergence_dicts = []
-    for true_alpha in alpha_values:
-        for true_logsigma in sigma_values:
-            conv_dict = fit_single_trajectory(true_alpha, true_logsigma, T=T)
-            print('-'*50)
-            print(conv_dict)
-            print('-'*50)
+#     convergence_dicts = []
+#     for true_alpha in alpha_values:
+#         for true_logsigma in sigma_values:
+#             conv_dict = fit_single_trajectory(true_alpha, true_logsigma, T=T)
+#             print('-'*50)
+#             print(conv_dict)
+#             print('-'*50)
 
-            convergence_dicts.append(conv_dict)
+#             convergence_dicts.append(conv_dict)
 
-    with open(f'saves/convergence_dicts_w_initial_simplex_T{T}.pkl', 'wb') as f:
-        pickle.dump(convergence_dicts, f)
+#     with open(f'saves/convergence_dicts_w_initial_simplex_T{T}.pkl', 'wb') as f:
+#         pickle.dump(convergence_dicts, f)
 
 # def fit_single_trajectory(true_alpha, true_logsigma, T=1000):
 #     true_model = models.GLMLearn(dynamics_logscale=true_logsigma, alpha=true_alpha)
