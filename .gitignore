@@ -6,7 +6,8 @@ saves/
 notebooks/
 slurm_outs/
 figures/
-X/ # folder for little scripts and tests
+X/
+postprocessing/
 
 # Files
 *.slurm
