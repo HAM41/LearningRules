@@ -4,6 +4,7 @@ import jax.scipy as jsp
 import numpy as np
 import scipy as sp
 from typing import Tuple, Optional, Iterable, Union
+from functools import partial
 
 import os
 os.environ['JAX_PLATFORMS']='cpu'
@@ -47,19 +48,19 @@ def vec(x):
 #     return x[1:]
 
 @jax.jit
-def sign(y):
+def sign(y: jnp.ndarray):
     '''
     y: array-like, 
     '''
-    y = jnp.asarray(y).astype(bool)
+    # y = jnp.asarray(y).astype(bool)
     return jnp.where(y == 0., -1., 1.)
 
-def correct_choice(x):
+def correct_choice(x: jnp.ndarray):
     '''
     Returns the side {0,1} of the stimulus. 
     Also corresponds to the correct choice.
     '''
-    x = jnp.asarray(x).astype(float)
+    # x = jnp.asarray(x).astype(float)
     return jnp.where(x < 0, 0, 1)
 
 def reward(X, Y, r1=1.0, r0=0.0) -> np.ndarray:
@@ -87,6 +88,13 @@ def reward(X, Y, r1=1.0, r0=0.0) -> np.ndarray:
     r = jnp.where(mask_condition, r1, r)
 
     return r
+
+@partial(jax.jit, static_argnums=(0,))
+def set_day_flags(T, session_indices):
+    day_flags = jnp.zeros(T, dtype=bool)
+    day_flags = day_flags.at[session_indices].set(True)
+    day_flags = day_flags.at[0].set(False) # do not use 0 session index as a new day for transitions
+    return day_flags
 
 @jax.jit
 def effective_reward(X):
@@ -278,7 +286,7 @@ class GLMLearn():
         learning rule, or a closed-form policy gradient update.
     '''
     def __init__(self, 
-                 alpha: float=0.0, dynamics_logscale: float=-1.0, 
+                 alpha: Union[float, jnp.ndarray] = 0.0, log_sigma: float=-1.0, log_sigma_day=-1.0,
                  not_trainable: list=[],
                  learning_rule: str='policy_gradient', seed: int=0,
                  ) -> None:
@@ -336,11 +344,11 @@ class GLMLearn():
         
         # Change in mean weights from learning rule
         if self.learning_rule == 'reinforce':
-            learning_signal = params.alpha * reinforce(w, x, y, r)
+            learning_signal = jnp.multiply(params.alpha, reinforce(w, x, y, r))
         elif self.learning_rule == 'policy_gradient':
             learning_signal = jnp.multiply(params.alpha, policy_gradient(w, x, r)) # alpha * jnp.ones(w.shape[1])
         elif self.learning_rule == 'maximum_likelihood':
-            learning_signal = params.alpha * maximum_likelihood(w, x)
+            learning_signal = jnp.multiply(params.alpha, maximum_likelihood(w, x))
         else:
             raise ValueError(f"Learning rule {self.learning_rule} not implemented.")
 
@@ -374,9 +382,9 @@ class GLMLearn():
         In our case, the latents z are the GLM weights w
         '''
         if self.learning_rule == 'reinforce':
-            learning_signal = params.alpha * reinforce(z_prev, inputs, data, r=r)
+            learning_signal = jnp.multiply(params.alpha, reinforce(z_prev, inputs, data, r=r))
         else: # use Policy gradient
-            learning_signal = params.alpha * policy_gradient(z_prev, inputs, r=r)
+            learning_signal = jnp.multiply(params.alpha, policy_gradient(z_prev, inputs, r=r))
         mean = z_prev + learning_signal
         N = mean.shape[0]
 
@@ -391,9 +399,9 @@ class GLMLearn():
         '''
         Samples from the model, focusing only on univariate stimuli (stimulus intensity).
         Returns:
-            X: array, stimulus, of shape (T,)
+            X: array, stimulus, of shape (T, 1,)
             Y: array, decisions, of shape (T,)
-            W: array, weights, of shape (T, 2)
+            W: array, weights, of shape (T, 2, )
         '''
         if key is None:
             key = self.key
@@ -402,7 +410,7 @@ class GLMLearn():
 
         # Generate stimulus uniformly from range
         x_range = jnp.linspace(-1,1,12)
-        X = jax.random.choice(init_key, x_range, shape=(T,), replace=True)
+        X = jax.random.choice(init_key, x_range, shape=(T,1,), replace=True)
 
         # Encode percept and define initial values
         w = jax.random.normal(init_key, shape=(2,)) # w_0 ~ N(0, 1)
@@ -440,22 +448,20 @@ class GLMLearn():
 
         returns: 
             log_joint: float, value of log joint likelihood
+        #? Add potentially to parent class
         '''
         # Format arguments
         T = len(Y)
         if R is None:
             R = [None]*T
-        if session_indices == []:
-            day_flags = jnp.array([False for _ in range(T)], dtype=bool)
-        else:
-            # assert np.max(session_indices) <= T, "Session indices exceed length of data."
-            # if np.max(session_indices) > T:
-            #     logging.warning("Session indices exceed length of data.")
-            day_flags = jnp.array([True if i in session_indices else False for i in range(T)], dtype=bool)
-            day_flags = day_flags.at[0].set(False) #! do not use 0 session index as a new day for transitions
+        # if session_indices == []:
+        #     day_flags = jnp.array([False for _ in range(T)], dtype=bool)
+        # else:
+        #     day_flags = jnp.array([True if i in session_indices else False for i in range(T)], dtype=bool)
+        #     day_flags = day_flags.at[0].set(False) # do not use 0 session index as a new day for transitions
+        day_flags = set_day_flags(T, session_indices)
 
-        # Initial t=0 joint likelihood terms
-        # Dynamics
+        # Initial t=0 dynamics likelihood terms
         log_pz0 = self.initial_loglikelihood(Z[0])
 
         # # Emissions
@@ -466,8 +472,6 @@ class GLMLearn():
         # # # Loop over time steps 
         # # logpzzdays = []
         # # log_pzz0 = 0.
-        # #? vectorize with vmap?
-
         # day_Zs = []
         # prevday_Zs = []
         # for t in range(1,T):
@@ -489,82 +493,35 @@ class GLMLearn():
         #     # Update value and gradient of log joint
         #     log_joint_0 += log_pyz + _log_pzz
 
-        # print(Z[1:].shape, Z[:-1].shape, X[:-1].shape, Y[:-1].shape, day_flags[:-1].shape, R[:-1].shape)
-            
-        # day_flags[0] = False
         prev_day_flags = jnp.roll(day_flags, shift=-1)
-        # print(jnp.sum(day_flags))
-        
-        # print(Z.shape)
-        # print('day_Zs', day_Zs)
-        # print('Z[day_flags]', Z[day_flags], Z[day_flags])
-
+    
+        # Evaluate dynamics likelihoods on inter-sessions
         log_pzz_days = jax.vmap(
-            lambda z1, z0, x0, y0, r0: self.dynamics_loglikelihood(
-                z1, z0, x0, y0, params=params, day_flag=True, r=r0
-                )
+            lambda z1, z0, x0, y0, r0: self.dynamics_loglikelihood(z1, z0, x0, y0, params=params, day_flag=True, r=r0)
         )(
-            Z[day_flags],
-            Z[prev_day_flags], 
-            X[prev_day_flags], 
-            Y[prev_day_flags],
-            R[prev_day_flags]
+            Z[day_flags], Z[prev_day_flags], X[prev_day_flags], Y[prev_day_flags], R[prev_day_flags]
             )
         log_pzz_days = jnp.sum(log_pzz_days)
 
+        # Evaluate dynamics likelihoods within sessions
         log_pzz_trials = jax.vmap(
-            lambda z1, z0, x0, y0, r0: self.dynamics_loglikelihood(
-                z1, z0, x0, y0, params=params, day_flag=False, r=r0
-                )
+            lambda z1, z0, x0, y0, r0: self.dynamics_loglikelihood(z1, z0, x0, y0, params=params, day_flag=False, r=r0)
         )(
-            Z[~day_flags][1:], 
-            Z[~prev_day_flags][:-1], 
-            X[~prev_day_flags][:-1], 
-            Y[~prev_day_flags][:-1],
-            R[~prev_day_flags][:-1]
+            Z[~day_flags][1:], Z[~prev_day_flags][:-1], X[~prev_day_flags][:-1], Y[~prev_day_flags][:-1], R[~prev_day_flags][:-1]
             )
         log_pzz_trials = jnp.sum(log_pzz_trials)
+
+        # Combine to obtain log p(z_{0:T})
         log_pz = log_pz0 + log_pzz_days + log_pzz_trials
 
-            
-        # def log_pzz_t(t):
-        #     log_pzz = self.dynamics_loglikelihood(
-        #         Z[t], Z[t-1], X[t-1], Y[t-1], 
-        #         params=params, day_flag=day_flags[t], r=R[t-1]
-        #         )
-        
-        # dynamics_loglikelihood_t = lambda t: \
-        #     self.dynamics_loglikelihood(Z[t], Z[t-1], X[t-1], day_flag=t in session_indices)
-        # log_pzz1 = jnp.sum(jax.vmap(dynamics_loglikelihood_t)(jnp.arange(T)))
-        # print(log_pzz1, log_pzz0)
-
-        # log_pzz = jnp.sum(log_pzz_days)
-
-        # log_pzz_trials = jax.vmap(
-        #     lambda z1, z0, x0, y0, r0: self.dynamics_loglikelihood(
-        #         z1, z0, x0, y0, params=params, day_flag=False, r=r0
-        #         )
-        # )(
-        #     Z[~day_flags], 
-        #     Z[~prev_day_flags], 
-        #     X[~prev_day_flags], 
-        #     Y[~prev_day_flags],
-        #     R[~prev_day_flags]
-        #     )
-        # log_pzz += jnp.sum(log_pzz_trials)
-
+        # Evaluate emissions likelihood log p(y_{0:T} | z_{0:T})
         log_pyz = jax.vmap(
-            lambda z, x, y: jnp.log(bernoulli_GLM_likelihood(z, x, y)),
+            lambda z, x, y: jnp.log(bernoulli_GLM_likelihood(z, x, y)), #TODO write as self.emission_loglikelihood
         )(Z, X, Y)
         log_pyz = jnp.sum(log_pyz)
         
+        # Combine to obtain log p(y_{0:T}, z_{0:T})
         log_joint = log_pyz + log_pz
-
-        # print(log_joint_0, log_joint_1)
-
-        # print(log_joint)
-        # import sys
-        # sys.exit()
 
         return log_joint
 
