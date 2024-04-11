@@ -12,6 +12,10 @@ import jax.numpy as jnp
 from functools import partial
 import time 
 
+import logging
+logging.basicConfig(level=logging.INFO, format='[%(filename)s][%(asctime)s] %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
 # @partial(jax.jit, static_argnums=(0,4,)) #! jitting raises OOM errors. Because of N?
 def bootstrap_filter(
         N: int, 
@@ -20,7 +24,7 @@ def bootstrap_filter(
         seed=0, 
         return_history=True, 
         R=None, 
-        session_indices=None,
+        session_indices=[],
         verbose=True
         ):
     '''
@@ -35,7 +39,7 @@ def bootstrap_filter(
         R: array, (T,). Rewards.
         model: needs to implement some form of forward method, and some for of emission likelihood
     Returns:
-        z_history: List (T,), each element containing N samples, 
+        z_history: array, (N, T, M+1).
             Equally weighted latent samples to p(z_{1:T} | y_{1:T}) to evalute integrals with MC methods
         log_lik: scalar,
             Estimate of the marginal log-likelihood
@@ -48,18 +52,29 @@ def bootstrap_filter(
     if R is None:
         R = [None for _ in range(T)]
 
-    assert jnp.max(session_indices) < T, "Session indices exceed length of data."
-    if session_indices is None:
-        day_flags = [False for _ in range(T)]
-    else:
-        day_flags = [True if i in session_indices else False for i in range(T)]
+    # day_flags = jnp.zeros(T, dtype=bool)
+    # day_flags = day_flags.at[session_indices].set(True)
+    day_flags = models.set_day_flags(T, session_indices)
+
+    # if len(session_indices) > 0:
+    #     # day_flags = [False for _ in range(T)]
+    #     day_flags = jnp.zeros(T, dtype=bool)
+    # else:
+    #     # if np.max(session_indices) > T:
+    #     #     logging.warning("Session indices exceed length of data.")
+    #     # day_flags = [True if i in session_indices else False for i in range(T)]
     key = jax.random.PRNGKey(seed)
 
-    posterior_history = []
     filtering_history = []
     log_lik = 0.
     p_t = jnp.ones(N)
     ps = [p_t]
+    if return_history:
+        # Block out N x T x M+1 array (float32, x 4 in bytes) to store z_t samples.
+        # A lot of memory, but much faster. 
+        posterior_history = jnp.zeros((N, T, M+1), dtype=jnp.float32) # float16 ?
+    else:
+        posterior_history = []
 
     if verbose:
         pbar = tqdm(range(0,T), desc='Bootstrap filter')
@@ -75,7 +90,7 @@ def bootstrap_filter(
             tilde_z_t = jax.random.normal(subkey, shape=(N, M+1,))
         else:
             # tilde_z_t = models.policy_gradient(z_t, x=X[t-1], y=Y[t-1], r=R[t-1])
-            tilde_z_t = model.update_weights(z_t, x=X[t-1], y=Y[t-1], r=R[t-1], day_flag=day_flags[t-1])
+            tilde_z_t = model.update_weights(z_t, x=X[t-1], y=Y[t-1], r=R[t-1], day_flag=day_flags[t])
             # tilde_z_t = models.policy_gradient(z_t, x=X[t-1], r=R[t-1])
 
         # 2. Evaluate importance weights p(y_t | xhat_t, V_t)
@@ -90,19 +105,24 @@ def bootstrap_filter(
         _, latent_dim = tilde_z_t.shape
         if return_history:
             # If return_history, also keep track and resample entire z trajectories 
-            #! Slow.
-            if t==0:
-                posterior_history = jax.random.choice(subkey, tilde_z_t, shape=(N,), p=tilde_w_t)
-                posterior_history = posterior_history.reshape(N, 1, latent_dim)
-            else:
-                posterior_history = jnp.concatenate((posterior_history, tilde_z_t[:, np.newaxis, :]), axis=1)
-                posterior_history = jax.random.choice(subkey, posterior_history, shape=(N,), p=tilde_w_t)
-            z_t = posterior_history[:,-1,:]
+            # #! Slow.
+            # if t==0:
+            #     posterior_history = jax.random.choice(subkey, tilde_z_t, shape=(N,), p=tilde_w_t)
+            #     posterior_history = posterior_history.reshape(N, 1, latent_dim)
+            # else:
+            #     posterior_history = jnp.concatenate((posterior_history, tilde_z_t[:, np.newaxis, :]), axis=1)
+            #     posterior_history = jax.random.choice(subkey, posterior_history, shape=(N,), p=tilde_w_t)
+            # z_t = posterior_history[:,-1,:]
+
+            # ? Faster?? Much faster.
+            posterior_history = posterior_history.at[:,t,:].set(tilde_z_t)
+            posterior_history = jax.random.choice(subkey, posterior_history, shape=(N,), p=tilde_w_t)
+            z_t = posterior_history[:,t,:]
         else:
             z_t = jax.random.choice(subkey, tilde_z_t, shape=(N,), p=tilde_w_t)
         z_t = jax.random.choice(subkey, tilde_z_t, shape=(N,), p=tilde_w_t)
-        if return_history:
-            filtering_history.append(z_t)
+        # if return_history:
+        #     filtering_history.append(z_t)
 
         # 4. Update log-likelihood estimate
         # p(y_t | y_{1:t-1}) = \int p(y_t | z_t) p(z_t | y_{1:t-1}) dz_t
@@ -119,11 +139,11 @@ def bootstrap_filter(
         if verbose:
             pbar.update(1)
 
-    if return_history:
-        filtering_history = jnp.stack(filtering_history, axis=0)
-        assert filtering_history.shape == (T, N, M+1)
+    # if return_history:
+    #     filtering_history = jnp.stack(filtering_history, axis=0)
+    #     assert filtering_history.shape == (T, N, M+1)
 
-        filtering_history = filtering_history.transpose(1,0,2)
+    #     filtering_history = filtering_history.transpose(1,0,2)
 
     return (posterior_history, filtering_history), log_lik
 
