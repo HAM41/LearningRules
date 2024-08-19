@@ -8,7 +8,7 @@ class ParameterProperties():
 class ParamsGLMLearn(NamedTuple):
     log_sigma: Union[float, ParameterProperties]
     log_sigma_day: Union[float, ParameterProperties]
-    alpha: Union[float, jnp.ndarray, ParameterProperties]
+    log_alpha: Union[float, jnp.ndarray, ParameterProperties]
 
     # def __repr__(self) -> str:
     #     return f'ParamsGLMLearn(log_sigma={self.log_sigma:1.2e}, log_sigma_day={self.log_sigma:1.2e}, alpha={self.alpha:2.6f})'

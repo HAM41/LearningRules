@@ -52,7 +52,7 @@ def sign(y: jnp.ndarray):
     '''
     y: array-like, 
     '''
-    # y = jnp.asarray(y).astype(bool)
+    y = jnp.asarray(y).astype(bool)
     return jnp.where(y == 0., -1., 1.)
 
 def correct_choice(x: jnp.ndarray):
@@ -89,7 +89,7 @@ def reward(X, Y, r1=1.0, r0=0.0) -> np.ndarray:
 
     return r
 
-@partial(jax.jit, static_argnums=(0,))
+# @partial(jax.jit, static_argnums=(0,))
 def set_day_flags(T, session_indices):
     day_flags = jnp.zeros(T, dtype=bool)
     day_flags = day_flags.at[session_indices].set(True)
@@ -124,6 +124,7 @@ def bernoulli_GLM_likelihood(w, x, y):
     #     # LM = w @ vx.T
     #     LM = jnp.einsum('ij,ij->i', w, vx)
     #     print(LM.shape)
+    # print(LM.shape, sign(y).shape)
     p = safe_sigmoid(sign(y) * LM)
     return p
 
@@ -139,11 +140,6 @@ def reinforce(w, x, y, r=None):
     p = bernoulli_GLM_likelihood(w, x, y)
     if r is None:
         r = reward(x,y)
-    # print(r.shape, p.shape, vec(x).shape, sign(y).shape)
-
-    # signed_vx = jnp.multiply(sign(y)[:,None], vec(x))
-    # print(signed_vx.shape)
-    # return r * 1-p * sign(y) * vec(x)
     return r * jnp.outer(1-p, sign(y) * vec(x)).squeeze()
 
 @jax.jit
@@ -286,16 +282,16 @@ class GLMLearn():
         learning rule, or a closed-form policy gradient update.
     '''
     def __init__(self, 
-                 alpha: Union[float, jnp.ndarray] = 0.0, log_sigma: float=-1.0, log_sigma_day=-1.0,
-                 not_trainable: list=[],
+                 log_alpha: Union[float, jnp.ndarray] = 0.0, log_sigma: float=-1.0, log_sigma_day=-1.0,
+                 not_trainable: list=[], z_0: Union[float, jnp.ndarray] = 0.0,
                  learning_rule: str='policy_gradient', seed: int=0,
                  ) -> None:
         self.learning_rule = learning_rule.lower()
 
-        self.params = ParamsGLMLearn(log_sigma=log_sigma, alpha=alpha, log_sigma_day=log_sigma_day)
+        self.params = ParamsGLMLearn(log_sigma=log_sigma, log_alpha=log_alpha, log_sigma_day=log_sigma_day)
         self.props = ParamsGLMLearn(
             log_sigma=ParameterProperties(), 
-            alpha=ParameterProperties(),
+            log_alpha=ParameterProperties(),
             log_sigma_day=ParameterProperties()
             )
         for param in not_trainable:
@@ -303,6 +299,7 @@ class GLMLearn():
 
         # Initialization for latents and key for reproducibility
         self.key = jax.random.PRNGKey(seed)
+        self.z_0 = z_0
 
     def update_params(self, **kwargs) -> None:
         '''passes trainable kwargs to self.params._replace
@@ -344,11 +341,11 @@ class GLMLearn():
         
         # Change in mean weights from learning rule
         if self.learning_rule == 'reinforce':
-            learning_signal = jnp.multiply(params.alpha, reinforce(w, x, y, r))
+            learning_signal = jnp.multiply(jnp.exp(params.log_alpha), reinforce(w, x, y, r))
         elif self.learning_rule == 'policy_gradient':
-            learning_signal = jnp.multiply(params.alpha, policy_gradient(w, x, r)) # alpha * jnp.ones(w.shape[1])
+            learning_signal = jnp.multiply(jnp.exp(params.log_alpha), policy_gradient(w, x, r)) # alpha * jnp.ones(w.shape[1])
         elif self.learning_rule == 'maximum_likelihood':
-            learning_signal = jnp.multiply(params.alpha, maximum_likelihood(w, x))
+            learning_signal = jnp.multiply(jnp.exp(params.log_alpha), maximum_likelihood(w, x))
         else:
             raise ValueError(f"Learning rule {self.learning_rule} not implemented.")
 
@@ -367,13 +364,27 @@ class GLMLearn():
     def initial_loglikelihood(self, z_0):
         """log p(z_0). We use p(z_0) = N(0,I)."""
         if z_0.shape == (1,):
-            log_lik = lambda z: jsp.stats.norm.logpdf(z)#, loc=z_0_mean, scale=1.0)
+            log_lik = lambda z: jsp.stats.norm.logpdf(z, loc=self.z_0, scale=1.0)
         else:
-            # N = w_init_mean.shape[0]
+            D = z_0.shape[0]
+            assert z_0.shape == (D,), f"z_0 shape {z_0.shape} does not match expected shape ({D},)"
             log_lik = lambda z: jsp.stats.multivariate_normal.logpdf(
-                z, mean=jnp.zeros_like(z), cov=jnp.diag(jnp.ones_like(z))
+                z, mean=self.z_0 * jnp.ones(D), cov=jnp.diag(jnp.ones(D))
                 )
         return log_lik(z_0)
+
+    def sample_initial(self, N, d=1, key=None):
+        '''Sample from the initial distribution p(z_0)'''
+        if key is None:
+            self.key, subkey = jax.random.split(self.key)
+        else:
+            subkey = key
+
+        # if z_0 is None:
+        #     z_0 = jnp.zeros((d+1))
+
+        # key, subkey = jax.random.split(self.key)
+        return self.z_0 + jax.random.normal(subkey, shape=(N, d+1,))
     
     @handle_none_params
     def dynamics_loglikelihood(self, z_next, z_prev, inputs, data, 
@@ -382,9 +393,9 @@ class GLMLearn():
         In our case, the latents z are the GLM weights w
         '''
         if self.learning_rule == 'reinforce':
-            learning_signal = jnp.multiply(params.alpha, reinforce(z_prev, inputs, data, r=r))
+            learning_signal = jnp.multiply(jnp.exp(params.log_alpha), reinforce(z_prev, inputs, data, r=r))
         else: # use Policy gradient
-            learning_signal = jnp.multiply(params.alpha, policy_gradient(z_prev, inputs, r=r))
+            learning_signal = jnp.multiply(jnp.exp(params.log_alpha), policy_gradient(z_prev, inputs, r=r))
         mean = z_prev + learning_signal
         N = mean.shape[0]
 
@@ -443,7 +454,7 @@ class GLMLearn():
         parameters:
             X: array, stimulus, of shape (T, input_dim)
             Y: array, decisions, of shape (T, output_dim)
-            Z: array, latent variables, of shape (T, latent_dim)
+            Z: array, latent variables, of shape (T, latent_dim) = (T, input_dim + 1)
             params: ParamsGLMLearn, model parameters
 
         returns: 
@@ -454,6 +465,9 @@ class GLMLearn():
         T = len(Y)
         if R is None:
             R = [None]*T
+        if params is None:
+            params = self.params
+            
         # if session_indices == []:
         #     day_flags = jnp.array([False for _ in range(T)], dtype=bool)
         # else:
@@ -525,18 +539,34 @@ class GLMLearn():
 
         return log_joint
 
+
 if __name__=='__main__':
     # Seed for reproducibility
-    seed = 0
+    seed = 1
     key = jax.random.PRNGKey(seed)
 
     # true_model = QLearningModel(sigma=0.3, alpha=0.5, softmax=False)
     # X, Y, m, Vs = true_model.sample(10)
     # print(X, Y, m, Vs)
 
-    true_model = GLMLearn(log_sigma=-3.0, alpha=1.0, seed=seed, learning_rule='reinforce')
-    X, Y, Ws = true_model.sample(1000)
+    true_params = ParamsGLMLearn(log_sigma=-2.744629, log_sigma_day=-1.1630859, log_alpha=jnp.array([-4.8521523, -1.7326317]))
+    true_model_PG = GLMLearn(**true_params._asdict(), seed=seed, learning_rule='policy_gradient')
+    _, _, Ws_PG, _ = true_model_PG.sample(1000)
 
-    for log_sigma in np.linspace(-5,-1,10):
-        print(log_sigma, true_model.log_joint(X, Y, Ws, params=ParamsGLMLearn(log_sigma, -1.0, 0.5)))
+    true_model_R = GLMLearn(**true_params._asdict(), seed=seed, learning_rule='reinforce')
+    _, _, Ws_R, _ = true_model_R.sample(1000)
+
+    import matplotlib.pyplot as plt 
+    fig, axs = plt.subplots(nrows=2, constrained_layout=True)
+    axs[0].plot(Ws_PG[:,0], c="tab:blue", label='Policy Gradient')
+    axs[0].plot(Ws_PG[:,1], c="tab:orange")
+    axs[0].plot(Ws_R[:,0], c="tab:blue", ls='--', label='REINFORCE')
+    axs[0].plot(Ws_R[:,1], c="tab:orange", ls='--',)
+    # axs[0].plot(Ws_R, label='REINFORCE')
+    axs[1].plot(Ws_PG - Ws_R)
+    plt.savefig('figures/weights_logalpha-2.png', dpi=300)
+    plt.close()
+
+    # for log_sigma in np.linspace(-5,-1,10):
+    #     print(log_sigma, true_model.log_joint(X, Y, Ws, params=ParamsGLMLearn(log_sigma, -1.0, 0.5)))
     # print(X, Y, Ws)
