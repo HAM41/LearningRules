@@ -25,7 +25,7 @@ def bootstrap_filter(
         return_history=True, 
         R=None, 
         session_indices=[],
-        verbose=True
+        verbose=True,
         ):
     '''
     Bootstrap Filter / Particle filtering algorithm from [1], along with likelihood evaluation,
@@ -87,7 +87,8 @@ def bootstrap_filter(
         #   Outcome: {tilde z_t^i, 1/N}, an approximation to p(z_t|y_{1:t-1})
 
         if t == 0:
-            tilde_z_t = jax.random.normal(subkey, shape=(N, M+1,))
+            # tilde_z_t = jax.random.normal(subkey, shape=(N, M+1,))
+            tilde_z_t = model.sample_initial(N, d=M)
         else:
             # tilde_z_t = models.policy_gradient(z_t, x=X[t-1], y=Y[t-1], r=R[t-1])
             tilde_z_t = model.update_weights(z_t, x=X[t-1], y=Y[t-1], r=R[t-1], day_flag=day_flags[t])
@@ -122,7 +123,8 @@ def bootstrap_filter(
             z_t = jax.random.choice(subkey, tilde_z_t, shape=(N,), p=tilde_w_t)
         z_t = jax.random.choice(subkey, tilde_z_t, shape=(N,), p=tilde_w_t)
         # if return_history:
-        #     filtering_history.append(z_t)
+        
+        filtering_history.append(z_t)
 
         # 4. Update log-likelihood estimate
         # p(y_t | y_{1:t-1}) = \int p(y_t | z_t) p(z_t | y_{1:t-1}) dz_t
@@ -140,10 +142,10 @@ def bootstrap_filter(
             pbar.update(1)
 
     # if return_history:
-    #     filtering_history = jnp.stack(filtering_history, axis=0)
-    #     assert filtering_history.shape == (T, N, M+1)
+    filtering_history = jnp.stack(filtering_history, axis=0)
+    assert filtering_history.shape == (T, N, M+1)
 
-    #     filtering_history = filtering_history.transpose(1,0,2)
+    filtering_history = filtering_history.transpose(1,0,2)
 
     return (posterior_history, filtering_history), log_lik
 
@@ -151,18 +153,33 @@ def test_bootstrap_filter():
     true_alpha = 0.05
     true_logsigma = -1.0
     # true_model = QLearningModel(sigma=true_sigma, alpha=true_alpha, softmax=True)
-    true_model = GLMLearn(dynamics_logscale=true_logsigma, alpha=true_alpha)
+    true_model = GLMLearn(log_sigma=true_logsigma, log_alpha=jnp.log(true_alpha))
 
 
-    T = 500
-    for i in range(10):
-        key = jax.random.PRNGKey(i)
-        X, Y, Z = true_model.sample(T, key=key)
+    T = 1000
+    # for i in range(2):
+    key = jax.random.PRNGKey(0)
+    X, Y, Z, _ = true_model.sample(T, key=key)
 
-        log_liks, Z_errors = [], []
-        N_particles = 10000
+    log_liks, Z_errors = [], []
+    N_particles = 50000
 
-        _, log_lik = bootstrap_filter(N_particles, X=X, Y=Y, model=true_model, return_history=False, verbose=True)
+    (z_smooth, z_filt), log_lik = bootstrap_filter(N_particles, X=X, Y=Y, model=true_model, return_history=True, verbose=True)
+    Z_error = jnp.linalg.norm(z_smooth.mean(axis=0) - Z)
+    print(Z_error, log_lik)
+
+    plt.figure();
+    for i in range(2):
+        plt.plot(z_smooth.mean(axis=0)[:,i], c='tab:blue', label='Smoothed')
+        plt.fill_between(np.arange(T), z_smooth.mean(axis=0)[:,i]-z_smooth.std(axis=0)[:,i], z_smooth.mean(axis=0)[:,i]+z_smooth.std(axis=0)[:,i], alpha=0.3, color='tab:blue')
+
+        plt.plot(z_filt.mean(axis=0)[:,i], c='tab:orange', label='filtered')
+        plt.fill_between(np.arange(T), z_filt.mean(axis=0)[:,i]-z_filt.std(axis=0)[:,i], z_filt.mean(axis=0)[:,i]+z_filt.std(axis=0)[:,i], alpha=0.3, color='tab:orange')
+    plt.plot(Z, c='k', label='True')
+    plt.legend()
+    plt.savefig('tests/figures/test_bootstrap_filter.png')
+    plt.close()
+
         # _, log_lik = bootstrap_filter(N_particles, X=X, Y=Y, return_history=False, verbose=True)
     # for N_particles in particles_range:
     # _, log_lik = bootstrap_filter_2(N_particles, X=X, Y=Y, update_weights=true_model.update_weights, emission_likelihood=true_model.emission_likelihood, return_history=False, verbose=True)
