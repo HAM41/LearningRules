@@ -98,26 +98,34 @@ def make_n_dimensional(points, key=None):
 
     return points_array
 
-def fit_EM(X, Y, R=None, n_iters=200, model_kwargs={}, seed=0, N_particles=1000, session_indices=[]):
+def fit_EM(
+        X, Y, R=None, 
+        n_iters=200, model_kwargs={}, 
+        seed=0, N_particles=1000, 
+        session_indices=[], initial_params=None, 
+        m_step_iters=500,
+        posterior_type='smooth'
+        ):
     '''
     Fit model with SMC EM: posterior samples are obtained by SMC, and used to evalutate with Monte-Carlo the ELBO. 
     '''
     logging.info(f'Fitting model with SMC-EM.')
+    logging.info(f"Posterior type: {posterior_type}. N_particles: {N_particles}.")
     T, D = X.shape
 
     # current_params = [-5.0, -1.0, 0.5]
 
-    initial_params = ParamsGLMLearn(log_sigma=-3.0, log_sigma_day=-1.0, alpha=0.5 * jnp.ones(D+1))
+    if initial_params is None:
+        initial_params = ParamsGLMLearn(log_sigma=-3.0, log_sigma_day=-1.0, alpha=0.5 * jnp.ones(D+1))._asdict()
 
     learning_rate = 1e-02
     # optimizer = optax.adam(learning_rate)
     opt = optax.chain(
         optax.adam(learning_rate),
         optax.contrib.reduce_on_plateau(
-            learning_rate=0.01,
-            patience=5, # Number of epochs with no improvement after which learning rate will be reduced
+            patience=10, # Number of epochs with no improvement after which learning rate will be reduced
             factor=0.1, # Factor by which to reduce the learning rate
-            rtol=1e-3, 
+            rtol=1e-4, 
         ),
     )
 
@@ -134,8 +142,8 @@ def fit_EM(X, Y, R=None, n_iters=200, model_kwargs={}, seed=0, N_particles=1000,
     #         )
     #     return - val
 
-    ELBOs = [] 
-    params = initial_params._asdict()
+    liks = [] 
+    params = initial_params
 
     logging.info("Starting EM procedure.")
     for iter_id in jnp.arange(n_iters):
@@ -143,17 +151,25 @@ def fit_EM(X, Y, R=None, n_iters=200, model_kwargs={}, seed=0, N_particles=1000,
         # model.update_params_from_array(params)
 
         # E-step: MC samples from the posterior
-        (Zs, _), lik = samplers.bootstrap_filter(
+        (Zs_smooth, Zs_filt), lik = samplers.bootstrap_filter(
             N_particles, 
             X, Y, 
             model, 
             R=R, session_indices=session_indices, 
-            return_history=True, verbose=False,
+            return_history=True if posterior_type == 'smooth' else False, 
+            verbose=False,
             )
+        if posterior_type == 'smooth':
+            Zs = Zs_smooth
+            del Zs_filt
+        elif posterior_type == 'filt':
+            Zs = Zs_filt
+            del Zs_smooth
         assert Zs.shape == (N_particles, T, D+1)
         logging.info(f'[{iter_id} - E] Lik: {lik:5.2f}')
 
         # Z_mean = jnp.mean(Zs, axis=0)
+        # print('Average std over particles', jnp.std(Zs, axis=0).mean(axis=0))
 
         # M-Step
         # def neg_log_joint(params_array):
@@ -184,12 +200,23 @@ def fit_EM(X, Y, R=None, n_iters=200, model_kwargs={}, seed=0, N_particles=1000,
                 return model.log_joint(
                     X, Y, z, R=R, 
                     params = ParamsGLMLearn(**_params),
-                    session_indices=session_indices
+                    session_indices=session_indices,
                     )
         
             log_joint_MCvalues = jax.vmap(log_joint_per_particle)(Zs) 
+            # log_joint_MCvalues = jax.pmap(log_joint_per_particle)(Zs) 
             val = jnp.mean(log_joint_MCvalues, axis=0)
             return - val
+        
+        # def neg_log_joint2(_params, _z):
+        #     return model.log_joint(
+        #         X, Y, _z, R=R, 
+        #         params = ParamsGLMLearn(**_params),
+        #         session_indices=session_indices
+        #         )
+        
+        # print(jax.grad(neg_log_joint2, argnums=0)(params))
+        # sys.exit()
 
 
         # res = minimize(
@@ -214,13 +241,31 @@ def fit_EM(X, Y, R=None, n_iters=200, model_kwargs={}, seed=0, N_particles=1000,
 
         # use optax for optimization
         opt_state = opt.init(params)
-        for _ in range(100):
+        for m_iter_id in range(m_step_iters):
+
+            # Grad of vmap over particles
             val, grad = jax.value_and_grad(neg_log_joint)(params)
+
+            # # Vmap of grads over particles
+            # grads = jax.vmap(
+            #     lambda z: jax.grad(lambda _params: neg_log_joint2(_params, z))
+            #     )(Zs)
+            # print(grad['log_alpha'].shape, grads.shape)
+            # sys.exit()
+
+            # Update
             updates, opt_state = opt.update(grad, opt_state, loss=val)
             params = optax.apply_updates(params, updates)
-            # logging.info(f'[{iter_id} - M] joint: {-val:.2f}, grad: {grad}, params: {params}')
+            if m_iter_id % 100 == 0:
+                logging.info(f'[{iter_id} - M - {m_iter_id}] joint: {-val:.2f}, log_alpha grad norm = {jnp.linalg.norm(grad["log_alpha"]):.2e}')
 
         logging.info(f"[{iter_id} - M] Optim result: {params}")
+
+        logging.info(f'Memory: {process.memory_info().rss/1e6:5.2f} MB')
+
+        if learning_rate * opt_state[1].lr < 1e-06:
+            logging.info(f"Learning rate below threshold. Exiting.")
+            break
 
         # # ELBO:
         # def log_joint_per_particle(z):
@@ -243,8 +288,18 @@ def fit_EM(X, Y, R=None, n_iters=200, model_kwargs={}, seed=0, N_particles=1000,
 
         # # Update
         # current_params = res.x
+        
+        liks.append(lik.item())
 
-    return params, ELBOs
+    result_dict = {
+        'params': params,
+        'T': T,
+        'N_particles': N_particles,
+        'seed': seed,
+        'liks': liks
+    }
+
+    return params, result_dict
 
 def fit_LaplaceEM(X, Y, R=None, n_iters=200, model_kwargs={}, seed=0, N_particles=1000, session_indices=[]):
     T, D = X.shape
@@ -397,10 +452,66 @@ def fit_MLL(X, Y, R=None, model_kwargs={}, seed=0, N_particles=10000, session_in
         )
     return res
 
+def find_initial(
+        X: list[jnp.ndarray], Y: list[jnp.ndarray], R: list[jnp.ndarray] = None, session_indices: list[list]=[[]],
+        N_particles: int=10000, 
+        model_kwargs: dict={}, seed: int=0
+        ) -> jnp.ndarray:
+    log_sigmas = jnp.linspace(-4.0, -1.0, 5)
+    log_sigma_days = jnp.linspace(-2.0, 0.0, 3)
+    log_alphas = jnp.linspace(-8.0, -2.0, 8)
+    grid_points = jnp.stack(jnp.meshgrid(log_alphas, log_sigmas, log_sigma_days), axis=-1).reshape(-1,3)
+    logging.info(f'Finding initialization from grid of {grid_points.shape} points.')
+
+    # Define loss
+    def neg_MLL(params_array):
+        '''Negative marginal log-likelihood, as a function of the parameters.'''
+        log_alpha, log_sigma, log_sigma_day = params_array
+
+        # Instantiate model
+        model = models.GLMLearn(
+            log_alpha=log_alpha, log_sigma=log_sigma, log_sigma_day=log_sigma_day, 
+            seed=seed, 
+            **model_kwargs
+            )
+
+        # Compute marginal log-likelihood with SMC, summing over subjects
+        loglik = 0.
+        for _X, _Y, _R, _sess_ind in zip(X, Y, R, session_indices):
+            _, _loglik = samplers.bootstrap_filter(
+                N_particles, 
+                _X, _Y, 
+                model, 
+                R=_R, session_indices=_sess_ind, 
+                return_history=False, verbose=False
+                )
+            loglik += _loglik
+        return -loglik
+
+    
+    # Compute neg MLL over grid
+    vals = jax.vmap(neg_MLL)(grid_points)
+    # vals = jax.pmap(neg_MLL)(grid_points)
+
+    # Print 5 highest MLL grid points
+    sorted_indices = jnp.argsort(vals)
+    logging.info('Top 5 grid points ([log_alpha, log_sigma, log_sigma_day]):')
+    for i in range(5):
+        logging.info(f'\tneg MLL: {vals[sorted_indices[i]]:.2f}, Grid point: {grid_points[sorted_indices[i]]}')
+
+    # Take lowest
+    best_params = grid_points[sorted_indices[0]]
+    # logging.info(f'Best params: [log_alpha, log_sigma, log_sigma_day]={best_params}, neg MLL: {vals[sorted_indices[0]]:.2f}, ')
+    return best_params
+
+
+
+    
+
 def fit_optax(
         X: list[jnp.ndarray], Y: list[jnp.ndarray], R: list[jnp.ndarray] = None, session_indices: list[list]=[[]],
         n_iters: int=200, N_particles: int=10000, 
-        model_kwargs: dict={}, seed: int=0,
+        model_kwargs: dict={}, seed: int=0, initial_params: Optional[dict] = None,
         ):
     '''
     Fit model via optimization of the marginal log-likelihood (MLL) using optax. 
@@ -417,20 +528,23 @@ def fit_optax(
     Returns:
         params: optimized parameters
     '''
-    learning_rate = 1e-02
+    learning_rate = 0.01
     T, d = X[0].shape
-    initial_params = ParamsGLMLearn(log_sigma=-3.0, log_sigma_day=-1.0, alpha=0.5 * jnp.ones(d+1))
+
+    if initial_params is None:
+        initial_params = ParamsGLMLearn(log_sigma=-3.0, log_sigma_day=-1.0, log_alpha= -0.5 * jnp.ones(d+1))._asdict()
 
     # optimizer = optax.adam(learning_rate)
+    # optimizer = optax.noisy_sgd(learning_rate=learning_rate)
     optimizer = optax.chain(
         optax.adam(learning_rate),
         optax.contrib.reduce_on_plateau(
-            patience=5, # Number of epochs with no improvement after which learning rate will be reduced
+            patience=10, # Number of epochs with no improvement after which learning rate will be reduced
             factor=0.1, # Factor by which to reduce the learning rate
-            rtol=1e-3, 
+            # rtol=1e-3, 
         ),
     )
-    logging.info(f'Starting optimization. Optimizer: Adam, learning rate: {learning_rate}.')
+    logging.info(f'Starting optimization. Optimizer: adam + reduce_on_plateau, learning rate: {learning_rate}')
 
 
 
@@ -478,21 +592,10 @@ def fit_optax(
     
 
     # Obtain the `opt_state` that contains statistics for the optimizer.
-    params = initial_params._asdict()
+    params = initial_params #._asdict()
     opt_state = optimizer.init(params)
     lr_scale = opt_state[1].lr
     for i in range(n_iters):
-        # def neg_evidence_value_and_grad(_X, _Y, _R, _sess_ind):
-        #     def neg_MLL(params):
-        #         return samplers.bootstrap_filter(
-        #                 N_particles, 
-        #                 _X, _Y, 
-        #                 model = models.GLMLearn(seed=seed, **params, **model_kwargs), 
-        #                 R=_R, session_indices=_sess_ind, 
-        #                 return_history=False, verbose=False
-        #                 )[1]
-        #     grad = jax.grad(neg_MLL)(params)
-        #     return grad
 
         # with Pool(10) as pool:
         #     grads = pool.map(neg_evidence_value_and_grad, zip(X, Y, R, session_indices))
@@ -503,6 +606,7 @@ def fit_optax(
         # updates, opt_state = optimizer.update(grad, opt_state)
         updates, opt_state = optimizer.update(grad, opt_state, loss=val)
         params = optax.apply_updates(params, updates)
+        # params['alpha'] = optax.projections.projection_non_negative(params['alpha'])
 
         if opt_state[1].lr != lr_scale:
             lr_scale = opt_state[1].lr
@@ -510,7 +614,6 @@ def fit_optax(
         logging.info(f'[{i}] lik: {-val:.2f}, params: {params}')
 
         # Ensure alpha is non-negative
-        params['alpha'] = optax.projections.projection_non_negative(params['alpha'])
     return params
 
 # def neg_evidence_value_and_grad(args):
@@ -700,8 +803,8 @@ if __name__=='__main__':
         Y.append(Y_sub)
         sess_ind.append(jnp.array(sess_ind_sub))
 
-    if not args.all_subjects:
-        logging.info(f"Loaded subject '{fit_subjects[0]}' data. T={len(Y[0])}.")
+    # if not args.all_subjects:
+    #     logging.info(f"Loaded subject '{fit_subjects[0]}' data. T={len(Y[0])}.")
     logging.info(f"Regressors: {['bias'] + regressors}")
 
     # else:
@@ -731,23 +834,125 @@ if __name__=='__main__':
     #                         learning_rule=args.learning_rule)
     # X, Y, true_Z, true_sample_noises = model.sample(T=5000, key=key)
 
-    # if args.all_subjects:
     if args.learning_rule == 'reinforce':
         R = [jnp.asarray(models.reward(X_sub[:,1]-X_sub[:,0], Y_sub)) for X_sub, Y_sub in zip(X, Y)]
     elif args.learning_rule == 'policy_gradient':
         R = [jnp.asarray(models.effective_reward(X_sub[:,1]-X_sub[:,0])) for X_sub, Y_sub in zip(X, Y)]
+
+    # Format initial condition 
+    T_start = 0
+    T = len(X[0])
+
+    if T_start > 0:
+        #! Hard coded
+        # rec_params = {'log_alpha': jnp.array([-1.8199868 , -7.543031  , -4.49377   , -1.1154436 , -0.75007665], dtype=jnp.float32), 'log_sigma': 4.6615686, 'log_sigma_day': 0.09152629}
+        
+        # 0 : 2000
+        rec_params_2000 = {'log_alpha': jnp.array([-0.8376785 , -0.9085973 , -0.90883476, -0.90600324, -0.86133814],      dtype=jnp.float32), 'log_sigma': -2.5854561, 'log_sigma_day': -0.49938372}
+
+        # 2000 : 4000
+        rec_params_20004000 = {'log_alpha': jnp.array([-1.3416517 , -1.414401  , -1.392542  , -1.4192349 , -0.63191247], dtype=jnp.float32), 'log_sigma': -2.0918186, 'log_sigma_day': -0.2745998 }
+
+        # 4000 : 6000
+        rec_params_40006000 = {'log_alpha': jnp.array([-1.6269428, -1.5575756, -1.6327392, -0.8933461, -0.6904897],      dtype=jnp.float32), 'log_sigma':-1.892599, 'log_sigma_day': 0.42951426}
+
+        # 6000 : 8000
+        rec_params_60008000 = {'log_alpha': jnp.array([-1.7647194, -1.6801634, -1.7461658, -1.0577695, -1.0274256],      dtype=jnp.float32), 'log_sigma': -1.7569481, 'log_sigma_day': 0.5056702}
+    else:
+        rec_params = None
+
+    if T_start > 0:
+
+        # First, 0 : 2000
+        (Zs, _), _ = samplers.bootstrap_filter(
+            N_particles,
+            X[0][:2000], Y[0][:2000],
+            models.GLMLearn(seed=seed, **rec_params_2000, learning_rule=args.learning_rule),
+            R=R[0][:2000], session_indices=sess_ind[0],
+            return_history=True, verbose=True
+            )
+        z_0 = jnp.mean(Zs[:,-1,:], axis=0)
+
+        # Second, 2000 : 4000
+        (Zs, _), _ = samplers.bootstrap_filter(
+            N_particles,
+            X[0][2000:4000], Y[0][2000:4000],
+            models.GLMLearn(seed=seed, **rec_params_20004000, learning_rule=args.learning_rule, z_0=z_0),
+            R=R[0][2000:4000], session_indices=sess_ind[0],
+            return_history=True, verbose=True
+            )
+        z_0 = jnp.mean(Zs[:,-1,:], axis=0)
+
+        # Third, 4000 : 6000
+        (Zs, _), _ = samplers.bootstrap_filter(
+            N_particles,
+            X[0][4000:6000], Y[0][4000:6000],
+            models.GLMLearn(seed=seed, **rec_params_40006000, learning_rule=args.learning_rule, z_0=z_0),
+            R=R[0][4000:6000], session_indices=sess_ind[0],
+            return_history=True, verbose=True
+            )
+        z_0 = jnp.mean(Zs[:,-1,:], axis=0)
+
+        # Third, 6000 : 8000
+        (Zs, _), _ = samplers.bootstrap_filter(
+            N_particles,
+            X[0][6000:8000], Y[0][6000:8000],
+            models.GLMLearn(seed=seed, **rec_params_60008000, learning_rule=args.learning_rule, z_0=z_0),
+            R=R[0][6000:8000], session_indices=sess_ind[0],
+            return_history=True, verbose=True
+            )
+        z_0 = jnp.mean(Zs[:,-1,:], axis=0)
+
+        logging.info(f"Starting weights at t={T_start} : {jnp.mean(Zs[:,-1,:], axis=0)} pm {jnp.std(Zs[:,-1,:], axis=0)}")
+    else:
+        z_0 = 0.
+
+    # if T_start > 0:
+    X_train = [_X[T_start:T_start+T] for _X in X]
+    Y_train = [_Y[T_start:T_start+T] for _Y in Y]
+    R_train = [_R[T_start:T_start+T] for _R in R]
+    session_indices_train = [sess - T_start for sess in sess_ind]
     # else:
-    #     if args.learning_rule == 'reinforce':
-    #         R = jnp.asarray(models.reward(X[:,1]-X[:,0], Y))
-    #     elif args.learning_rule == 'policy_gradient':
-    #         R = jnp.asarray(models.effective_reward(X[:,1]-X[:,0]))
-    #     R = [R]
+    #     X_train = [_X[:T] for _X in X]
+    #     Y_train = [_Y[:T] for _Y in Y]
+    #     R_train = [_R[:T] for _R in R]
+    #     session_indices_train = sess_ind
+
+    if not args.all_subjects:
+        if T_start >0:
+            logging.info(f"Loaded subject '{fit_subjects[0]}' data. Training data: T={T}, start: {T_start}.")
+        else:
+            logging.info(f"Loaded subject '{fit_subjects[0]}' data. T={len(Y_train[0])}.")
 
     # Start fit
     # logging.info('Starting fitting. Model: GLM with learning rule: REINFORCE.')
+    gridsearch_params = find_initial(
+        X_train, Y_train, R=R_train, session_indices=session_indices_train,
+        N_particles=N_particles, model_kwargs={'learning_rule':args.learning_rule}, seed=seed
+        )
+    # gridsearch_params = [-3.0, -1.0, 0.5]
+    
+    initial_params = ParamsGLMLearn(
+        log_sigma=gridsearch_params[1], 
+        log_sigma_day=gridsearch_params[2], 
+        log_alpha=gridsearch_params[0] * jnp.ones(X[0].shape[1]+1)
+        )._asdict()
+    logging.info(f'Initial params: {initial_params}')
+
     logging.info(f"Starting fitting. Model: GLM with '{args.learning_rule}' learning rule")
-    res = fit_optax(X, Y, R=R, session_indices=sess_ind, 
-                    N_particles=N_particles, model_kwargs={'learning_rule':args.learning_rule})
+
+    # res = fit_optax(
+    #     X_train, Y_train, R=R_train, session_indices=session_indices_train, 
+    #     N_particles=N_particles, model_kwargs={'learning_rule':args.learning_rule, 'z_0': z_0},
+    #     initial_params=initial_params
+    #     )
+    res = fit_EM(
+        X_train[0], Y_train[0], R=R_train[0], session_indices=session_indices_train[0], 
+        N_particles=N_particles, model_kwargs={'learning_rule':args.learning_rule, 'z_0': z_0},
+        initial_params=initial_params
+    )
+    # res = fit_optax(X, Y, R=R, session_indices=sess_ind, 
+    #                 N_particles=N_particles, model_kwargs={'learning_rule':args.learning_rule})
     # res = fit_optax(X[:], Y[:], R=R[:], session_indices=sess_ind, 
     #                 N_particles=N_particles, model_kwargs={'learning_rule':args.learning_rule})
     # params_array = fit_EM(X[:], Y[:], R=R[:], n_iters=200, model_kwargs={'learning_rule':args.learning_rule}, 
