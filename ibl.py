@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 from typing import List, Tuple, Optional
+import jax.numpy as jnp
 
 def z_score(array):
     return (array - np.mean(array))/np.std(array)
