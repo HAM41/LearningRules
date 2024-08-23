@@ -5,11 +5,12 @@ import numpy as np
 import scipy as sp
 from typing import Tuple, Optional, Iterable, Union
 from functools import partial
+from tqdm import tqdm
 
 import os
 os.environ['JAX_PLATFORMS']='cpu'
 
-from parameters import ParamsGLMLearn, ParameterProperties, handle_none_params
+from parameters import ParamsGLMLearn, ParameterProperties #, handle_none_params
 
 import logging
 logging.basicConfig(level=logging.INFO, format='[%(filename)s][%(asctime)s] %(levelname)s - %(message)s')
@@ -124,8 +125,8 @@ def bernoulli_GLM_likelihood(w, x, y):
     #     # LM = w @ vx.T
     #     LM = jnp.einsum('ij,ij->i', w, vx)
     #     print(LM.shape)
-    # print(LM.shape, sign(y).shape)
-    p = safe_sigmoid(sign(y) * LM)
+    # p = safe_sigmoid(sign(y) * LM)
+    p = sigmoid(sign(y) * LM)
     return p
 
 @jax.jit
@@ -147,6 +148,21 @@ def maximum_likelihood(w, x):
     z = correct_choice(x)
     p = bernoulli_GLM_likelihood(w, x, z)
     return jnp.outer(1-p, sign(z) * vec(x)).squeeze()
+
+class LearningRule():
+    '''
+    A learning rule is a probability distribution over the next weights given the current weights and the data.
+        p(w_t | w_{t-1}, x_t, y_t)
+    '''
+    def update_weights(self, 
+                       weights: jnp.ndarray, 
+                       inputs: jnp.ndarray, emissions: jnp.ndarray, rewards: jnp.ndarray, 
+                       params
+                       ):
+        raise NotImplementedError
+    
+    def log_likelihood(self, weights, inputs, emissions, rewards, params):
+        raise NotImplementedError
 
 class QLearningModel():
     def __init__(self, alpha: float, sigma: float, beta: float=1.0, softmax: bool=True) -> None:
@@ -282,40 +298,41 @@ class GLMLearn():
         learning rule, or a closed-form policy gradient update.
     '''
     def __init__(self, 
-                 log_alpha: Union[float, jnp.ndarray] = 0.0, log_sigma: float=-1.0, log_sigma_day=-1.0,
-                 not_trainable: list=[], z_0: Union[float, jnp.ndarray] = 0.0,
+                #  log_alpha: Union[float, jnp.ndarray] = 0.0, log_sigma: float=-1.0, log_sigma_day=-1.0,
+                #  not_trainable: list=[], 
+                 z_0: Union[float, jnp.ndarray] = 0.0,
                  learning_rule: str='policy_gradient', seed: int=0,
                  ) -> None:
         self.learning_rule = learning_rule.lower()
 
-        self.params = ParamsGLMLearn(log_sigma=log_sigma, log_alpha=log_alpha, log_sigma_day=log_sigma_day)
-        self.props = ParamsGLMLearn(
-            log_sigma=ParameterProperties(), 
-            log_alpha=ParameterProperties(),
-            log_sigma_day=ParameterProperties()
-            )
-        for param in not_trainable:
-            getattr(self.props, param).trainable = False
+        # self.params = ParamsGLMLearn(log_sigma=log_sigma, log_alpha=log_alpha, log_sigma_day=log_sigma_day)
+        # self.props = ParamsGLMLearn(
+        #     log_sigma=ParameterProperties(), 
+        #     log_alpha=ParameterProperties(),
+        #     log_sigma_day=ParameterProperties()
+        #     )
+        # for param in not_trainable:
+        #     getattr(self.props, param).trainable = False
 
         # Initialization for latents and key for reproducibility
         self.key = jax.random.PRNGKey(seed)
         self.z_0 = z_0
 
-    def update_params(self, **kwargs) -> None:
-        '''passes trainable kwargs to self.params._replace
-        #? Add to parent class?
-        '''
-        for key in kwargs:
-            if not getattr(self.props, key).trainable:
-                raise ValueError(f"Parameter '{key}' is not trainable")
+    # def update_params(self, **kwargs) -> None:
+    #     '''passes trainable kwargs to self.params._replace
+    #     #? Add to parent class?
+    #     '''
+    #     for key in kwargs:
+    #         if not getattr(self.props, key).trainable:
+    #             raise ValueError(f"Parameter '{key}' is not trainable")
         
-        self.params = self.params._replace(**kwargs)
+    #     self.params = self.params._replace(**kwargs)
 
-    def update_params_from_array(self, params_array: Iterable) -> None:
-        '''Standardize way to set parameters from array.'''
-        # params_dict = {'log_sigma': params_array[0], 'alpha': params_array[1]}
-        # self.update_params(**params_dict)
-        self.params = ParamsGLMLearn._make(params_array)
+    # def update_params_from_array(self, params_array: Iterable) -> None:
+    #     '''Standardize way to set parameters from array.'''
+    #     # params_dict = {'log_sigma': params_array[0], 'alpha': params_array[1]}
+    #     # self.update_params(**params_dict)
+    #     self.params = ParamsGLMLearn._make(params_array)
         
     def decision(self, w, x, key=None):
         if key is None:
@@ -327,11 +344,11 @@ class GLMLearn():
         y = jax.random.bernoulli(subkey, p_R).astype(int)
         return y
     
-    @handle_none_params
+    # @handle_none_params
     def update_weights(
             self, 
             w, x, 
-            params: Optional[ParamsGLMLearn]=None, y=None, r=None,
+            params: ParamsGLMLearn, y=None, r=None,
             day_flag: bool=False,
             key=None, return_noise=False):
         if key is None:
@@ -386,9 +403,9 @@ class GLMLearn():
         # key, subkey = jax.random.split(self.key)
         return self.z_0 + jax.random.normal(subkey, shape=(N, d+1,))
     
-    @handle_none_params
+    # @handle_none_params
     def dynamics_loglikelihood(self, z_next, z_prev, inputs, data, 
-                               params: Optional[ParamsGLMLearn]=None, day_flag=False, r=None):
+                               params: ParamsGLMLearn, day_flag=False, r=None):
         '''p(z_t | z_{t-1})
         In our case, the latents z are the GLM weights w
         '''
@@ -406,7 +423,7 @@ class GLMLearn():
         log_lik = lambda z: jsp.stats.multivariate_normal.logpdf(z, mean=mean, cov=cov)
         return log_lik(z_next)
     
-    def sample(self, T, key=None):
+    def sample(self, params, T, key=None):
         '''
         Samples from the model, focusing only on univariate stimuli (stimulus intensity).
         Returns:
@@ -420,7 +437,7 @@ class GLMLearn():
         key, init_key = jax.random.split(key)
 
         # Generate stimulus uniformly from range
-        x_range = jnp.linspace(-1,1,12)
+        x_range = jnp.linspace(-1,1,100)
         X = jax.random.choice(init_key, x_range, shape=(T,1,), replace=True)
 
         # Encode percept and define initial values
@@ -437,15 +454,15 @@ class GLMLearn():
             Ws.append(w)
 
             # Update
-            w, eps = self.update_weights(w, x=X[t], y=Y[t], key=update_key, return_noise=True)
+            w, eps = self.update_weights(w, params=params, x=X[t], y=Y[t], key=update_key, return_noise=True)
             noises.append(eps)
         return X, jnp.stack(Y), jnp.stack(Ws), noises
     
-    @handle_none_params
+    # @handle_none_params
     def log_joint(
             self, 
             X: jnp.ndarray, Y: jnp.ndarray, Z: jnp.ndarray, 
-            params: Optional[ParamsGLMLearn]=None, R: Optional[jnp.ndarray]=None,
+            params: ParamsGLMLearn, R: Optional[jnp.ndarray]=None,
             session_indices: Optional[list]=[],
             ) -> float:
         '''
@@ -465,8 +482,8 @@ class GLMLearn():
         T = len(Y)
         if R is None:
             R = [None]*T
-        if params is None:
-            params = self.params
+        # if params is None:
+        #     params = self.params
             
         # if session_indices == []:
         #     day_flags = jnp.array([False for _ in range(T)], dtype=bool)
@@ -523,6 +540,7 @@ class GLMLearn():
         )(
             Z[~day_flags][1:], Z[~prev_day_flags][:-1], X[~prev_day_flags][:-1], Y[~prev_day_flags][:-1], R[~prev_day_flags][:-1]
             )
+        #! Replace above cases with jnp.where?
         log_pzz_trials = jnp.sum(log_pzz_trials)
 
         # Combine to obtain log p(z_{0:T})
@@ -538,6 +556,130 @@ class GLMLearn():
         log_joint = log_pyz + log_pz
 
         return log_joint
+    
+    def posterior_samples(self, 
+            key, 
+            params, 
+            X, Y, R=None, session_indices=[], 
+            N_particles=1000, return_history=True, posterior_type='smooth', verbose=False
+            ):
+        if X.ndim == 1:
+            T = len(X)
+            M = 1
+        else:
+            T, M = X.shape
+        if R is None:
+            R = [None for _ in range(T)]
+        day_flags = set_day_flags(T, session_indices)
+
+        if return_history:
+            # Block out N x T x M+1 array (float32, x 4 in bytes) to store z_t samples.
+            # A lot of memory, but much faster. 
+            z_history = jnp.zeros((N_particles, T, M+1), dtype=jnp.float32) # float16 ?
+
+        if verbose:
+            pbar = tqdm(range(0,T), desc='Bootstrap filter')
+    
+        log_lik = 0.
+        for t in range(0,T):
+            key, subkey = jax.random.split(key)
+
+            # 1. Prediction step : tilde z_t ~ p(z_t | z_{t-1})
+            #   Sample proposal N particles from previous N particles
+            #   Outcome: {tilde z_t^i, 1/N}, an approximation to p(z_t|y_{1:t-1})
+            if t == 0:
+                tilde_z_t = self.sample_initial(N_particles, d=M)
+            else:
+                tilde_z_t = self.update_weights(z_t, params=params, x=X[t-1], y=Y[t-1], r=R[t-1], day_flag=day_flags[t])
+
+            # 2. Evaluate importance weights p(y_t | xhat_t, V_t)
+            #   Outcome: {tilde z_t^i, tilde w^i}, an approximation to p(z_t|y_{1:t})
+            tilde_w_t = bernoulli_GLM_likelihood(y=Y[t], w=tilde_z_t, x=X[t]) 
+            
+            # 3. Resample with replacement N particles according the importance weights
+            #   Outcome: {z_t, 1/N}, an approximation to p(z_t|y_{1:t})
+            if return_history:
+                if posterior_type == 'smooth':
+                    z_history = z_history.at[:,t,:].set(tilde_z_t)
+                    z_history = jax.random.choice(subkey, z_history, shape=(N_particles,), p=tilde_w_t)
+                    z_t = z_history[:,t,:]
+
+                elif posterior_type == 'filt':
+                    z_t = jax.random.choice(subkey, tilde_z_t, shape=(N_particles,), p=tilde_w_t)
+                    z_history = z_history.at[:,t,:].set(z_t)
+            else:
+                z_t = jax.random.choice(subkey, tilde_z_t, shape=(N_particles,), p=tilde_w_t)
+
+            # 4. Update log-likelihood estimate
+            log_lik += jnp.log(jnp.mean(tilde_w_t))
+
+            if verbose:
+                pbar.update(1)
+
+        if not return_history:
+            z_history = z_t
+
+        return z_history, log_lik
+    
+    def marginal_log_likelihood(self, key, params, X, Y, R=None, session_indices=[], 
+                                N_particles=1000, verbose=False):
+        _, log_lik = self.posterior_samples(
+            key, params, 
+            X, Y, R=R, session_indices=session_indices, 
+            N_particles=N_particles, return_history=False, verbose=verbose
+            )
+        return log_lik
+    
+    def score_predict(self,
+            key, params,
+            X_hist: jnp.ndarray, Y_hist: jnp.ndarray,
+            X_pred: jnp.ndarray, Y_pred: jnp.ndarray,
+            R_hist: jnp.ndarray = None, session_indices: list=[],
+            N_particles: int=10000,
+            ):
+        '''
+        Do filtering to obtain last weights, then sample weights trajectories from there and compare
+        sampled decisions with true decisions.
+        '''
+        T = len(X_hist) + len(X_pred)
+        day_flags = set_day_flags(T, session_indices)
+
+        # Step 1: filtering to obtain last weights
+        # (_, Zs_filt), _ = samplers.bootstrap_filter(
+        #     N_particles, 
+        #     X_hist, Y_hist, 
+        #     model, 
+        #     R=R_hist, session_indices=session_indices, 
+        #     return_history=False, verbose=True,
+        #     )
+        Zs_filt_T, _ = self.posterior_samples(
+            key, params, X_hist, Y_hist, R=R_hist, session_indices=session_indices,
+            N_particles=N_particles, return_history=False, posterior_type='filt',
+        )
+        w = Zs_filt_T.mean(0)
+
+        # Step 2: sample weights trajectories
+        Ys, Ws = [], []
+        for t in range(len(X_pred)):
+            key, decision_key, update_key = jax.random.split(key, 3)
+
+            # Decision
+            y = self.decision(w, X_pred[t], key=decision_key)
+
+            if self.learning_rule == 'reinforce':
+                r = reward(X_pred[t,1]-X_pred[t,0], y)
+            elif self.learning_rule == 'policy_gradient':
+                r = effective_reward(X_pred[t,1]-X_pred[t,0])
+
+            # Update
+            w = self.update_weights(w, params=params, x=X_pred[t], y=y, key=update_key, r=r, return_noise=False, day_flag=day_flags[t])
+
+            Ys.append(y)
+            Ws.append(w)
+
+        # Compute score 
+        score = jnp.mean(jnp.array(Ys) == jnp.array(Y_pred))
+        return score
 
 
 if __name__=='__main__':
