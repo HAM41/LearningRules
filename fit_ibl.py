@@ -19,7 +19,8 @@ import sys
 import jax 
 import jax.numpy as jnp
 import jax.scipy as jsp
-from scipy.optimize import minimize
+# from scipy.optimize import minimize
+import jaxopt
 from itertools import combinations
 # import os
 # os.environ['JAX_PLATFORMS']='cpu'
@@ -113,7 +114,7 @@ def fit_EM(
     logging.info(f"Posterior type: {posterior_type}. N_particles: {N_particles}.")
     T, D = X.shape
     key = jax.random.PRNGKey(seed)
-    model = models.GLMLearn(seed=seed, **model_kwargs)
+    model = models.GLMLearn(**model_kwargs)
 
     # current_params = [-5.0, -1.0, 0.5]
 
@@ -391,25 +392,37 @@ def fit_LaplaceEM(X, Y, R=None, n_iters=200, model_kwargs={}, seed=0, N_particle
         current_params = res.x
     return current_params     
 
-def fit_MLL(X, Y, R=None, model_kwargs={}, seed=0, N_particles=10000, session_indices=[]):
-    def neg_MLL(params_array):
+def fit_MLL(key, X, Y, R=None, model_kwargs={}, seed=0, N_particles=10000, session_indices=[], initial_params=None):
+    model = models.GLMLearn(**model_kwargs)
+    T, D = X.shape
+
+    if initial_params is None:
+        initial_params = ParamsGLMLearn(log_sigma=-3.0, log_sigma_day=-1.0, alpha=0.5 * jnp.ones(D+1))
+
+    @jax.jit
+    def neg_MLL(params):
         '''Negative marginal log-likelihood, as a function of the parameters.'''
         # Instantiate model
-        model = models.GLMLearn(seed=seed, **model_kwargs)#, learning_rule='reinforce')
-        model.update_params_from_array(params_array)
+        # model = models.GLMLearn(seed=seed, **model_kwargs)#, learning_rule='reinforce')
+        # model.update_params_from_array(params_array)
 
         # Compute marginal log-likelihood with SMC
-        _, lik = samplers.bootstrap_filter(
-            N_particles, 
-            X, Y, 
-            model, 
-            R=R, session_indices=session_indices, 
-            return_history=False, verbose=True
+        # _, lik = samplers.bootstrap_filter(
+        #     N_particles, 
+        #     X, Y, 
+        #     model, 
+        #     R=R, session_indices=session_indices, 
+        #     return_history=False, verbose=True
+        #     )
+        
+        loglik = model.marginal_log_likelihood(
+                key, params, X, Y, R=R, session_indices=session_indices,
+                N_particles=N_particles,
             )
         # _, lik = samplers.bootstrap_filter(N_particles, X=X, Y=Y, R=R, return_history=False, verbose=True)
         # logging.info(f'Likelihood: {lik:5.2f}, memory: {process.memory_info().rss/1e6:5.2f} MB')
-        # logging.info(f'Func eval. Likelihood: {lik}, params: {params_array}')
-        return -lik
+        # logging.info(f'Func eval. Likelihood: {loglik}, params: {params}')
+        return - loglik
     
     def find_initial_simplex(key=None):
         if key is None:
@@ -461,22 +474,37 @@ def fit_MLL(X, Y, R=None, model_kwargs={}, seed=0, N_particles=10000, session_in
 
     # res = minimize(
     #     neg_MLL,
-    #     x0 = initial_simplex[0],
+    #     x0 = initial_params,
     #     method='Nelder-Mead',
     #     tol=1e-3,
-    #     options={'disp':True, 'return_all':True, 'initial_simplex':initial_simplex},
+    #     options={'disp':True, 'return_all':True},
     #     callback=callback_f,
     #     bounds=[(-6,2), (-6,2), (0,1)]
     #     )
 
-    res = minimize(
-        neg_MLL,
-        x0 = [-5.0, -1.0, 0.5],
-        method='L-BFGS-B',
-        jac = jax.grad(neg_MLL),
-        bounds=[(-6,2), (-6,2), (0,1)],
-        options={'disp':101}, # iprint number
-        )
+    def callback(xk):
+        lik = -neg_MLL(xk)
+        logging.info(f'Marginal log-lik: {lik}, Params: {xk}')
+
+    # solver = jaxopt.ScipyMinimize(
+    #     method='Nelder-Mead',
+    #     jit=True,
+    #     fun=neg_MLL,
+    #     callback=callback,
+    #     )
+    solver = jaxopt.BFGS(neg_MLL, verbose=False, maxiter=20)
+    res = solver.run(init_params=initial_params)
+    logging.info(f'Final params: {res.params}')
+    logging.info(f'Final state: {res.state}')
+
+    # res = minimize(
+    #     neg_MLL,
+    #     x0 = [-5.0, -1.0, 0.5],
+    #     method='L-BFGS-B',
+    #     jac = jax.grad(neg_MLL),
+    #     bounds=[(-6,2), (-6,2), (0,1)],
+    #     options={'disp':101}, # iprint number
+    #     )
     return res
 
 def find_initial(
@@ -485,12 +513,12 @@ def find_initial(
         model_kwargs: dict={}, seed: int=0,
         vmap=True, metric='mll',
         ) -> jnp.ndarray:
-    log_sigmas = jnp.linspace(-4.0, -1.0, 5)
-    log_sigma_days = jnp.linspace(-2.0, 0.0, 3)
+    log_sigmas = jnp.linspace(-8.0, -2.0, 5)
+    log_sigma_days = jnp.linspace(-5.0, -2.0, 3)
     log_alphas = jnp.linspace(-8.0, -2.0, 5)
     grid_points = jnp.stack(jnp.meshgrid(log_alphas, log_sigmas, log_sigma_days), axis=-1).reshape(-1,3)
     logging.info(f'Finding initialization from grid of {grid_points.shape} points.')
-    model = models.GLMLearn(seed=seed, **model_kwargs)
+    model = models.GLMLearn(**model_kwargs)
     key = jax.random.PRNGKey(seed)
     
     import psutil
@@ -592,14 +620,14 @@ def fit_optax(
         params: optimized parameters
     '''
     T, d = X.shape
-    model = models.GLMLearn(seed=seed, **model_kwargs)
+    model = models.GLMLearn(**model_kwargs)
     key = jax.random.PRNGKey(seed)
     logging.info(f'Fitting model with direct gradient optimization of MLL.')
 
     if initial_params is None:
-        initial_params = ParamsGLMLearn(log_sigma=-3.0, log_sigma_day=-1.0, log_alpha= -0.5 * jnp.ones(d+1))._asdict()
+        initial_params = ParamsGLMLearn(log_sigma=-3.0, log_sigma_day=-3.0, log_alpha= -2.0 * jnp.ones(d+1))._asdict()
 
-    learning_rate = 0.05
+    learning_rate = 0.02
     # optimizer = optax.adam(learning_rate)
     # optimizer = optax.noisy_sgd(learning_rate=learning_rate)
     # optimizer = optax.chain(
@@ -628,6 +656,7 @@ def fit_optax(
 
 
     # Define loss
+    @jax.jit
     def neg_MLL(params):#, _X, _Y, _R, _sess_ind):
         '''Negative marginal log-likelihood, as a function of the parameters.'''
         # Instantiate model
