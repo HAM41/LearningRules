@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 import sys
 # sys.path.append('../')
 sys.path.append('/home/vg0233/PillowLab/LearningRules/')
-from fit_ibl import fit_optax, fit_EM, find_initial
+from fit_ibl import fit_optax, fit_EM, find_initial, fit_MLL
 from parameters import ParamsGLMLearn, ParameterProperties
 import models
 
@@ -57,13 +57,17 @@ if __name__=='__main__':
         true_key = key
     
     subkey1, subkey2, subkey3 = jax.random.split(true_key, 3)
-    true_log_sigma = jax.random.uniform(subkey1, minval=-4.0, maxval=-1.0)
-    true_log_sigma_day = jax.random.uniform(subkey2, minval=-2.0, maxval=0.0)
+    # true_log_sigma = jax.random.uniform(subkey1, minval=-4.0, maxval=-1.0)
+    # true_log_sigma_day = jax.random.uniform(subkey2, minval=-2.0, maxval=0.0)
+
+    # needs small log sigma for alpha to be learned. PsyTrack found log_sigma ~= -5.5, log_sigma_day ~= -3.5
+    true_log_sigma = jax.random.uniform(subkey1, minval=-8, maxval=-5)
+    true_log_sigma_day = jax.random.uniform(subkey2, minval=-5, maxval=-3)
     true_log_alpha = jax.random.uniform(subkey3, minval=-6, maxval=-2, shape=(d+1,))
     true_params = ParamsGLMLearn(log_sigma=true_log_sigma, log_sigma_day=true_log_sigma_day, log_alpha=true_log_alpha)
 
     logging.info(f"True parameters: {true_params}")
-    true_model = models.GLMLearn(seed=args.seed, learning_rule=args.learning_rule) # **true_params._asdict(),
+    true_model = models.GLMLearn(learning_rule=args.learning_rule) # **true_params._asdict(),
 
     # Create dataset
     X, Y, Z = [], [], []
@@ -81,11 +85,21 @@ if __name__=='__main__':
     elif args.learning_rule == 'policy_gradient':
         R = [jnp.asarray(models.effective_reward(X_sub[:,0])) for X_sub, Y_sub in zip(X, Y)]
 
-    # true_loglik = true_model.marginal_log_likelihood(
+    import time
+    start = time.time()
+    true_loglik = true_model.marginal_log_likelihood(
+        key, true_params, X[0], Y[0], R[0], session_indices[0], N_particles=args.N_particles,
+        verbose=True
+    )
+    logging.info(f"True log-likelihood (scan): {true_loglik}, time: {time.time()-start}")
+
+    # start = time.time()
+    # true_loglik = true_model.marginal_log_likelihood_1(
     #     key, true_params, X[0], Y[0], R[0], session_indices[0], N_particles=args.N_particles,
     #     verbose=True
     # )
-    # logging.info(f"True log-likelihood: {true_loglik}")
+    # logging.info(f"True log-likelihood: {true_loglik}, time: {time.time()-start}")
+    # sys.exit()
 
     partition = int(len(X[0]) * 0.6)
     key, subkey = jax.random.split(key)
@@ -105,9 +119,9 @@ if __name__=='__main__':
     gridsearch_params = find_initial(
         X, Y, R=R, session_indices=session_indices,
         N_particles=args.N_particles, model_kwargs={'learning_rule':args.learning_rule}, seed=args.seed,
-        vmap=True, metric='prediction_score',
+        vmap=True, metric='mll',
         )
-    # gridsearch_params = [0.5, -1.0, -1.0]
+    # gridsearch_params = [-1.0, -4.0, -4.0]
 
     initial_params = ParamsGLMLearn(
         log_sigma=gridsearch_params[1], 
@@ -121,12 +135,19 @@ if __name__=='__main__':
     #     N_particles=args.N_particles, model_kwargs={'learning_rule':args.learning_rule, 'z_0': 0.},
     #     initial_params=initial_params
     #     )
-    params, results_dict = fit_EM(
+
+    res = fit_MLL(
+        key,
         X[0], Y[0], R=R[0], session_indices=session_indices[0],
         N_particles=args.N_particles, model_kwargs={'learning_rule':args.learning_rule, 'z_0': 0.},
-        initial_params=initial_params, seed=args.seed, n_iters=10, m_step_iters=500,
-        posterior_type='smooth',
+        initial_params=initial_params
     )
+    # params, results_dict = fit_EM(
+    #     X[0], Y[0], R=R[0], session_indices=session_indices[0],
+    #     N_particles=args.N_particles, model_kwargs={'learning_rule':args.learning_rule, 'z_0': 0.},
+    #     initial_params=initial_params, seed=args.seed, n_iters=50, m_step_iters=500,
+    #     posterior_type='smooth',
+    # )
     # logging.info(f"Results: {results_dict}")
         
         # res = fit_EM(X[0], Y[0], R=R[0], session_indices=session_indices[0], N_particles=N_particles, model_kwargs={'learning_rule':learning_rule})
