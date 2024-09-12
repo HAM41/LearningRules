@@ -8,6 +8,8 @@ from typing import Tuple, Optional, Iterable, Union
 from functools import partial
 from tqdm import tqdm
 
+import tensorflow_probability.substrates.jax.distributions as tfd
+
 import os
 os.environ['JAX_PLATFORMS']='cpu'
 
@@ -45,7 +47,9 @@ def vec(x):
             raise NotImplementedError
         return jnp.concatenate((jnp.ones((x.shape[0],1)),x), axis=1)
 
-    
+def softmax_forward(x):
+    return jax.nn.softmax(jnp.concatenate([x, jnp.zeros((1,))]))
+
 # def unvec(x): # has to be consistent with vec(). remove if not used
 #     return x[1:]
 
@@ -150,6 +154,12 @@ def maximum_likelihood(w, x):
     z = correct_choice(x)
     p = bernoulli_GLM_likelihood(w, x, z)
     return jnp.outer(1-p, sign(z) * vec(x)).squeeze()
+
+def linear_regression_gradient(w, x, y, params):
+    p_c = bernoulli_GLM_likelihood(w, x, y)
+    r = reward(x, y)
+    return params.Q @ w + r * (params.A @ vec(x) + params.kappa) + params.b + \
+            r * jnp.outer(params.alpha * (1 - p_c) + params.beta * jnp.multiply(p_c, 1 - p_c), vec(x)).squeeze()
 
 class LearningRule():
     '''
@@ -774,6 +784,71 @@ class GLMLearn():
         inputs = (X[:-1], Y[:-1], R[:-1], X[1:], Y[1:], next_day_flags[:-1], subkeys)
         (_, log_lik), scores = jax.lax.scan(scan_fn, carry, inputs, length=T-1)
         return scores, log_lik
+    
+    def alpha_mcmc(self, 
+                   key, params, 
+                   X, Y, R=None, session_indices=[],
+                   N_particles=1000, n_iters=100, N_samples=100,
+                   verbose=True, proposal_scale=1.0,
+                   ):
+        '''Metropolis hastings to sample from posterior of alpha.'''
+        proposal = lambda x: tfd.Normal(loc=x, scale=proposal_scale)
+
+        @partial(jax.vmap, in_axes=(0,))
+        def log_target(log_alpha) -> float:
+            params_prop = params._replace(log_alpha=log_alpha)
+            return self.marginal_log_likelihood(key, params_prop, X, Y, R, session_indices, N_particles)
+        
+        @jax.jit
+        def metropolis_hastings_step(log_alpha, key):
+            '''
+            Single step of Metropolis-Hastings. 
+            Written in form amendable to jax.lax.scan.
+            '''
+            key, proposal_key, accept_key = jax.random.split(key, 3)
+
+            # Proposal step
+            log_alpha_prop = proposal(log_alpha).sample(seed=proposal_key)
+            log_alpha_prop = jnp.clip(log_alpha_prop, -10, 2)
+
+            # Acceptance step
+            log_ratio = log_target(log_alpha_prop) - log_target(log_alpha)
+            accept = jnp.log(jax.random.uniform(accept_key)) < log_ratio
+
+            log_alpha = jnp.where(accept[:, None], log_alpha_prop, log_alpha)
+            return log_alpha, (log_alpha, accept)
+        
+        # Initialize
+        keys = jax.random.split(key, n_iters)
+        log_alpha = params.log_alpha
+        log_alpha_samples_t = jnp.tile(log_alpha, (N_samples, 1))
+        
+        if verbose:
+            log_alpha_samples = []
+            for i in range(n_iters):
+                _, (log_alpha_samples_t, accepts) = metropolis_hastings_step(log_alpha_samples_t, keys[i])
+                logging.info(f"[{i}/{n_iters}] log alpha mean: {log_alpha_samples_t.mean(0)}, accept frac: {accepts.sum()/N_samples:.2f}")
+
+                # Print confidence intervals
+                if i % 10 == 0:
+                    logging.info(f"log alpha CI: {jnp.percentile(log_alpha_samples_t, q=jnp.array([2.5, 97.5]), axis=0).T}")
+
+                log_alpha_samples.append(log_alpha_samples_t)
+            log_alpha_samples = jnp.stack(log_alpha_samples)
+        else:
+            # Wrap in scan
+            _, (log_alpha_samples, accepts) = jax.lax.scan(
+                metropolis_hastings_step,
+                log_alpha_samples_t, keys, length=n_iters
+                )
+            accepts = accepts[-1]
+            
+        assert log_alpha_samples.shape[0] == n_iters and log_alpha_samples.shape[1] == N_samples
+        
+        logging.info(f"log alpha mean: {log_alpha_samples[-1].mean(0)}, accept frac: {accepts.mean():.2f}")
+        logging.info(f"log alpha CI: {jnp.percentile(log_alpha_samples[-1], q=jnp.array([2.5, 97.5]), axis=0).T}")
+        # return log_alpha_samples
+        return log_alpha_samples, accepts
 
 from typing import NamedTuple
 class ParamsTimeVarGLMLearn(NamedTuple):
@@ -858,10 +933,81 @@ class TimeVarGLMLearn(GLMLearn):
         raise NotImplementedError
 
 
+class ParamsGLMHMMLearn(NamedTuple):
+    A: jnp.ndarray
+    log_alpha: float
+    log_sigma: float
+    log_sigma_day: float
+
+class GLMHMMLearn(GLMLearn):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+
+    def split_latent(self, z):
+        if z.ndim == 1:
+            state, w = jnp.array(z[0], dtype=int), z[1:]
+        else:
+            state, w = z[:,0], z[:,1:]
+        return state, w
+    
+    def merge_latent(self, state, w):
+        if w.ndim == 1:
+            # alpha is scalar
+            return jnp.concatenate([jnp.array([state], dtype=int), w])
+        else:
+            return jnp.concatenate([state[:, None], w], axis=1)
+        
+    def sample_initial(self, key: PRNGKey, params, N: int, d: int=1):
+        '''Sample from the initial distribution p(z_0)'''
+        state = jax.random.choice(key, 2, shape=(N,))
+        w = super().sample_initial(key, params=None, N=N, d=d)
+        return self.merge_latent(state, w)
+    
+    def update_weights(self, key: PRNGKey, z, x, params, y=None, r=None, day_flag=False, return_noise=False):
+        '''
+        State dependent weight updates. In one state, we follow a policy gradient update, 
+        in the other there is no learning. 
+        '''
+        state_t, w_t = self.split_latent(z)
+        key, state_key, w_key = jax.random.split(key, 3)
+
+        params_GLM = ParamsGLMLearn(log_sigma=params.log_sigma, log_alpha=params.log_alpha, log_sigma_day=params.log_sigma_day)
+        w_t = jnp.where(state_t[:, None], 
+                  super().update_weights(
+                      w_key, w_t, x, 
+                      ParamsGLMLearn(log_sigma=params.log_sigma, log_alpha=-20., log_sigma_day=params.log_sigma_day), 
+                      y, r, day_flag
+                      ),
+                  super().update_weights(
+                      w_key, w_t, x, 
+                      ParamsGLMLearn(log_sigma=params.log_sigma, log_alpha=params.log_alpha, log_sigma_day=params.log_sigma_day), 
+                      y, r, day_flag
+                      )
+        )
+
+        state_t = jax.vmap(lambda A: jax.random.choice(state_key, 2, p=A))(params.A[state_t.astype(int)])
+        z_t = self.merge_latent(state_t, w_t)
+        return z_t
+    
+    def emission_likelihood(self, z, x, y):
+        _, w = self.split_latent(z)
+        p = bernoulli_GLM_likelihood(w, x, y)
+        return p
+    
+    def decision(self, key: PRNGKey, z, x):
+        p_R = self.emission_likelihood(z, x, y=1)
+        y = jax.random.bernoulli(key, p_R).astype(int)
+        return y
+
+
+
 if __name__=='__main__':
     # Seed for reproducibility
     seed = 1
     key = PRNGKey(seed)
+
+    array = jnp.array([0.2, 0.3, 0.4])
+    print(softmax_forward(array))
 
     # X = jax.random.uniform(key, shape=(10, 1))
     # Y = jax.random.bernoulli(key, p=0.5, shape=(10,)).astype(int)
