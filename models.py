@@ -4,9 +4,12 @@ import jax.scipy as jsp
 from jax.random import PRNGKey
 import numpy as np
 import scipy as sp
-from typing import Tuple, Optional, Iterable, Union
+from typing import Tuple, Optional, Iterable, Union, NamedTuple
+from jaxtyping import Array, Float, Bool
 from functools import partial
 from tqdm import tqdm
+
+
 
 import tensorflow_probability.substrates.jax.distributions as tfd
 
@@ -317,6 +320,7 @@ class GLMLearn():
                  latent_dim = None,
                  ) -> None:
         self.learning_rule = learning_rule.lower()
+        self.reward_func = None
 
         # self.params = ParamsGLMLearn(log_sigma=log_sigma, log_alpha=log_alpha, log_sigma_day=log_sigma_day)
         # self.props = ParamsGLMLearn(
@@ -451,6 +455,7 @@ class GLMLearn():
             X: array, stimulus, of shape (T, 1,)
             Y: array, decisions, of shape (T,)
             W: array, weights, of shape (T, 2, )
+        #! depracte in favor of sample_forward()
         '''
         key, init_key = jax.random.split(key)
 
@@ -595,7 +600,7 @@ class GLMLearn():
         return z_history, log_lik
 
     def marginal_log_likelihood(self, key, params, X, Y, R=None, session_indices=[],
-                                N_particles=1000, verbose=False):
+                                N_particles=1000, verbose=False, return_logliks = False):
         '''Use scan to make computation more efficient.'''
         if X.ndim == 1:
             T = len(X)
@@ -617,12 +622,13 @@ class GLMLearn():
             z_t = jax.random.choice(subkey1, tilde_z_t, shape=(N_particles,), p=tilde_w_t)
 
             # 4. Update log-likelihood estimate
-            log_lik += jnp.log(jnp.mean(tilde_w_t))
+            log_lik = jnp.log(jnp.mean(tilde_w_t))
+            marginal_log_lik += log_lik
             
             # 1. Prediction step : tilde z_t ~ p(z_t | z_{t-1})
             tilde_z_t = self.update_weights(subkey2, z_t, params=params, x=X_t, y=Y_t, r=R_t, day_flag=next_day_flag)
             
-            return (tilde_z_t, log_lik), None
+            return (tilde_z_t, marginal_log_lik), log_lik
         
         key, subkey = jax.random.split(key)
         tilde_z_t = self.sample_initial(subkey, params=params, N=N_particles, d=M)
@@ -632,8 +638,56 @@ class GLMLearn():
         subkeys = jax.random.split(key, num=(T, 2))
         inputs = (X, Y, R, next_day_flags, subkeys)
         
-        (_, log_lik), _ = jax.lax.scan(scan_fn, carry, inputs, length=T)
-        return log_lik
+        (_, marginal_log_lik), log_liks = jax.lax.scan(scan_fn, carry, inputs, length=T)
+        if return_logliks:
+            return marginal_log_lik, log_liks
+        else:
+            return marginal_log_lik
+    
+    def posterior_samples_scan(self, key, params, X, Y, R=None, session_indices=[],
+                                N_particles=1000, verbose=False):
+        '''Use scan to make computation more efficient.'''
+        if X.ndim == 1:
+            T = len(X)
+            M = 1
+        else:
+            T, M = X.shape
+        if R is None:
+            R = [None for _ in range(T)]
+        day_flags = set_day_flags(T, session_indices)
+
+        def scan_fn(carry, inputs):
+            t, tilde_z_t, log_lik, z_history = carry
+            X_t, Y_t, R_t, next_day_flag, (subkey1, subkey2) = inputs
+
+            # 2. Evaluate importance weights p(y_t | xhat_t, V_t)
+            tilde_w_t = self.emission_likelihood(tilde_z_t, X_t, Y_t) 
+            
+            # 3. Resample with replacement N particles according the importance weights
+            # z_t = jax.random.choice(subkey1, tilde_z_t, shape=(N_particles,), p=tilde_w_t)
+            z_history = z_history.at[:,t,:].set(tilde_z_t)
+            z_history = jax.random.choice(subkey1, z_history, shape=(N_particles,), p=tilde_w_t)
+            z_t = z_history[:,t,:]
+
+            # 4. Update log-likelihood estimate
+            log_lik += jnp.log(jnp.mean(tilde_w_t))
+            
+            # 1. Prediction step : tilde z_t ~ p(z_t | z_{t-1})
+            tilde_z_t = self.update_weights(subkey2, z_t, params=params, x=X_t, y=Y_t, r=R_t, day_flag=next_day_flag)
+            
+            return (t+1, tilde_z_t, log_lik, z_history), None
+        
+        key, subkey = jax.random.split(key)
+        tilde_z_t = self.sample_initial(subkey, params=params, N=N_particles, d=M)
+        z_history = jnp.zeros((N_particles, T, self.latent_dim), dtype=jnp.float32) # float16
+        carry = (0, tilde_z_t, 0., z_history)
+        
+        next_day_flags = jnp.roll(day_flags, shift=1)
+        subkeys = jax.random.split(key, num=(T, 2))
+        inputs = (X, Y, R, next_day_flags, subkeys)
+        
+        (_, _, log_lik, z_history), _ = jax.lax.scan(scan_fn, carry, inputs, length=T)
+        return z_history, log_lik
     
     
     def score_predict(self,
@@ -702,13 +756,13 @@ class GLMLearn():
 
         def scan_fn(carry, inputs):
             tilde_z_t, log_lik = carry
-            X_t, Y_t, R_t, next_day_flag, (subkey1, subkey2, subkey3) = inputs
+            X_t, Y_t, R_t, next_day_flag, (subkey1, subkey2) = inputs
 
             # 2. Evaluate importance weights p(y_t | xhat_t, V_t)
             tilde_w_t = self.emission_likelihood(tilde_z_t, X_t, Y_t)
 
             # 3. Resample with replacement N particles according the importance weights
-            z_t = jax.random.choice(subkey2, tilde_z_t, shape=(N_particles,), p=tilde_w_t)
+            z_t = jax.random.choice(subkey1, tilde_z_t, shape=(N_particles,), p=tilde_w_t)
 
             # 4. Update log-likelihood estimate
             lik = jnp.mean(tilde_w_t)
@@ -716,7 +770,7 @@ class GLMLearn():
             
             # 1. Prediction step : tilde z_t ~ p(z_t | z_{t-1})
             #    Outcome: {tilde z_t^i, 1/N}, an approximation to p(z_t|y_{1:t-1})
-            tilde_z_t = self.update_weights(subkey3, z_t, params=params, x=X_t, y=Y_t, r=R_t, day_flag=next_day_flag)
+            tilde_z_t = self.update_weights(subkey2, z_t, params=params, x=X_t, y=Y_t, r=R_t, day_flag=next_day_flag)
             
             return (tilde_z_t, log_lik), lik
         
@@ -725,7 +779,7 @@ class GLMLearn():
         carry = (tilde_z_t, 0.)
         
         next_day_flags = jnp.roll(day_flags, shift=1)
-        subkeys = jax.random.split(key, num=(T, 3))
+        subkeys = jax.random.split(key, num=(T, 2))
         inputs = (X, Y, R, next_day_flags, subkeys)
         
         (_, log_lik), scores = jax.lax.scan(scan_fn, carry, inputs, length=T)
@@ -762,14 +816,14 @@ class GLMLearn():
                 forward_key, z_forward, params=params, x=X_t1, y=Y_t1, r=R_t1, day_flag=next_day_flag
                 )
             pz2 = self.emission_likelihood(z_forward, X_t2, Y_t2)
-            
+
             # 3. Resample with replacement N particles according the importance weights
             z_t = jax.random.choice(subkey2, tilde_z_t, shape=(N_particles,), p=tilde_w_t)
 
-            # 4. Update log-likelihood estimate
+            # # 4. Update log-likelihood estimate
             lik = jnp.mean(tilde_w_t)
             log_lik += jnp.log(lik)
-            
+
             # 1. Prediction step : tilde z_t ~ p(z_t | z_{t-1})
             tilde_z_t = self.update_weights(subkey3, z_t, params=params, x=X_t1, y=Y_t1, r=R_t1, day_flag=next_day_flag)
             
@@ -780,9 +834,13 @@ class GLMLearn():
         carry = (tilde_z_t, 0.)
         
         next_day_flags = jnp.roll(day_flags, shift=1)
-        subkeys = jax.random.split(key, num=(T-1, 3))
-        inputs = (X[:-1], Y[:-1], R[:-1], X[1:], Y[1:], next_day_flags[:-1], subkeys)
-        (_, log_lik), scores = jax.lax.scan(scan_fn, carry, inputs, length=T-1)
+        subkeys = jax.random.split(key, num=(T, 3))
+        inputs = (X[:-1], Y[:-1], R[:-1], X[1:], Y[1:], next_day_flags[:-1], subkeys[:-1])
+        (tilde_z_t, log_lik), scores = jax.lax.scan(scan_fn, carry, inputs, length=T-1)
+
+        # Add last step loglik
+        log_lik += jnp.log(jnp.mean(self.emission_likelihood(tilde_z_t, X[-1], Y[-1])))
+
         return scores, log_lik
     
     def alpha_mcmc(self, 
@@ -849,10 +907,88 @@ class GLMLearn():
         logging.info(f"log alpha CI: {jnp.percentile(log_alpha_samples[-1], q=jnp.array([2.5, 97.5]), axis=0).T}")
         # return log_alpha_samples
         return log_alpha_samples, accepts
+    
+    def sample_forward(self, key, params, X: Float[Array, "T M"], day_flags: Bool[Array, "T"], z_0=None):
+        '''
+        Forward pass through the model from initial state, sampling decisions.
+        '''
+        assert self.reward_func is not None, "Reward function, (x_t, y_t) -> r_t, must be defined."
+        if z_0 is None:
+            z_0 = self.sample_initial(key, params, N=1, d=self.latent_dim).squeeze()
+            assert z_0.shape == (self.latent_dim,)
+       
+        T = len(X)
+        latent_dim = z_0.shape[0]
 
-from typing import NamedTuple
+        # Forward pass
+        def scan_fn(carry, inputs):
+            y_t, z_t = carry
+
+            # Process inputs
+            subkey, X_t, X_next, day_flag = inputs
+            r_t = self.reward_func(X_t, y_t)  
+
+            # Update state
+            z_pred = self.update_weights(subkey, z_t, params, X_t, y_t, r_t, day_flag)
+            y_pred = self.decision(subkey, z_pred, X_next)
+
+            return (y_pred, z_pred), (y_pred, z_pred)
+        
+        # Initialize
+        subkeys = jax.random.split(key, T)
+        y_0 = self.decision(subkeys[0], z_0, X[0])
+        init = (y_0, z_0)
+        inputs = (subkeys[1:], X[:-1], X[1:], day_flags[:-1])
+
+        # Forward pass
+        _, (Y_pred, Z_pred) = jax.lax.scan(scan_fn, init, inputs, length=T-1)
+        Y = jnp.concatenate([jnp.array([y_0]), Y_pred]); assert Y.shape == (T,)
+        Z = jnp.concatenate([jnp.array([z_0]), Z_pred]); assert Z.shape == (T, latent_dim)
+        return Y, Z
+    
+    def held_out_marginal_log_likelihood(self, 
+            key, params, 
+            t1, t2,
+            X, Y, R=None, session_indices=[], 
+            N_particles=1000):
+        '''Compute the predictive marginal log likelihood of held out data.
+            log p(y_{t1:t2} | y_{1:t1}, x_{1:t2}, theta)
+        '''
+        _, logliks = self.marginal_log_likelihood(
+            key, params, X[:t2], Y[:t2], R[:t2], session_indices, N_particles,
+            return_logliks = True,
+            )
+        return logliks[t1:t2].sum()
+    
+    
+class ParamsPsytrack(NamedTuple):
+    log_sigma: float
+    log_sigma_day: float
+
+class Psytrack(GLMLearn):
+    def __init__(self, 
+                 z_0: Union[float, jnp.ndarray] = 0.0,
+                 latent_dim = None,
+                 ) -> None:
+        self.z_0 = z_0
+        self.latent_dim = latent_dim
+        self.reward_func = None
+
+    def update_weights(self, key: PRNGKey, w, x, params: ParamsGLMLearn, y=None, r=None, day_flag: bool = False, return_noise=False):
+        # Add noise
+        update_noise = jax.random.normal(key, shape=w.shape)
+        update_noise = jnp.where(day_flag, 
+                                 jnp.multiply(jnp.exp(params.log_sigma_day), update_noise),
+                                 jnp.multiply(jnp.exp(params.log_sigma), update_noise)
+                                 )
+        
+        if return_noise:
+            return w + update_noise, update_noise
+        else:
+            return w + update_noise
+
 class ParamsTimeVarGLMLearn(NamedTuple):
-    beta_0: float
+    log_beta_0: float
     log_alpha: float
     log_sigma_0: float
     log_sigma: float
@@ -874,36 +1010,48 @@ class TimeVarGLMLearn(GLMLearn):
     $$
     so that $\sigma(\alpha)$ represents the lapse rate. 
     '''
-    def __init__(self, **kwargs) -> None:
+    def __init__(self, lapse, **kwargs) -> None:
         super().__init__(**kwargs)
+        self.lapse = lapse
 
     def split_latent(self, z):
         if z.ndim == 1:
-            beta, w = jnp.array(z[0]), z[1:]
+            log_beta, w = jnp.array(z[0]), z[1:]
         else:
-            beta, w = z[:,0], z[:,1:]
-        return beta, w
+            log_beta, w = z[:,0], z[:,1:]
+        return log_beta, w
     
-    def merge_latent(self, beta, w):
+    def merge_latent(self, log_beta, w):
         if w.ndim == 1:
             # alpha is scalar
-            return jnp.concatenate([jnp.array([beta]), w])
+            return jnp.concatenate([jnp.array([log_beta]), w])
         else:
-            return jnp.concatenate([beta[:, None], w], axis=1)
+            return jnp.concatenate([log_beta[:, None], w], axis=1)
 
     def sample_initial(self, key: PRNGKey, params, N: int, d: int=1):
         '''Sample from the initial distribution p(z_0)'''
-        beta = params.beta_0 + jnp.exp(params.log_sigma_0) * jax.random.normal(key, shape=(N,))
+        log_beta = params.log_beta_0 + jnp.exp(params.log_sigma_0) * jax.random.normal(key, shape=(N,))
         w = super().sample_initial(key, params=None, N=N, d=d)
-        return self.merge_latent(beta, w)
+        return self.merge_latent(log_beta, w)
         
     def update_weights(self, key: PRNGKey, z, x, params, y=None, r=None, day_flag=False, return_noise=False):
-        beta_t, w_t = self.split_latent(z)
+        log_beta_t, w_t = self.split_latent(z)
 
         key, beta_key, w_key = jax.random.split(key, 3)
-        beta_t = beta_t + jnp.exp(params.log_sigma_0) * jax.random.normal(beta_key, shape=beta_t.shape)
+        log_beta_t = log_beta_t + jnp.exp(params.log_sigma_0) * jax.random.normal(beta_key, shape=log_beta_t.shape)
 
-        log_learning_rate = params.log_alpha + jnp.log(jnp.clip(beta_t, 0, 1)) #jnp.log((1-sigmoid(beta_t)))
+        # log_learning_rate = params.log_alpha # jnp.log(jnp.clip(beta_t, 0, 1)) #jnp.log((1-sigmoid(beta_t)))
+        # if self.lapse:
+        #     log_learning_rate += sigmoid(log_beta_t)
+        # else:
+        #     log_learning_rate += log_beta_t
+        
+        log_learning_rate = jnp.where(
+            self.lapse,
+            params.log_alpha + sigmoid(log_beta_t),
+            params.log_alpha + log_beta_t
+        )
+        
         # jnp.log(jnp.clip(beta_t, 0, 1))[:, None] if w_t.ndim > 1 else jnp.log(jnp.clip(alpha_t, 0, 1))
         params_GLM = ParamsGLMLearn(
             log_sigma=params.log_sigma, 
@@ -912,13 +1060,13 @@ class TimeVarGLMLearn(GLMLearn):
             )
         w_t = super().update_weights(w_key, w_t, x, params_GLM, y, r, day_flag)
 
-        z_t = self.merge_latent(beta_t, w_t)
+        z_t = self.merge_latent(log_beta_t, w_t)
         return z_t
     
     def emission_likelihood(self, z, x, y):
-        beta, w = self.split_latent(z)
-        p = bernoulli_GLM_likelihood(w, x, y)
-        # p = (1-sigmoid(beta)) * p_GLM + sigmoid(beta)
+        log_beta, w = self.split_latent(z)
+        # p = bernoulli_GLM_likelihood(w, x, y)
+        p = sigmoid(log_beta) * bernoulli_GLM_likelihood(w, x, y) + y * sigmoid(-log_beta)
         return p
     
     def decision(self, key: PRNGKey, z, x):
@@ -1006,8 +1154,9 @@ if __name__=='__main__':
     seed = 1
     key = PRNGKey(seed)
 
-    array = jnp.array([0.2, 0.3, 0.4])
-    print(softmax_forward(array))
+    # array = jnp.array([0.2, 0.3, 0.4])
+    # print(softmax_forward(array))
+    print(sigmoid(jnp.array([-12])))
 
     # X = jax.random.uniform(key, shape=(10, 1))
     # Y = jax.random.bernoulli(key, p=0.5, shape=(10,)).astype(int)

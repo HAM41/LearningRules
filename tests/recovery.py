@@ -91,8 +91,25 @@ if __name__=='__main__':
         key, true_params, X[0], Y[0], R[0], session_indices[0], N_particles=args.N_particles,
         verbose=True
     )
+
+    # _, true_loglik = true_model.posterior_samples(
+    #     key, true_params, X[0], Y[0], R[0], session_indices[0], N_particles=args.N_particles,
+    #     return_history=False, verbose=False, posterior_type='filt'
+    # )
     logging.info(f"True log-likelihood (scan): {true_loglik}, time: {time.time()-start}")
 
+    key, scores_key1, scores_key2 = jax.random.split(key, 3)
+    scores, log_lik = true_model.next_step_prediction_score(
+        scores_key1, true_params, X[0], Y[0], R[0], session_indices[0], N_particles=args.N_particles,
+    )
+    logging.info(f"True next-step prediction score: {scores.mean():.3f} ± {scores.std():.3f}, log-lik: {log_lik}")
+
+    scores2t, _ = true_model.two_step_prediction_score(
+        scores_key2, true_params, X[0], Y[0], R[0], session_indices[0], N_particles=args.N_particles,
+    )
+    logging.info(f"True two-step prediction score: {scores2t.mean():.3f} ± {scores2t.std():.3f}")
+
+    
     # start = time.time()
     # true_loglik = true_model.marginal_log_likelihood_1(
     #     key, true_params, X[0], Y[0], R[0], session_indices[0], N_particles=args.N_particles,
@@ -101,15 +118,15 @@ if __name__=='__main__':
     # logging.info(f"True log-likelihood: {true_loglik}, time: {time.time()-start}")
     # sys.exit()
 
-    partition = int(len(X[0]) * 0.6)
-    key, subkey = jax.random.split(key)
-    prediction_score = true_model.score_predict(
-        key, true_params, 
-        X_hist=X[0][:partition], Y_hist=Y[0][:partition], R_hist=R[0][:partition], session_indices=session_indices[0], 
-        X_pred=X[0][partition:partition+100], Y_pred=Y[0][partition:partition+100],
-        N_particles=args.N_particles,
-    )
-    logging.info(f"Prediction score: {prediction_score:.4f}")
+    # partition = int(len(X[0]) * 0.6)
+    # key, subkey = jax.random.split(key)
+    # prediction_score = true_model.score_predict(
+    #     key, true_params, 
+    #     X_hist=X[0][:partition], Y_hist=Y[0][:partition], R_hist=R[0][:partition], session_indices=session_indices[0], 
+    #     X_pred=X[0][partition:partition+100], Y_pred=Y[0][partition:partition+100],
+    #     N_particles=args.N_particles,
+    # )
+    # logging.info(f"Prediction score: {prediction_score:.4f}")
 
     # Start fitting ----------------------------------
         
@@ -119,29 +136,62 @@ if __name__=='__main__':
     gridsearch_params = find_initial(
         X, Y, R=R, session_indices=session_indices,
         N_particles=args.N_particles, model_kwargs={'learning_rule':args.learning_rule}, seed=args.seed,
-        vmap=True, metric='mll',
+        vmap=True, metric='mll', return_top_n=1
         )
-    # gridsearch_params = [-1.0, -4.0, -4.0]
+    gridsearch_params = gridsearch_params[0]
+    logging.info(f"Gridsearch params: {gridsearch_params}")
 
+    # gridsearch_params = [-1.0, -5.0, -4.0]
+
+    # for i, top_grid_point in enumerate(gridsearch_params):
+    #     logging.info(f"Grid point #{i}: {top_grid_point}")
+
+        
     initial_params = ParamsGLMLearn(
         log_sigma=gridsearch_params[1], 
         log_sigma_day=gridsearch_params[2], 
         log_alpha=gridsearch_params[0] * jnp.ones(X[0].shape[1]+1)
-        )#._asdict()
+        )
     logging.info(f'Initial params: {initial_params}')
 
-    # res = fit_optax(
-    #     X[0], Y[0], R=R[0], session_indices=session_indices[0],
-    #     N_particles=args.N_particles, model_kwargs={'learning_rule':args.learning_rule, 'z_0': 0.},
-    #     initial_params=initial_params
-    #     )
+    all_log_alpha_samples, accepts = true_model.alpha_mcmc(
+            key, initial_params, 
+            X[0], Y[0], R=R[0], session_indices=session_indices[0],
+            N_particles=args.N_particles, n_iters=50, verbose=False, proposal_scale=0.5,
+            )
+    
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(10,4), ncols=2, constrained_layout=True)
+    for j in range(2):
+        ax[j].plot(all_log_alpha_samples[:,:,j], alpha=0.1, c='tab:blue')
+        ax[j].plot(jnp.percentile(all_log_alpha_samples[:,:,j], q=jnp.array([2.5, 50.0, 97.5]), axis=1).T, c='tab:blue')
+        ax[j].axhline(true_log_alpha[j], c='k', ls='--')
+    plt.savefig('tests/figures/alpha_samples.png')
+    
+    # log_alpha_samples = all_log_alpha_samples[-1]
+    log_alpha_samples = all_log_alpha_samples.reshape(-1, all_log_alpha_samples.shape[-1])
+    ci = jnp.percentile(log_alpha_samples, q=jnp.array([2.5, 97.5]), axis=0).T
+    log_geo_means = jnp.mean(log_alpha_samples, axis=0)
+    log_ari_means = jax.scipy.special.logsumexp(log_alpha_samples, axis=0) - jnp.log(log_alpha_samples.shape[0])
+    log_alpha_meds = jnp.median(log_alpha_samples, axis=0)
 
-    res = fit_MLL(
-        key,
+    logging.info("Posterior alpha:")
+    for i in range(len(initial_params.log_alpha)):
+        logging.info(f"alpha_{i}: log geo mean = {log_geo_means[i]:.2f}, log ari mean = {log_ari_means[i]:.2f}, med = {log_alpha_meds[i]:.2f}, CI = [{ci[i,0]:.2f}, {ci[i,1]:.2f}]")
+    sys.exit()
+    
+    res = fit_optax(
         X[0], Y[0], R=R[0], session_indices=session_indices[0],
         N_particles=args.N_particles, model_kwargs={'learning_rule':args.learning_rule, 'z_0': 0.},
         initial_params=initial_params
-    )
+        )
+
+    # params, res = fit_MLL(
+    #     key,
+    #     X[0], Y[0], R=R[0], session_indices=session_indices[0],
+    #     N_particles=args.N_particles, model_kwargs={'learning_rule':args.learning_rule, 'z_0': 0.},
+    #     initial_params=initial_params
+    # )
     # params, results_dict = fit_EM(
     #     X[0], Y[0], R=R[0], session_indices=session_indices[0],
     #     N_particles=args.N_particles, model_kwargs={'learning_rule':args.learning_rule, 'z_0': 0.},
@@ -149,8 +199,8 @@ if __name__=='__main__':
     #     posterior_type='smooth',
     # )
     # logging.info(f"Results: {results_dict}")
-        
-        # res = fit_EM(X[0], Y[0], R=R[0], session_indices=session_indices[0], N_particles=N_particles, model_kwargs={'learning_rule':learning_rule})
+    
+    # res = fit_EM(X[0], Y[0], R=R[0], session_indices=session_indices[0], N_particles=N_particles, model_kwargs={'learning_rule':learning_rule})
 
     # # # Plot recovery
 
