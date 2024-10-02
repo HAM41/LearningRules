@@ -1,7 +1,10 @@
 import numpy as np
 import pandas as pd
-from typing import List, Tuple, Optional
+from typing import NamedTuple, List, Tuple, Optional
+from jaxtyping import Array, Float, Bool
+import jax
 import jax.numpy as jnp
+import models
 
 def z_score(array):
     return (array - np.mean(array))/np.std(array)
@@ -139,6 +142,110 @@ def get_mouse_design(
             sess_ind.append(sess_ind[-1] + dLength)
     
     return X, Y, sess_ind
+
+def format_reward(X, Y, regressors, learning_rule):
+    if regressors[1] == 'contrastRight' and regressors[0] == 'contrastLeft':
+        if learning_rule == 'policy_gradient':
+            R = jnp.asarray(models.effective_reward(X[:,1]-X[:,0]))
+        else:
+            R = jnp.asarray(models.reward(X[:,1]-X[:,0], Y))
+    elif regressors[0] == 'stimIntensity':
+        if learning_rule == 'policy_gradient':
+            R = jnp.asarray(models.effective_reward(X[:,0]))
+        else:
+            R = jnp.asarray(models.reward(X[:,0], Y))
+    else:
+        raise Exception('Reward function not implemented for this regressor set.')
+    return R
+
+class IBLDataTrajectory(NamedTuple):
+    '''IBL single trajectory data, with T trials.'''
+    X: Float[Array, "T M"]      # Regressors, M-dimensional
+    Y: Float[Array, "T"]        # Choices, in {0, 1}
+    R: Float[Array, "T"]        # Rewards
+    day_flags: Bool[Array, "T"] # Day flags
+
+def split_train_test(X, Y, R, day_flags, session_indices, held_out_sessions):
+    '''
+    Split per session, then concatenate held_out_sessions into test set, and others into training set.
+    Args:
+        X: (T, M), Y: (T,), R: (T,), day_flags: (T,), session_indices: list of session time indices (in (0,T))
+        held_out_sessions: list of session indices (in (0, len(session_indices))) to hold out.
+    '''
+    # Split data into training and test sets
+    X_train, Y_train, R_train, day_flags_train = [], [], [], []
+    X_test, Y_test, R_test, day_flags_test = [], [], [], []
+
+    for session_id in range(len(session_indices) - 1):
+        t1, t2 = session_indices[session_id], session_indices[session_id + 1]
+        if session_id in held_out_sessions:
+            X_test.append(X[t1:t2])
+            Y_test.append(Y[t1:t2])
+            R_test.append(R[t1:t2])
+            day_flags_test.append(day_flags[t1:t2])
+        else:
+            X_train.append(X[t1:t2])
+            Y_train.append(Y[t1:t2])
+            R_train.append(R[t1:t2])
+            day_flags_train.append(day_flags[t1:t2])
+
+    X_train = jnp.concatenate(X_train, axis=0)
+    Y_train = jnp.concatenate(Y_train, axis=0)
+    R_train = jnp.concatenate(R_train, axis=0)
+    day_flags_train = jnp.concatenate(day_flags_train, axis=0)
+
+    X_test = jnp.concatenate(X_test, axis=0)
+    Y_test = jnp.concatenate(Y_test, axis=0)
+    R_test = jnp.concatenate(R_test, axis=0)
+    day_flags_test = jnp.concatenate(day_flags_test, axis=0)
+
+    train_trajectory = IBLDataTrajectory(X_train, Y_train, R_train, day_flags_train)
+    test_trajectory = IBLDataTrajectory(X_test, Y_test, R_test, day_flags_test)
+    return train_trajectory, test_trajectory
+
+
+class IBLSingleTrajectoryLoader():
+    def __init__(self, params):
+        '''
+        params: dict, with keys:
+        '''
+        lab = params['lab']
+        idx = params['subject_id']
+        regressors = params['regressors']
+        learning_rule = params['learning_rule']
+        seed = params['seed']
+
+        # Load IBL data
+        df = pd.read_csv('./data/ibl_learning_processed.csv') #TODO: change to ONE loading
+
+        lab_df = df[df['lab']==lab]
+        lab_subjects = np.unique(lab_df['subject'].values)
+        assert idx < len(lab_subjects), f"Subject index {idx} out of bounds."
+        subject = lab_subjects[idx]
+
+        # Get design matrix data
+        X, Y, session_indices = get_mouse_design(lab_df, subject=subject, regressors=regressors)
+        R = format_reward(X, Y, regressors, learning_rule)
+        day_flags = models.set_day_flags(len(X), jnp.array(session_indices))
+        self.trajectory = IBLDataTrajectory(X, Y, R, day_flags)
+
+        # Split data into training and test sets
+        key = jax.random.PRNGKey(seed)
+        n_sessions = len(session_indices)
+        held_out_sessions = jax.random.choice(key, n_sessions, shape=(int(n_sessions/10),), replace=False)
+        held_out_sessions = jnp.sort(held_out_sessions)
+        self.held_out_sessions = held_out_sessions
+
+        self.train_trajectory, self.test_trajectory = split_train_test(
+            X, Y, R, day_flags, session_indices, held_out_sessions
+            )
+        
+    def load_train_data(self):
+        return self.train_trajectory
+    
+    def load_test_data(self):
+        return self.trajectory, self.held_out_sessions
+    
 
 if __name__=='__main__':
     df = pd.read_csv('./data/ibl_learning_processed.csv')

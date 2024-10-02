@@ -335,29 +335,8 @@ class GLMLearn():
         # self.key = PRNGKey(seed)
         self.z_0 = z_0
         self.latent_dim = latent_dim
-
-    # def update_params(self, **kwargs) -> None:
-    #     '''passes trainable kwargs to self.params._replace
-    #     #? Add to parent class?
-    #     '''
-    #     for key in kwargs:
-    #         if not getattr(self.props, key).trainable:
-    #             raise ValueError(f"Parameter '{key}' is not trainable")
-        
-    #     self.params = self.params._replace(**kwargs)
-
-    # def update_params_from_array(self, params_array: Iterable) -> None:
-    #     '''Standardize way to set parameters from array.'''
-    #     # params_dict = {'log_sigma': params_array[0], 'alpha': params_array[1]}
-    #     # self.update_params(**params_dict)
-    #     self.params = ParamsGLMLearn._make(params_array)
         
     def decision(self, key: PRNGKey, w, x):
-        # if key is None:
-        #     self.key, subkey = jax.random.split(self.key)
-        # else:
-        #     subkey = key
-
         p_R = bernoulli_GLM_likelihood(w, x, y=1)
         y = jax.random.bernoulli(key, p_R).astype(int)
         return y
@@ -407,15 +386,6 @@ class GLMLearn():
 
     def sample_initial(self, key: PRNGKey, params, N: int, d: int=1):
         '''Sample from the initial distribution p(z_0)'''
-        # if key is None:
-        #     self.key, subkey = jax.random.split(self.key)
-        # else:
-        #     subkey = key
-
-        # if z_0 is None:
-        #     z_0 = jnp.zeros((d+1))
-
-        # key, subkey = jax.random.split(self.key)
         return self.z_0 + jax.random.normal(key, shape=(N, d+1,))
     
     # @handle_none_params
@@ -430,11 +400,6 @@ class GLMLearn():
             learning_signal = jnp.multiply(jnp.exp(params.log_alpha), policy_gradient(z_prev, inputs, r=r))
         mean = z_prev + learning_signal
         N = mean.shape[0]
-
-        # if day_flag:
-        #     cov = jnp.multiply(jnp.square(jnp.exp(params.log_sigma_day)), jnp.eye(N))
-        # else:
-        #     cov = jnp.multiply(jnp.square(jnp.exp(params.log_sigma)), jnp.eye(N))
 
         cov = jnp.where(day_flag, 
             jnp.multiply(jnp.square(jnp.exp(params.log_sigma_day)), jnp.eye(N)),
@@ -491,7 +456,7 @@ class GLMLearn():
             self, 
             X: jnp.ndarray, Y: jnp.ndarray, Z: jnp.ndarray, 
             params: ParamsGLMLearn, R: Optional[jnp.ndarray]=None,
-            session_indices: Optional[list]=[],
+            day_flags: Optional[jnp.ndarray]=None,
             ) -> float:
         '''
         Evaluate `log p(Y, Z | X, R, theta) = log p(y_{1:T}, z_{1:T} | x_{1:T}, r_{1:T}, theta)`. 
@@ -510,7 +475,8 @@ class GLMLearn():
         T = len(Y)
         if R is None:
             R = [None]*T
-        day_flags = set_day_flags(T, session_indices)
+        if day_flags is None:
+            day_flags = jnp.zeros(T, dtype=bool)
 
         # Initial t=0 dynamics likelihood terms
         log_pz0 = self.initial_loglikelihood(Z[0])
@@ -535,7 +501,7 @@ class GLMLearn():
     def posterior_samples(self, 
             key, 
             params, 
-            X, Y, R=None, session_indices=[], 
+            X, Y, R=None, day_flags=None,
             N_particles=1000, return_history=True, posterior_type='smooth', verbose=False
             ):
         if X.ndim == 1:
@@ -545,9 +511,10 @@ class GLMLearn():
             T, M = X.shape
         if R is None:
             R = [None for _ in range(T)]
+        if day_flags is None:
+            day_flags = jnp.zeros(T, dtype=bool)
         if self.latent_dim is None:
             self.latent_dim = M + 1
-        day_flags = set_day_flags(T, session_indices)
 
         if return_history:
             # Block out N x T x M+1 array (float32, x 4 in bytes) to store z_t samples.
@@ -599,7 +566,7 @@ class GLMLearn():
 
         return z_history, log_lik
 
-    def marginal_log_likelihood(self, key, params, X, Y, R=None, session_indices=[],
+    def marginal_log_likelihood(self, key, params, X, Y, R=None, day_flags=None,
                                 N_particles=1000, verbose=False, return_logliks = False):
         '''Use scan to make computation more efficient.'''
         if X.ndim == 1:
@@ -609,10 +576,11 @@ class GLMLearn():
             T, M = X.shape
         if R is None:
             R = [None for _ in range(T)]
-        day_flags = set_day_flags(T, session_indices)
+        if day_flags is None:
+            day_flags = jnp.zeros(T, dtype=bool)
 
         def scan_fn(carry, inputs):
-            tilde_z_t, log_lik = carry
+            tilde_z_t, marginal_log_lik = carry
             X_t, Y_t, R_t, next_day_flag, (subkey1, subkey2) = inputs
 
             # 2. Evaluate importance weights p(y_t | xhat_t, V_t)
@@ -644,7 +612,7 @@ class GLMLearn():
         else:
             return marginal_log_lik
     
-    def posterior_samples_scan(self, key, params, X, Y, R=None, session_indices=[],
+    def posterior_samples_scan(self, key, params, X, Y, R=None, day_flags=None,
                                 N_particles=1000, verbose=False):
         '''Use scan to make computation more efficient.'''
         if X.ndim == 1:
@@ -654,7 +622,8 @@ class GLMLearn():
             T, M = X.shape
         if R is None:
             R = [None for _ in range(T)]
-        day_flags = set_day_flags(T, session_indices)
+        if day_flags is None:
+            day_flags = jnp.zeros(T, dtype=bool)
 
         def scan_fn(carry, inputs):
             t, tilde_z_t, log_lik, z_history = carry
@@ -694,7 +663,7 @@ class GLMLearn():
             key, params,
             X_hist: jnp.ndarray, Y_hist: jnp.ndarray,
             X_pred: jnp.ndarray, Y_pred: jnp.ndarray,
-            R_hist: jnp.ndarray = None, session_indices: list=[],
+            R_hist: jnp.ndarray = None, day_flags: jnp.ndarray = None,
             N_particles: int=10000,
             ):
         '''
@@ -702,7 +671,8 @@ class GLMLearn():
         sampled decisions with true decisions.
         '''
         T = len(X_hist) + len(X_pred)
-        day_flags = set_day_flags(T, session_indices)
+        if day_flags is None:
+            day_flags = jnp.zeros(T, dtype=bool)
 
         # Step 1: filtering to obtain last weights
         # (_, Zs_filt), _ = samplers.bootstrap_filter(
@@ -713,7 +683,7 @@ class GLMLearn():
         #     return_history=False, verbose=True,
         #     )
         Zs_filt_T, _ = self.posterior_samples(
-            key, params, X_hist, Y_hist, R=R_hist, session_indices=session_indices,
+            key, params, X_hist, Y_hist, R=R_hist, day_flags=day_flags,
             N_particles=N_particles, return_history=False, posterior_type='filt',
         )
         w = Zs_filt_T.mean(0)
@@ -742,7 +712,7 @@ class GLMLearn():
         return score
     
     def next_step_prediction_score(
-            self, key, params, X, Y, R=None, session_indices=[],
+            self, key, params, X, Y, R=None, day_flags=None,
             N_particles=1000, verbose=False):
         '''Use scan to make computation more efficient.'''
         if X.ndim == 1:
@@ -752,7 +722,8 @@ class GLMLearn():
             T, M = X.shape
         if R is None:
             R = [None for _ in range(T)]
-        day_flags = set_day_flags(T, session_indices)
+        if day_flags is None:
+            day_flags = jnp.zeros(T, dtype=bool)
 
         def scan_fn(carry, inputs):
             tilde_z_t, log_lik = carry
@@ -787,7 +758,7 @@ class GLMLearn():
     
     
     def two_step_prediction_score(
-            self, key, params, X, Y, R=None, session_indices=[],
+            self, key, params, X, Y, R=None, day_flags=None,
             N_particles=1000, verbose=False):
         '''Use scan to make computation more efficient.'''
         if X.ndim == 1:
@@ -797,7 +768,8 @@ class GLMLearn():
             T, M = X.shape
         if R is None:
             R = [None for _ in range(T)]
-        day_flags = set_day_flags(T, session_indices)
+        if day_flags is None:
+            day_flags = jnp.zeros(T, dtype=bool)
 
         def scan_fn(carry, inputs):
             tilde_z_t, log_lik = carry
@@ -845,17 +817,19 @@ class GLMLearn():
     
     def alpha_mcmc(self, 
                    key, params, 
-                   X, Y, R=None, session_indices=[],
+                   X, Y, R=None, day_flags=None,
                    N_particles=1000, n_iters=100, N_samples=100,
                    verbose=True, proposal_scale=1.0,
                    ):
         '''Metropolis hastings to sample from posterior of alpha.'''
         proposal = lambda x: tfd.Normal(loc=x, scale=proposal_scale)
+        if day_flags is None:
+            day_flags = jnp.zeros(len(X), dtype=bool)
 
         @partial(jax.vmap, in_axes=(0,))
         def log_target(log_alpha) -> float:
             params_prop = params._replace(log_alpha=log_alpha)
-            return self.marginal_log_likelihood(key, params_prop, X, Y, R, session_indices, N_particles)
+            return self.marginal_log_likelihood(key, params_prop, X, Y, R, day_flags, N_particles)
         
         @jax.jit
         def metropolis_hastings_step(log_alpha, key):
@@ -949,13 +923,13 @@ class GLMLearn():
     def held_out_marginal_log_likelihood(self, 
             key, params, 
             t1, t2,
-            X, Y, R=None, session_indices=[], 
+            X, Y, R=None, day_flags=None,
             N_particles=1000):
         '''Compute the predictive marginal log likelihood of held out data.
             log p(y_{t1:t2} | y_{1:t1}, x_{1:t2}, theta)
         '''
         _, logliks = self.marginal_log_likelihood(
-            key, params, X[:t2], Y[:t2], R[:t2], session_indices, N_particles,
+            key, params, X[:t2], Y[:t2], R[:t2], day_flags, N_particles,
             return_logliks = True,
             )
         return logliks[t1:t2].sum()
@@ -1077,7 +1051,7 @@ class TimeVarGLMLearn(GLMLearn):
     def dynamics_loglikelihood(self, z_next, z_prev, inputs, data, params: ParamsGLMLearn, day_flag=False, r=None):
         raise NotImplementedError
     
-    def log_joint(self, X, Y, Z, params, R=None, session_indices=[]):
+    def log_joint(self, X, Y, Z, params, R=None, day_flags=None):
         raise NotImplementedError
 
 
