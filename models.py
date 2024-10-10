@@ -16,11 +16,13 @@ import tensorflow_probability.substrates.jax.distributions as tfd
 import os
 os.environ['JAX_PLATFORMS']='cpu'
 
-from parameters import ParamsGLMLearn, ParameterProperties #, handle_none_params
+from parameters import ParamsGLMLearn, ParamsPsytrack, ParamsTimeVarGLMLearn #, handle_none_params
 
 import logging
 logging.basicConfig(level=logging.INFO, format='[%(filename)s][%(asctime)s] %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+Y_L, Y_N, Y_R = 0.0, 0.5, 1.0 # Numerical value for the left, null, and right choices
 
 @jax.jit
 def sigmoid(x):
@@ -56,22 +58,24 @@ def softmax_forward(x):
 # def unvec(x): # has to be consistent with vec(). remove if not used
 #     return x[1:]
 
-@jax.jit
+# @jax.jit
 def sign(y: jnp.ndarray):
     '''
     y: array-like, 
     '''
-    y = jnp.asarray(y).astype(bool).astype(float)
+    # jax.debug.print('y = {}', y)
+    y = jnp.asarray(y)
     # return jnp.where(y == 0., -1., 1.)
-    return 2*y - 1
+    out = 2*jnp.where(jnp.isnan(y), Y_N, y) - 1
+    return out
 
 def correct_choice(x: jnp.ndarray):
     '''
-    Returns the side {0,1} of the stimulus. 
+    Returns the side {Y_L,Y_R} of the stimulus. 
     Also corresponds to the correct choice.
     '''
     # x = jnp.asarray(x).astype(float)
-    return jnp.where(x < 0, 0, 1)
+    return jnp.where(x < 0, Y_L, Y_R)
 
 def reward(X, Y, r1=1.0, r0=0.0) -> np.ndarray:
     '''
@@ -81,19 +85,19 @@ def reward(X, Y, r1=1.0, r0=0.0) -> np.ndarray:
     for (x,y) pairs in zip(X, Y)
     '''
     X = jnp.array(X).squeeze()
-    Y = jnp.array(Y).squeeze().astype(int)
+    Y = jnp.array(Y).squeeze().astype(float)
     
     # Broadcast scalars to arrays if needed
     if X.size == 1 and Y.size > 1:
         X = jnp.full(Y.shape, X)
     elif Y.size == 1 and X.size > 1:
-        Y = jnp.full(X.shape, Y).astype(int)
+        Y = jnp.full(X.shape, Y).astype(float)
 
     # Initialize an array for the rewards with the same shape as x and y
     r = r0 * jnp.ones_like(X, dtype=float)
 
     # Calculate rewards element-wise
-    mask_condition = (X < 0) & (Y == 0) | (X > 0) & (Y == 1)
+    mask_condition = jnp.logical_or(jnp.logical_and(X < 0, Y == Y_L), jnp.logical_and(X > 0, Y == Y_R))
     # r = r.at[mask_condition].set(1.0)
     r = jnp.where(mask_condition, r1, r)
 
@@ -112,7 +116,7 @@ def effective_reward(X):
     Returns effective reward R(x) = \sum_y r(x,y) sign(y), for all x in X. 
     Output `RX` is of same shape as `X`.
     '''
-    RX = jnp.sum(jnp.array([sign(y) * reward(X, y) for y in [0,1]]), axis=0)
+    RX = jnp.sum(jnp.array([sign(y) * reward(X, y) for y in [Y_L, Y_R]]), axis=0)
     return RX
 
 def cumulative_gaussian(x, sigma=1.0, mu=0.0):
@@ -125,22 +129,24 @@ def Phi(x):
 
 @jax.jit
 def bernoulli_GLM_likelihood(w, x, y):
-    '''Log-likelihood for a Bernoulli GLM'''
+    '''
+    Log-likelihood for a Bernoulli GLM
+        p(y | x, w) = sigmoid(sign(y) * w^T x)
+    
+    WARNING: 
+        Setting NaN y values to p=1, so that log p(y=NaN) = 0.
+        This is to handle held-out or missing data, & 
+        makes uncertainty-based (i.e. contains p or 1-p) learning rule updates equal 0.
+    '''
     vx = vec(x)
-    # if vx.ndim == 1:
     LM = jnp.dot(w, vx)
-    # else:
-    #     # print(w.shape, vx.shape)
-    #     # LM = w @ vx.T
-    #     LM = jnp.einsum('ij,ij->i', w, vx)
-    #     print(LM.shape)
     # p = safe_sigmoid(sign(y) * LM)
-    p = sigmoid(sign(y) * LM)
+    p = jnp.where(jnp.isnan(y), 1.0, sigmoid(sign(y) * LM))
     return p
 
 @jax.jit
 def policy_gradient(w, x, r=None):
-    p_R = bernoulli_GLM_likelihood(w, x, y=1.0)
+    p_R = bernoulli_GLM_likelihood(w, x, y=Y_R)
     if r is None:
         r = effective_reward(x)
     return r * jnp.outer(jnp.multiply(p_R, 1 - p_R), vec(x)).squeeze()
@@ -335,9 +341,12 @@ class GLMLearn():
         # self.key = PRNGKey(seed)
         self.z_0 = z_0
         self.latent_dim = latent_dim
+
+    def __repr__(self) -> str:
+        return f"GLMLearn({self.learning_rule})"
         
     def decision(self, key: PRNGKey, w, x):
-        p_R = bernoulli_GLM_likelihood(w, x, y=1)
+        p_R = bernoulli_GLM_likelihood(w, x, y=Y_R)
         y = jax.random.bernoulli(key, p_R).astype(int)
         return y
     
@@ -648,6 +657,7 @@ class GLMLearn():
         
         key, subkey = jax.random.split(key)
         tilde_z_t = self.sample_initial(subkey, params=params, N=N_particles, d=M)
+        assert self.latent_dim is not None, "Latent dimension not defined."
         z_history = jnp.zeros((N_particles, T, self.latent_dim), dtype=jnp.float32) # float16
         carry = (0, tilde_z_t, 0., z_history)
         
@@ -827,39 +837,50 @@ class GLMLearn():
             day_flags = jnp.zeros(len(X), dtype=bool)
 
         @partial(jax.vmap, in_axes=(0,))
-        def log_target(log_alpha) -> float:
+        def log_target_func(log_alpha) -> float:
             params_prop = params._replace(log_alpha=log_alpha)
             return self.marginal_log_likelihood(key, params_prop, X, Y, R, day_flags, N_particles)
         
         @jax.jit
-        def metropolis_hastings_step(log_alpha, key):
+        def metropolis_hastings_step(carry, inputs):
             '''
             Single step of Metropolis-Hastings. 
             Written in form amendable to jax.lax.scan.
             '''
+            # Unpack
+            log_alpha, log_fx = carry
+            key = inputs
+            
             key, proposal_key, accept_key = jax.random.split(key, 3)
 
             # Proposal step
             log_alpha_prop = proposal(log_alpha).sample(seed=proposal_key)
-            log_alpha_prop = jnp.clip(log_alpha_prop, -10, 2)
+            log_alpha_prop = jnp.clip(log_alpha_prop, -10, 1)
 
             # Acceptance step
-            log_ratio = log_target(log_alpha_prop) - log_target(log_alpha)
+            log_fx_prop = log_target_func(log_alpha_prop)
+
+            log_ratio = log_fx_prop - log_fx
             accept = jnp.log(jax.random.uniform(accept_key)) < log_ratio
 
-            log_alpha = jnp.where(accept[:, None], log_alpha_prop, log_alpha)
-            return log_alpha, (log_alpha, accept)
+            log_alpha = jnp.where(accept[:, None], log_alpha_prop, log_alpha) # pass log target to cut time?
+            log_fx = jnp.where(accept, log_fx_prop, log_fx)
+            return (log_alpha, log_fx), (log_alpha, accept)
         
         # Initialize
         keys = jax.random.split(key, n_iters)
         log_alpha = params.log_alpha
         log_alpha_samples_t = jnp.tile(log_alpha, (N_samples, 1))
         
+        log_fx = log_target_func(log_alpha_samples_t)
         if verbose:
             log_alpha_samples = []
             for i in range(n_iters):
-                _, (log_alpha_samples_t, accepts) = metropolis_hastings_step(log_alpha_samples_t, keys[i])
-                logging.info(f"[{i}/{n_iters}] log alpha mean: {log_alpha_samples_t.mean(0)}, accept frac: {accepts.sum()/N_samples:.2f}")
+                (log_alpha_samples_t, log_fx), (_, accepts) = metropolis_hastings_step(
+                    (log_alpha_samples_t, log_fx),
+                    keys[i]
+                    )
+                logging.info(f"[{i}/{n_iters}] log alpha med: {jnp.median(log_alpha_samples_t, axis=0)}, accept frac: {accepts.sum()/N_samples:.2f}")
 
                 # Print confidence intervals
                 if i % 10 == 0:
@@ -920,7 +941,7 @@ class GLMLearn():
         Z = jnp.concatenate([jnp.array([z_0]), Z_pred]); assert Z.shape == (T, latent_dim)
         return Y, Z
     
-    def held_out_marginal_log_likelihood(self, 
+    def held_out_session_marginal_log_likelihood(self, 
             key, params, 
             t1, t2,
             X, Y, R=None, day_flags=None,
@@ -934,10 +955,20 @@ class GLMLearn():
             )
         return logliks[t1:t2].sum()
     
-    
-class ParamsPsytrack(NamedTuple):
-    log_sigma: float
-    log_sigma_day: float
+    def held_out_trials_marginal_log_likelihood(self, 
+            key, params, 
+            held_out_trials,
+            X, Y, R=None, day_flags=None,
+            N_particles=1000):
+        '''Compute the predictive marginal log likelihood of held out data for each held out trial t,
+            log p(y_{t} | y_{1:t-1}, x_{1:t}, theta)
+        '''
+        T = max(held_out_trials)
+        _, logliks = self.marginal_log_likelihood(
+            key, params, X[:T], Y[:T], R[:T], day_flags[:T], N_particles,
+            return_logliks = True,
+            )
+        return logliks[held_out_trials]
 
 class Psytrack(GLMLearn):
     def __init__(self, 
@@ -948,7 +979,10 @@ class Psytrack(GLMLearn):
         self.latent_dim = latent_dim
         self.reward_func = None
 
-    def update_weights(self, key: PRNGKey, w, x, params: ParamsGLMLearn, y=None, r=None, day_flag: bool = False, return_noise=False):
+    def __repr__(self) -> str:
+        return f"Psytrack()"
+
+    def update_weights(self, key: PRNGKey, w, x, params: ParamsPsytrack, y=None, r=None, day_flag: bool = False, return_noise=False):
         # Add noise
         update_noise = jax.random.normal(key, shape=w.shape)
         update_noise = jnp.where(day_flag, 
@@ -961,58 +995,46 @@ class Psytrack(GLMLearn):
         else:
             return w + update_noise
 
-class ParamsTimeVarGLMLearn(NamedTuple):
-    log_beta_0: float
-    log_alpha: float
-    log_sigma_0: float
-    log_sigma: float
-    log_sigma_day: float
-
 class TimeVarGLMLearn(GLMLearn):
     r'''
-    We posit a random walk prior for the learning rate, 
-    $$
-        \beta_{t+1} = \beta_t + \epsilon_t
-    $$
-    and have the learning rule now be
-    $$
-        \w_{t+1} = \w_t + \alpha \beta_t \mathcal{L} + \epsilon_t
-    $$
-    and with a decision making model of the form,
-    $$
-        p(y = R\mid \w, \vec x, \alpha) = (1-2*\sigma(\beta)) * \sigma(\w^\top \vec x)   + \sigma(\beta)
-    $$
-    so that $\sigma(\alpha)$ represents the lapse rate. 
+    If lapse, beta = lapse state, sigmoid(beta) is the lapse rate. 
+        beta_0 should be set negative, so that sigmoid(beta) is close to 0.
+    If not lapse, beta = reward value (IRL) setting. 
+        beta_0 should be set to 1.
     '''
     def __init__(self, lapse, **kwargs) -> None:
         super().__init__(**kwargs)
         self.lapse = lapse
 
+    def __repr__(self) -> str:
+        return f"TimeVarGLMLearn(lapse={self.lapse})"
+
     def split_latent(self, z):
+        # Split latent variable into beta and weights, over last axis
         if z.ndim == 1:
-            log_beta, w = jnp.array(z[0]), z[1:]
+            beta, w = jnp.array(z[0]), z[1:]
         else:
-            log_beta, w = z[:,0], z[:,1:]
-        return log_beta, w
+            beta, w = z[..., 0], z[..., 1:]
+        return beta, w
     
-    def merge_latent(self, log_beta, w):
+    def merge_latent(self, beta, w):
         if w.ndim == 1:
             # alpha is scalar
-            return jnp.concatenate([jnp.array([log_beta]), w])
+            return jnp.concatenate([jnp.array([beta]), w])
         else:
-            return jnp.concatenate([log_beta[:, None], w], axis=1)
+            return jnp.concatenate([beta[:, None], w], axis=1)
 
     def sample_initial(self, key: PRNGKey, params, N: int, d: int=1):
         '''Sample from the initial distribution p(z_0)'''
-        log_beta = params.log_beta_0 + jnp.exp(params.log_sigma_0) * jax.random.normal(key, shape=(N,))
+        beta = params.beta_0 + jnp.exp(params.log_sigma_0) * jax.random.normal(key, shape=(N,))
         w = super().sample_initial(key, params=None, N=N, d=d)
-        return self.merge_latent(log_beta, w)
+        return self.merge_latent(beta, w)
         
     def update_weights(self, key: PRNGKey, z, x, params, y=None, r=None, day_flag=False, return_noise=False):
-        log_beta_t, w_t = self.split_latent(z)
+        beta_t, w_t = self.split_latent(z)
 
         key, beta_key, w_key = jax.random.split(key, 3)
-        log_beta_t = log_beta_t + jnp.exp(params.log_sigma_0) * jax.random.normal(beta_key, shape=log_beta_t.shape)
+        beta_t = beta_t + jnp.exp(params.log_sigma_0) * jax.random.normal(beta_key, shape=beta_t.shape)
 
         # log_learning_rate = params.log_alpha # jnp.log(jnp.clip(beta_t, 0, 1)) #jnp.log((1-sigmoid(beta_t)))
         # if self.lapse:
@@ -1022,29 +1044,32 @@ class TimeVarGLMLearn(GLMLearn):
         
         log_learning_rate = jnp.where(
             self.lapse,
-            params.log_alpha + sigmoid(log_beta_t),
-            params.log_alpha + log_beta_t
+            params.log_alpha + (1 - sigmoid(beta_t))[:,None],
+            params.log_alpha + beta_t[:,None]
         )
         
         # jnp.log(jnp.clip(beta_t, 0, 1))[:, None] if w_t.ndim > 1 else jnp.log(jnp.clip(alpha_t, 0, 1))
         params_GLM = ParamsGLMLearn(
             log_sigma=params.log_sigma, 
-            log_alpha=log_learning_rate[:, None] if w_t.ndim > 1 else log_learning_rate, 
+            log_alpha=log_learning_rate, #[:, None] if w_t.ndim > 1 else log_learning_rate, 
             log_sigma_day=params.log_sigma_day
             )
         w_t = super().update_weights(w_key, w_t, x, params_GLM, y, r, day_flag)
 
-        z_t = self.merge_latent(log_beta_t, w_t)
+        z_t = self.merge_latent(beta_t, w_t)
         return z_t
     
     def emission_likelihood(self, z, x, y):
-        log_beta, w = self.split_latent(z)
-        # p = bernoulli_GLM_likelihood(w, x, y)
-        p = sigmoid(log_beta) * bernoulli_GLM_likelihood(w, x, y) + y * sigmoid(-log_beta)
+        beta, w = self.split_latent(z)
+        p = jnp.where(
+            self.lapse,
+            (1 - sigmoid(beta)) * bernoulli_GLM_likelihood(w, x, y) + 0.5 * sigmoid(beta),
+            bernoulli_GLM_likelihood(w, x, y),
+        )
         return p
     
     def decision(self, key: PRNGKey, z, x):
-        p_R = self.emission_likelihood(z, x, y=1)
+        p_R = self.emission_likelihood(z, x, y=Y_R)
         y = jax.random.bernoulli(key, p_R).astype(int)
         return y
     
@@ -1053,7 +1078,6 @@ class TimeVarGLMLearn(GLMLearn):
     
     def log_joint(self, X, Y, Z, params, R=None, day_flags=None):
         raise NotImplementedError
-
 
 class ParamsGLMHMMLearn(NamedTuple):
     A: jnp.ndarray

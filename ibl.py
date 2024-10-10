@@ -1,3 +1,12 @@
+r'''
+Author: Victor 
+
+This script contains functions to load and preprocess behavioral data from the IBL database.
+
+Useful links: 
+- IBL protocol details: https://figshare.com/articles/preprint/A_standardized_and_reproducible_method_to_measure_decision-making_in_mice_Appendix_2_IBL_protocol_for_mice_training/11634729/3?file=24954497
+- IBL ONE API searching: https://int-brain-lab.github.io/ONE/notebooks/one_search/one_search.html
+'''
 import numpy as np
 import pandas as pd
 from typing import NamedTuple, List, Tuple, Optional
@@ -5,6 +14,89 @@ from jaxtyping import Array, Float, Bool
 import jax
 import jax.numpy as jnp
 import models
+
+import logging
+logging.basicConfig(level=logging.INFO, format='[%(filename)s][%(asctime)s] %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+Y_L, Y_N, Y_R = 0.0, 0.5, 1.0 # Numerical value for the left, null, and right choices
+
+def tanh_transform(x, p=5):
+    return np.tanh(p*x)/np.tanh(p)
+
+def tanh_inv_transform(y, p=5):
+    return np.arctanh(y*np.tanh(p))/p
+
+def load_IBL_behavioral_data(protocol: str='training') -> Tuple[pd.DataFrame, list]:
+    '''
+    Load data from IBL database for a given protocol, into a pandas dataframe.
+    Select the `trainable` the subjects that moved to biasedChoiceWorld, thus attained status `Trained 1b`. 
+    Args:
+        protocol: str, the protocol to load data from. Select from ['training', 'biasedChoiceWorld']
+    returns: 
+        entries: pd.DataFrame, the data from the IBL database, with columns:
+            ['lab', 'subject', 'date', 'contrastRight', 'choice', 'probabilityLeft', 'feedbackType', 'rewardVolume', 'contrastLeft']
+    '''
+    from one.api import ONE
+    ONE.setup(base_url='https://openalyx.internationalbrainlab.org', silent=True)
+    one = ONE(password='international')
+
+    # Select only the subjects that moved to biasedChoiceWorld
+    _, infos_biasedCW = one.search(task_protocol='biasedChoiceWorld', details=True)
+    subjects = np.unique([info['subject'] for info in infos_biasedCW])
+
+    # Get eids and infos for these subjects
+    eids, infos = one.search(subject=subjects, task_protocol=protocol, details=True)
+
+    # Select keys for trial data that are not time dependent (e.g. 'goCue_times')
+    keys = ['contrastLeft', 'contrastRight', 'choice', 'probabilityLeft', 'feedbackType', 'rewardVolume']
+
+    def check_keys(trial_data) -> bool:
+        return np.all([key in trial_data.keys() for key in keys])
+
+    # Compile data into a pandas dataframe
+    entries = {'lab': [], 'subject': [], 'date': [], 'session': []}
+    for key in keys:
+        entries[key] = []
+    
+    error_animals = []
+    for eid, info in zip(eids, infos):
+        try:
+            trial_data = one.load_object(eid, 'trials')
+            assert check_keys(trial_data), f'Keys missing.'
+
+            for t in range(len(trial_data['choice'])):
+                entries['lab'].append(info['lab'])
+                entries['subject'].append(info['subject'])
+                entries['date'].append(str(info['date']))
+                entries['session'].append(info['number'])
+                
+                for key in keys:
+                    entries[key].append(float(trial_data[key][t]))
+        
+        except Exception as e: # Catch any errors, leave out the data
+            logger.info(f'Error loading trials for {eid}: {e}')
+            error_animals.append(info['subject'])
+            continue
+
+    entries_df = pd.DataFrame(entries)
+    entries_df = entries_df.fillna(0) # NaNs are on the contrast information, which is 0 when not present
+    
+    if protocol == 'training':
+        # Remove the animals that loaded with errors on some sessions in their training data.
+        # This removed 38/100 amimals, 347037/1171032 trials (30 %)
+        logger.warning('WARNING: removing animals with trial loading errors.')
+        error_animal_ids = np.unique(error_animals)
+        entries_df = entries_df[~entries_df['subject'].isin(error_animal_ids)]
+    
+    return entries_df, error_animals
+
+def format_IBL_behavioral_data(df: pd.DataFrame) -> pd.DataFrame:
+    out_df = df.copy()
+    out_df['choice'] = -out_df['choice'] # choice from wheel direction to decision
+    out_df['choice'] = (out_df['choice'] + 1)/2 # Convert choice to 0, 1
+    out_df['feedbackType'] = (out_df['feedbackType'] + 1)/2 # Convert feedbackType to 0, 1
+    return out_df
 
 def z_score(array):
     return (array - np.mean(array))/np.std(array)
@@ -82,6 +174,9 @@ def z_score(array):
 def format_regressor_data(df: pd.DataFrame, regressor_name:str) -> np.ndarray:
     regressors_list = ['stimIntensity', 'contrastLeft', 'contrastRight', 
                        'correctSide', 'previousChoice', 'previousRewarded']
+    
+    # Columns in df: ['contrastLeft', 'choice', 'contrastRight', 'probabilityLeft', 'feedbackType', 'rewardVolume']
+
     if regressor_name  not in regressors_list:
         raise Exception('Regressor name invalid or not implemented.')
     
@@ -90,25 +185,26 @@ def format_regressor_data(df: pd.DataFrame, regressor_name:str) -> np.ndarray:
         data = z_score(stim_intensity)
     elif regressor_name == 'contrastLeft':
         p=5 # as used in Psytrack paper
-        data = np.tanh(p*df['contrastLeft'])/np.tanh(p) # tanh transformation of left contrasts
+        data = tanh_transform(df['contrastLeft'], p) # tanh transformation of left contrasts
     elif regressor_name == 'contrastRight':
         p=5 # as used in Psytrack paper
-        data = np.tanh(p*df['contrastRight'])/np.tanh(p) # tanh transformation of right contrasts
+        data = tanh_transform(df['contrastRight'], p) # tanh transformation of right contrasts
     elif regressor_name == 'correctSide':
-        data = np.array(df['correctSide'])
+        # data = np.array(df['correctSide'])
+        data = np.where(df['contrastRight'] > df['contrastLeft'], Y_R, Y_L)
     elif regressor_name == 'previousChoice':
         y = np.array(df['choice'])
         data_temp = y[0:-1]
         data = np.concatenate(([0.0], data_temp))
     elif regressor_name == 'previousRewarded':
-        data_temp = np.array(df['correctSide'])[0:-1] # previous rewarded
+        data_temp = np.where(df['contrastRight'] > df['contrastLeft'], 1.0, 0.0)[0:-1] # previous rewarded
         data = np.concatenate(([0.0], data_temp))
     
-    assert len(data) == len(df)
+    assert len(data) == len(df), f"Data length mismatch: {len(data)} vs {len(df)}"
     return data
 
 def get_mouse_design(
-        dfAll: pd.DataFrame, subject: str, regressors=Optional[List[str]], sess_stop: int=-1,
+        dfAll: pd.DataFrame, subject: str, regressors=Optional[List[str]],
         ) -> Tuple[np.ndarray, np.ndarray, List]:
     '''
     Returns design matrix X and vector Y of outputs (decisions) for a given subject. 
@@ -116,19 +212,26 @@ def get_mouse_design(
         ['stimIntensity', 'contrastLeft', 'contrastRight', 'correctSide', 'previousChoice', 'previousRewarded']
     '''
     data = dfAll[dfAll['subject']==subject]   # Restrict data to the subject specified
-    default_regressors = ['stimIntensity']
 
-    # Keep specified number of sessions
-    dates_to_keep = np.unique(data['date'])[0:sess_stop]
+    # # Keep specified number of sessions
+    dates_to_keep = np.unique(data['date'])
     data_temp = pd.DataFrame(data.loc[data['date'].isin(list(dates_to_keep))])
 
     # Design and choice matrices
     if regressors is None:
-        regressors = default_regressors
+        regressors = ['stimIntensity'] # Default regressor
     X = np.zeros((data_temp.shape[0], len(regressors)))
     Y = np.array(data_temp['choice'])
+    # Y = np.where(Y == 0., Y_L, Y) # make decision = 0 as Y_L
 
-    X[:,0] = 1. # bias
+    # Ensure that notations match 
+    assert np.isin(Y, np.array([Y_L, Y_N, Y_R])).all(), f"Choices must in {[Y_L, Y_N, Y_R]} but got {np.unique(Y, return_counts=True)}"
+    
+    _sub_df = data_temp.query("contrastRight != 0.0 and contrastLeft != 0.0")
+    _correct_choice = np.where(_sub_df["contrastRight"] > _sub_df["contrastLeft"], Y_R, Y_L)
+    _feedback = _correct_choice == np.array(_sub_df['choice']).astype(float)
+    assert (_feedback == _sub_df["feedbackType"]).all(), f"Correct choice and feedbackType mismatch {np.sum(_feedback != data_temp["feedbackType"])}"
+
     for i, regressor in enumerate(regressors):
         X[:,i] = format_regressor_data(data_temp, regressor)
 
@@ -143,7 +246,7 @@ def get_mouse_design(
     
     return X, Y, sess_ind
 
-def format_reward(X, Y, regressors, learning_rule):
+def format_reward(X, Y, regressors, learning_rule) -> jnp.ndarray:
     if regressors[1] == 'contrastRight' and regressors[0] == 'contrastLeft':
         if learning_rule == 'policy_gradient':
             R = jnp.asarray(models.effective_reward(X[:,1]-X[:,0]))
@@ -165,7 +268,7 @@ class IBLDataTrajectory(NamedTuple):
     R: Float[Array, "T"]        # Rewards
     day_flags: Bool[Array, "T"] # Day flags
 
-def split_train_test(X, Y, R, day_flags, session_indices, held_out_sessions):
+def split_train_test_sessions(X, Y, R, day_flags, session_indices, held_out_sessions):
     '''
     Split per session, then concatenate held_out_sessions into test set, and others into training set.
     Args:
@@ -203,6 +306,28 @@ def split_train_test(X, Y, R, day_flags, session_indices, held_out_sessions):
     test_trajectory = IBLDataTrajectory(X_test, Y_test, R_test, day_flags_test)
     return train_trajectory, test_trajectory
 
+def hold_out_trials(X, Y, R, day_flags, held_out_trials):
+    '''
+    Split per session, then concatenate held_out_sessions into test set, and others into training set.
+    Args:
+        X: (T, M), Y: (T,), R: (T,), day_flags: (T,), session_indices: list of session time indices (in (0,T))
+        held_out_sessions: list of session indices (in (0, len(session_indices))) to hold out.
+    '''
+    # Split data into training and test sets
+    X_train = jnp.asarray(X).copy()
+    # X_train = X_train.at[held_out_trials].set(jnp.nan)
+   
+    Y_train = jnp.asarray(Y).copy()
+    Y_train = Y_train.at[held_out_trials].set(jnp.nan)
+
+    R_train = jnp.asarray(R).copy()
+    # R_train = R_train.at[held_out_trials].set(jnp.nan)
+
+    day_flags_train = jnp.asarray(day_flags).copy()
+
+    train_trajectory = IBLDataTrajectory(X_train, Y_train, R_train, day_flags_train)
+    return train_trajectory
+
 
 class IBLSingleTrajectoryLoader():
     def __init__(self, params):
@@ -215,51 +340,90 @@ class IBLSingleTrajectoryLoader():
         learning_rule = params['learning_rule']
         seed = params['seed']
 
-        # Load IBL data
-        df = pd.read_csv('./data/ibl_learning_processed.csv') #TODO: change to ONE loading
+        self.data = {}
 
+        # Load IBL data
+        DOWNLOAD = False
+        if DOWNLOAD:
+            protocol = 'training'
+            df, _ = load_IBL_behavioral_data(protocol)
+            df.to_csv(f'IBL_{protocol}_protocol.csv', index=False)
+            df = format_IBL_behavioral_data(df)
+        else:
+            df = pd.read_csv('/home/vg0233/PillowLab/LearningRules/data/IBL_training_protocol.csv')
+            df = format_IBL_behavioral_data(df)
+
+        assert lab in np.unique(df['lab'].values), f"Lab {lab} not found in data."
         lab_df = df[df['lab']==lab]
         lab_subjects = np.unique(lab_df['subject'].values)
         assert idx < len(lab_subjects), f"Subject index {idx} out of bounds."
         subject = lab_subjects[idx]
+        logger.info(f"Loading data for subject {subject}.")
 
         # Get design matrix data
         X, Y, session_indices = get_mouse_design(lab_df, subject=subject, regressors=regressors)
         R = format_reward(X, Y, regressors, learning_rule)
         day_flags = models.set_day_flags(len(X), jnp.array(session_indices))
-        self.trajectory = IBLDataTrajectory(X, Y, R, day_flags)
+        self.data['session_indices'] = jnp.array(session_indices, dtype=jnp.int32)
+        self.data['trajectory']  = IBLDataTrajectory(X, Y, R, day_flags)
+
+        #TODO : check that reward and (choice vs correctchoice) are correctly aligned, or reward and rewardVolume
 
         # Split data into training and test sets
+        # TODO: training sets are much shorter, hold out trials instead
         key = jax.random.PRNGKey(seed)
-        n_sessions = len(session_indices)
-        held_out_sessions = jax.random.choice(key, n_sessions, shape=(int(n_sessions/10),), replace=False)
-        held_out_sessions = jnp.sort(held_out_sessions)
-        self.held_out_sessions = held_out_sessions
+        # n_sessions = len(session_indices)
+        # held_out_sessions = jax.random.choice(key, n_sessions, shape=(int(n_sessions/10),), replace=False)
+        # held_out_sessions = jnp.sort(held_out_sessions)
+        # self.data['held_out_sessions']  = held_out_sessions
 
-        self.train_trajectory, self.test_trajectory = split_train_test(
-            X, Y, R, day_flags, session_indices, held_out_sessions
-            )
+        n_trials = len(X)
+        held_out_trials = jax.random.choice(key, n_trials, shape=(int(n_trials/10),), replace=False)
+        held_out_trials = jnp.sort(held_out_trials)
+        self.data['held_out_trials']  = held_out_trials
+
+        self.data['train_trajectory'] = hold_out_trials(X, Y, R, day_flags, held_out_trials)
+        
+    def load_data(self):
+        return self.data
         
     def load_train_data(self):
-        return self.train_trajectory
+        return self.data['train_trajectory']
     
     def load_test_data(self):
-        return self.trajectory, self.held_out_sessions
+        '''load data needed for testing'''
+        return self.data['trajectory'], self.data['held_out_trials']
     
 
 if __name__=='__main__':
-    df = pd.read_csv('./data/ibl_learning_processed.csv')
+    # df = pd.read_csv('./data/ibl_learning_processed.csv')
 
-    labs = np.unique(df['lab'].values)
+    # labs = np.unique(df['lab'].values)
 
-    for lab in labs:
-        lab_df = df[df['lab']==lab]
-        subjects = np.unique(lab_df['subject'].values)
-        print(lab, len(subjects))
+    # for lab in labs:
+    #     lab_df = df[df['lab']==lab]
+    #     subjects = np.unique(lab_df['subject'].values)
+    #     print(lab, len(subjects)
 
+    loader = IBLSingleTrajectoryLoader({
+        'lab': 'wittenlab',
+        'subject_id': 1,
+        'regressors': ['stimIntensity', 'previousChoice', 'previousRewarded'],
+        'learning_rule': 'policy_gradient',
+        'seed': 0
+    })
     # X, Y, sess_ind = get_mouse_design(
     #     df, subject='ibl_witten_02', 
     #     regressors=['contrastLeft', 'contrastRight', 'previousChoice', 'previousRewarded']
     #     )
 
-    # print(len(sess_ind))
+    # # print(len(sess_ind))
+
+    # df_psytrack = pd.read_csv('/home/vg0233/PillowLab/LearningRules/data/ibl_learning_processed_PsyTrack2021.csv')
+    # df = pd.read_csv('/home/vg0233/PillowLab/LearningRules/data/IBL_training_protocol.csv')
+    # df['choice'] = -df['choice'] # Invert choices to match the convention of Y_L, Y_N, Y_R
+
+    # # # df.query("choice == 1.0")['rewardVolume'].values
+    # # print(jnp.unique(df.query("feedbackType == -1.0")['rewardVolume'].values, return_counts=True))
+    # print(df.query("subject == 'ibl_witten_12' and date == '2019-07-17'")[:10])
+    # print(df_psytrack.query("subject == 'ibl_witten_12' and date == '2019-07-17'")[:10])
