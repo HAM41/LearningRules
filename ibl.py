@@ -394,24 +394,50 @@ class IBLSingleTrajectoryLoader():
         '''load data needed for testing'''
         return self.data['trajectory'], self.data['held_out_trials']
     
+def get_number_subjects(lab):
+    df = pd.read_csv('/home/vg0233/PillowLab/LearningRules/data/IBL_training_protocol.csv')
+    df = format_IBL_behavioral_data(df)
+    assert lab in np.unique(df['lab'].values), f"Lab {lab} not found in data."
+    lab_df = df[df['lab']==lab]
+    lab_subjects = np.unique(lab_df['subject'].values)
+    return len(lab_subjects)
+
+def trajectory_length(lab, subject_id):
+    loader = IBLSingleTrajectoryLoader({
+        'lab': lab,
+        'subject_id': subject_id,
+        'regressors': ['stimIntensity', 'previousChoice', 'previousRewarded'],
+        'learning_rule': 'policy_gradient',
+        'seed': 0
+    })
+    data = loader.load_data()
+    return len(data['trajectory'].X)
 
 if __name__=='__main__':
     # df = pd.read_csv('./data/ibl_learning_processed.csv')
 
     # labs = np.unique(df['lab'].values)
+    Ts = []
+    for lab in ['wittenlab', 'churchlandlab', 'angelakilab']:
+        for subject_id in range(get_number_subjects(lab)):
+            T = trajectory_length(lab, subject_id)
+            print(lab, subject_id, T)
+            Ts.append(T)
+
+    print(np.mean(Ts), np.std(Ts))
 
     # for lab in labs:
     #     lab_df = df[df['lab']==lab]
     #     subjects = np.unique(lab_df['subject'].values)
     #     print(lab, len(subjects)
 
-    loader = IBLSingleTrajectoryLoader({
-        'lab': 'wittenlab',
-        'subject_id': 1,
-        'regressors': ['stimIntensity', 'previousChoice', 'previousRewarded'],
-        'learning_rule': 'policy_gradient',
-        'seed': 0
-    })
+    # loader = IBLSingleTrajectoryLoader({
+    #     'lab': 'wittenlab',
+    #     'subject_id': 1,
+    #     'regressors': ['stimIntensity', 'previousChoice', 'previousRewarded'],
+    #     'learning_rule': 'policy_gradient',
+    #     'seed': 0
+    # })
     # X, Y, sess_ind = get_mouse_design(
     #     df, subject='ibl_witten_02', 
     #     regressors=['contrastLeft', 'contrastRight', 'previousChoice', 'previousRewarded']
