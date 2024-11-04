@@ -11,53 +11,19 @@ class ParamsGLMLearn(NamedTuple):
     log_sigma_day: Union[float, ParameterProperties]
     log_alpha: Union[float, jnp.ndarray, ParameterProperties]
 
-    # @staticmethod
-    # def from_array(array, lengths):
-    #     # Unpack the lengths of each attribute
-
-    #     # Slice the array based on the original lengths of attributes
-    #     log_sigma = array[0:lengths[0]].squeeze()
-    #     log_sigma_day = array[lengths[0]:lengths[0]+lengths[1]].squeeze()
-    #     log_alpha = array[lengths[0]+lengths[1]:].squeeze()
-        
-    #     # Reconstruct the NamedTuple
-    #     return ParamsGLMLearn(log_sigma=log_sigma, log_sigma_day=log_sigma_day, log_alpha=log_alpha)
-
 class ParamsPsytrack(NamedTuple):
     log_sigma: float
     log_sigma_day: float
 
-    # @staticmethod
-    # def from_array(array, lengths):
-    #     # Unpack the lengths of each attribute
-
-    #     # Slice the array based on the original lengths of attributes
-    #     log_sigma = array[0:lengths[0]].squeeze()
-    #     log_sigma_day = array[lengths[0]:].squeeze()
-        
-    #     # Reconstruct the NamedTuple
-    #     return ParamsPsytrack(log_sigma=log_sigma, log_sigma_day=log_sigma_day)
-
 class ParamsTimeVarGLMLearn(NamedTuple):
     beta_0: float
     log_alpha: float
-    log_sigma_0: float
-    log_sigma: float
-    log_sigma_day: float
-
-    # @staticmethod
-    # def from_array(array, lengths):
-    #     # Unpack the lengths of each attribute
-
-    #     # Slice the array based on the original lengths of attributes
-    #     beta_0 = array[0:lengths[0]].squeeze()
-    #     log_alpha = array[lengths[0]:lengths[0]+lengths[1]].squeeze()
-    #     log_sigma_0 = array[lengths[0]+lengths[1]:lengths[0]+lengths[1]+lengths[2]].squeeze()
-    #     log_sigma = array[lengths[0]+lengths[1]+lengths[2]:lengths[0]+lengths[1]+lengths[2]+lengths[3]].squeeze()
-    #     log_sigma_day = array[lengths[0]+lengths[1]+lengths[2]+lengths[3]:].squeeze()
-        
-    #     # Reconstruct the NamedTuple
-    #     return ParamsTimeVarGLMLearn(beta_0=beta_0, log_alpha=log_alpha, log_sigma_0=log_sigma_0, log_sigma=log_sigma, log_sigma_day=log_sigma_day)
+    log_sigma_0: float = -2.0
+    log_sigma: float = -2.0
+    log_sigma_day: float = -1.0
+    baseline: float = 0.0
+    forget: float = 0.0
+    forget_day: float = 0.1
 
 class ParamsGLMRegLearn(NamedTuple):
     log_sigma: float
@@ -70,26 +36,7 @@ class ParamsGLMRegLearn(NamedTuple):
     beta: float
     baseline: Union[float, jnp.ndarray]
 
-    # @staticmethod
-    # def from_array(array, lengths):
-    #     # Unpack the lengths of each attribute
-
-    #     L = np.cumsum(lengths)
-
-    #     # Slice the array based on the original lengths of attributes
-    #     log_sigma = array[0:L[0]].squeeze()
-    #     log_sigma_day = array[L[0]:L[1]].squeeze()
-    #     log_alpha = array[L[1]:L[2]].squeeze()
-    #     log_Q = array[L[2]:L[3]].squeeze()
-    #     A = array[L[3]:L[4]].squeeze()
-    #     kappa = array[L[4]:L[5]].squeeze()
-    #     gamma = array[L[5]:L[6]].squeeze()
-    #     beta = array[L[6]:].squeeze()
-
-    #     # Reconstruct the NamedTuple
-    #     return ParamsGLMRegLearn(
-    #         log_alpha=log_alpha, log_sigma=log_sigma, log_sigma_day=log_sigma_day, log_Q=log_Q, A=A, kappa=kappa, gamma=gamma, beta=beta,
-    #         )
+    
     
 class ParamsGLMHMMLearn(NamedTuple):
     logit_pi0: float
@@ -99,24 +46,6 @@ class ParamsGLMHMMLearn(NamedTuple):
     log_sigma: float
     log_sigma_day: float
 
-    # @staticmethod
-    # def from_array(array, lengths):
-    #     # Unpack the lengths of each attribute
-
-    #     L = np.cumsum(lengths)
-
-    #     # Slice the array based on the original lengths of attributes
-    #     logit_pi0 = array[0:L[0]].squeeze()
-    #     logit_a_1 = array[L[0]:L[1]].squeeze()
-    #     logit_a_2 = array[L[1]:L[2]].squeeze()
-    #     log_alpha = array[L[2]:L[3]].squeeze()
-    #     log_sigma = array[L[3]:L[4]].squeeze()
-    #     log_sigma_day = array[L[4]:].squeeze()
-
-    #     # Reconstruct the NamedTuple
-    #     return ParamsGLMHMMLearn(
-    #         logit_pi0=logit_pi0, logit_a_1=logit_a_1, logit_a_2=logit_a_2, log_alpha=log_alpha, log_sigma=log_sigma, log_sigma_day=log_sigma_day
-    #         )
 
 def handle_none_params(func):
     def wrapper(self, *args, params=None, **kwargs):
