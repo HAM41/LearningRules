@@ -6,6 +6,7 @@ from parameters import ParamsGLMLearn
 import scipy as sp
 from tqdm import tqdm
 from typing import Callable
+import sys
 
 import jax
 import jax.numpy as jnp
@@ -25,7 +26,7 @@ def bootstrap_filter(
         seed=0, 
         return_history=True, 
         R=None, 
-        session_indices=[],
+        day_flags=None,
         verbose=True,
         ):
     '''
@@ -52,10 +53,12 @@ def bootstrap_filter(
         T, M = X.shape
     if R is None:
         R = [None for _ in range(T)]
+    if day_flags is None:
+        day_flags = jnp.zeros(T, dtype=bool)
 
     # day_flags = jnp.zeros(T, dtype=bool)
     # day_flags = day_flags.at[session_indices].set(True)
-    day_flags = models.set_day_flags(T, session_indices)
+    # day_flags = models.set_day_flags(T, session_indices)
 
     # if len(session_indices) > 0:
     #     # day_flags = [False for _ in range(T)]
@@ -151,31 +154,36 @@ def bootstrap_filter(
     return (posterior_history, filtering_history), log_lik
 
 def test_bootstrap_filter():
-    true_log_alpha = -5.0
-    true_logsigma = -5.0
+    true_log_alpha = -4.0
+    true_logsigma = -2.0
     learning_rule = 'policy_gradient'
     # true_model = QLearningModel(sigma=true_sigma, alpha=true_alpha, softmax=True)
     # true_model = GLMLearn(log_sigma=true_logsigma, log_alpha=jnp.log(true_alpha))
     model = GLMLearn(learning_rule=learning_rule)
-    params = ParamsGLMLearn(log_sigma=true_logsigma, log_alpha=true_log_alpha, log_sigma_day=1.0)
+    true_params = ParamsGLMLearn(log_sigma=true_logsigma, log_alpha=true_log_alpha, log_sigma_day=1.0)
 
 
     T = 5000
     log_liks, Z_errors = [], []
     N_particles = 5000
 
-    fig, (ax, ax2) = plt.subplots(ncols=2, constrained_layout=True)
+    fig = plt.figure(figsize=[8,6], constrained_layout=True)
+    from matplotlib.gridspec import GridSpec
+    gs = GridSpec(2, 2, figure=fig)
+    ax1 = fig.add_subplot(gs[0,0])
+    ax2 = fig.add_subplot(gs[0,1])
+    ax3 = fig.add_subplot(gs[1,:])
 
     key = jax.random.PRNGKey(0)
     key, sample_key = jax.random.split(key, 2)
-    X, Y, Z, _ = model.sample(sample_key, params, T)
+    X, Y, Z, _ = model.sample(sample_key, true_params, T)
     session_indices = jnp.zeros_like(X[:,0], dtype=bool)
     if learning_rule == 'reinforce':
         R = jnp.array([models.reward(X[t], Y[t]) for t in range(T)])
     elif learning_rule == 'policy_gradient':
         R = models.effective_reward(X)
 
-    log_alpha_range = np.linspace(-8,0,30)
+    log_alpha_range = np.linspace(-7,-1,30)
     gradients = []
     for i in range(5):
         key, _ = jax.random.split(key)
@@ -193,31 +201,58 @@ def test_bootstrap_filter():
 
     log_liks = jnp.array(log_liks)
     gradients = jnp.array(gradients)
-    ax.plot(log_alpha_range, log_liks.mean(0), c='tab:grey')
-    ax.fill_between(log_alpha_range, log_liks.mean(0)-log_liks.std(0), log_liks.mean(0)+log_liks.std(0), alpha=0.3, color='tab:grey')
-    ax2.plot(log_alpha_range, jnp.abs(gradients.mean(0)), c='tab:blue')
-    ax2.set_yscale('log')
-    ax.set_xlabel(r'Learning rate $\alpha$')
-    ax.axvline(x=true_log_alpha, c='k', label=r'True $\alpha$')
-    plt.savefig('tests/figures/test_bootstrap_filter_alphavals.png')
 
-    # # (z_smooth, z_filt), log_lik = bootstrap_filter(N_particles, X=X, Y=Y, model=true_model, return_history=True, verbose=True)
-    for _ in range(1):
-        key, _ = jax.random.split(key)
-        Z_smooth, log_lik = model.posterior_samples(key, params, X, Y, R=R, N_particles=N_particles, verbose=True, posterior_type='smooth', session_indices=session_indices)
-        Z_error = jnp.linalg.norm(Z_smooth.mean(axis=0) - Z)
-        print(Z_error, log_lik)
+    ax1.plot(log_alpha_range, log_liks.mean(0), c='tab:grey')
+    ax1.fill_between(log_alpha_range, log_liks.mean(0)-log_liks.std(0), log_liks.mean(0)+log_liks.std(0), alpha=0.3, color='tab:grey')
+    ax2.plot(log_alpha_range, gradients.mean(0), c='tab:blue', zorder=1)
+    # ax2.fill_between(log_alpha_range, gradients.mean(0)-gradients.std(0), gradients.mean(0)+gradients.std(0), alpha=0.3, color='tab:blue')
+    ax1.set_ylabel('Log-likelihood')
+    ax2.set_ylabel('Gradient')
+    ax2.axhline(0, c='tab:gray', zorder=-1)
+    # ax2.set_yscale('log')
+    for ax in [ax1, ax2]:    
+        ax.set_xlabel(r'Learning rate $\alpha$')
+        ax.axvline(x=true_log_alpha, c='k', ls='--', label=r'True $\alpha$', zorder=-1)
 
-        plt.figure();
-        for i in range(2):
-            plt.plot(Z_smooth.mean(axis=0)[:,i], c='tab:blue', label='Smoothed')
-            plt.fill_between(np.arange(T), Z_smooth.mean(axis=0)[:,i]-Z_smooth.std(axis=0)[:,i], Z_smooth.mean(axis=0)[:,i]+Z_smooth.std(axis=0)[:,i], alpha=0.3, color='tab:blue')
+    logging.info("Plotted alpha vals and grads")
 
-            # plt.plot(z_filt.mean(axis=0)[:,i], c='tab:orange', label='filtered')
-            # plt.fill_between(np.arange(T), z_filt.mean(axis=0)[:,i]-z_filt.std(axis=0)[:,i], z_filt.mean(axis=0)[:,i]+z_filt.std(axis=0)[:,i], alpha=0.3, color='tab:orange')
-    plt.plot(Z, c='k', label='True')
-    plt.legend()
-    plt.savefig('tests/figures/test_bootstrap_filter.png')
+    # Confidence intervals
+    log_alpha_samples = model.alpha_mcmc(
+        key, true_params, X, Y, R=R, N_particles=N_particles, session_indices=session_indices,
+        n_iters=100
+    )
+    q1, q2 = jnp.percentile(log_alpha_samples, q=jnp.array([2.5, 97.5]), axis=0).T[0]
+    print(q1, q2)
+    
+    for ax in [ax1, ax2]:
+        ax.axvline(x=q1, c='tab:orange', ls='--', zorder=-1)
+        ax.axvline(x=q2, c='tab:orange', ls='--', zorder=-1)
+        ax.fill_betweenx(ax.get_ylim(), q1, q2, alpha=0.1, color='tab:orange', zorder=-1, label='95% CI')
+    ax1.legend()
+
+    # plt.savefig('tests/figures/test_bootstrap_filter_alphavals.png')
+
+    # # # (z_smooth, z_filt), log_lik = bootstrap_filter(N_particles, X=X, Y=Y, model=true_model, return_history=True, verbose=True)
+    # for _ in range(1):
+    #     key, _ = jax.random.split(key)
+    #     Z_smooth, log_lik = model.posterior_samples(key, true_params, X, Y, R=R, N_particles=N_particles, verbose=True, posterior_type='smooth', session_indices=session_indices)
+    #     Z_error = jnp.linalg.norm(Z_smooth.mean(axis=0) - Z)
+    #     print(Z_error, log_lik)
+
+    #     for i in range(2):
+    #         ax3.plot(Z_smooth.mean(axis=0)[:,i], c='tab:blue', label='Smoothed')
+    #         ax3.fill_between(np.arange(T), Z_smooth.mean(axis=0)[:,i]-Z_smooth.std(axis=0)[:,i], Z_smooth.mean(axis=0)[:,i]+Z_smooth.std(axis=0)[:,i], alpha=0.3, color='tab:blue')
+
+    #         # plt.plot(z_filt.mean(axis=0)[:,i], c='tab:orange', label='filtered')
+    #         # plt.fill_between(np.arange(T), z_filt.mean(axis=0)[:,i]-z_filt.std(axis=0)[:,i], z_filt.mean(axis=0)[:,i]+z_filt.std(axis=0)[:,i], alpha=0.3, color='tab:orange')
+    # ax3.plot(Z, c='k', label='True')
+    # ax3.legend()
+    # ax3.set_title('Weight recovery')
+    # ax3.set_ylabel('Weight')
+    # ax3.set_xlabel('Trial')
+
+    fig.suptitle(r'$\log\alpha = $'+f'{true_log_alpha:1.2f}, '+r'$\log\sigma = $'+f'{true_logsigma:1.2f}')
+    plt.savefig(f'tests/figures/test_bootstrap_filter_alpha_{true_log_alpha}_sigma{true_logsigma}.png', dpi=300)
     plt.close()
     
         # _, log_lik = bootstrap_filter(N_particles, X=X, Y=Y, return_history=False, verbose=True)
