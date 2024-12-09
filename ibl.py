@@ -19,7 +19,7 @@ import logging
 logging.basicConfig(level=logging.INFO, format='[%(filename)s][%(asctime)s] %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-Y_L, Y_N, Y_R = 0.0, 0.5, 1.0 # Numerical value for the left, null, and right choices
+Y_L, Y_R = -1.0, 1.0 # Numerical value for the left, null, and right choices
 
 def tanh_transform(x, p=5):
     return np.tanh(p*x)/np.tanh(p)
@@ -181,8 +181,10 @@ def format_regressor_data(df: pd.DataFrame, regressor_name:str) -> np.ndarray:
         raise Exception('Regressor name invalid or not implemented.')
     
     if regressor_name == 'stimIntensity':
-        stim_intensity = df['contrastRight'] - df['contrastLeft']
-        data = z_score(stim_intensity)
+        _contrast_right = tanh_transform(df['contrastRight'], p=5)
+        _contrast_left =  tanh_transform(df['contrastLeft'], p=5)
+        # data = z_score(stim_intensity)
+        data = _contrast_right - _contrast_left
     elif regressor_name == 'contrastLeft':
         p=5 # as used in Psytrack paper
         data = tanh_transform(df['contrastLeft'], p) # tanh transformation of left contrasts
@@ -197,7 +199,7 @@ def format_regressor_data(df: pd.DataFrame, regressor_name:str) -> np.ndarray:
         data_temp = y[0:-1]
         data = np.concatenate(([0.0], data_temp))
     elif regressor_name == 'previousRewarded':
-        data_temp = np.where(df['contrastRight'] > df['contrastLeft'], 1.0, 0.0)[0:-1] # previous rewarded
+        data_temp = np.where(df['contrastRight'] > df['contrastLeft'], Y_R, Y_L)[0:-1] # previous rewarded
         data = np.concatenate(([0.0], data_temp))
     
     assert len(data) == len(df), f"Data length mismatch: {len(data)} vs {len(df)}"
@@ -222,10 +224,21 @@ def get_mouse_design(
         regressors = ['stimIntensity'] # Default regressor
     X = np.zeros((data_temp.shape[0], len(regressors)))
     Y = np.array(data_temp['choice'])
+    
+    if Y_L == -1.0:
+        Y = 2 * Y - 1
+        if np.sum(Y == 0.) > 0:
+            logger.warning(f"Warning: {np.sum(Y == 0.)}/{len(Y)} choices are 0.0, replaced with {Y_R}")
+            Y = np.where(Y==0., Y_R, Y)
+    else:
+        if np.sum(Y == 0.5) > 0:
+            logger.warning(f"Warning: {np.sum(Y == 0.5)}/{len(Y)} choices are 0.0, replaced with {Y_R}")
+            Y = np.where(Y==0.5, Y_R, Y)
+
     # Y = np.where(Y == 0., Y_L, Y) # make decision = 0 as Y_L
 
     # Ensure that notations match 
-    assert np.isin(Y, np.array([Y_L, Y_N, Y_R])).all(), f"Choices must in {[Y_L, Y_N, Y_R]} but got {np.unique(Y, return_counts=True)}"
+    assert np.isin(Y, np.array([Y_L, Y_R])).all(), f"Choices must in {[Y_L, Y_R]} but got {np.unique(Y, return_counts=True)}"
     
     _sub_df = data_temp.query("contrastRight != 0.0 and contrastLeft != 0.0")
     _correct_choice = np.where(_sub_df["contrastRight"] > _sub_df["contrastLeft"], Y_R, Y_L)
@@ -246,17 +259,52 @@ def get_mouse_design(
     
     return X, Y, sess_ind
 
+def load_session_indices(lab, subject_id):
+    # Load IBL data
+    DOWNLOAD = False
+    if DOWNLOAD:
+        protocol = 'training'
+        df, _ = load_IBL_behavioral_data(protocol)
+        df.to_csv(f'IBL_{protocol}_protocol.csv', index=False)
+        df = format_IBL_behavioral_data(df)
+    else:
+        df = pd.read_csv('/home/vg0233/PillowLab/LearningRules/data/IBL_training_protocol.csv')
+        df = format_IBL_behavioral_data(df)
+
+    assert lab in np.unique(df['lab'].values), f"Lab {lab} not found in data."
+    lab_df = df[df['lab']==lab]
+    lab_subjects = np.unique(lab_df['subject'].values)
+    assert subject_id < len(lab_subjects), f"Subject index {subject_id} out of bounds."
+    subject = lab_subjects[subject_id]
+    
+    data = lab_df[lab_df['subject']==subject]   # Restrict data to the subject specified
+
+    # # Keep specified number of sessions
+    dates_to_keep = np.unique(data['date'])
+    data_temp = pd.DataFrame(data.loc[data['date'].isin(list(dates_to_keep))])
+
+    # Session start indicies
+    sess_ind = [0]
+    for date in dates_to_keep:
+        d = data_temp[data_temp['date']==date]
+        for sess in np.unique(d['session']):
+            dTemp = d[d['session'] == sess]
+            dLength = len(dTemp.index.tolist())
+            sess_ind.append(sess_ind[-1] + dLength)
+    
+    return sess_ind
+
 def format_reward(X, Y, regressors, learning_rule) -> jnp.ndarray:
-    if regressors[1] == 'contrastRight' and regressors[0] == 'contrastLeft':
-        if learning_rule == 'policy_gradient':
-            R = jnp.asarray(models.effective_reward(X[:,1]-X[:,0]))
-        else:
-            R = jnp.asarray(models.reward(X[:,1]-X[:,0], Y))
-    elif regressors[0] == 'stimIntensity':
+    if regressors[0] == 'stimIntensity':
         if learning_rule == 'policy_gradient':
             R = jnp.asarray(models.effective_reward(X[:,0]))
         else:
             R = jnp.asarray(models.reward(X[:,0], Y))
+    elif regressors[1] == 'contrastRight' and regressors[0] == 'contrastLeft':
+        if learning_rule == 'policy_gradient':
+            R = jnp.asarray(models.effective_reward(X[:,1]-X[:,0]))
+        else:
+            R = jnp.asarray(models.reward(X[:,1]-X[:,0], Y))
     else:
         raise Exception('Reward function not implemented for this regressor set.')
     return R
@@ -402,6 +450,19 @@ def get_number_subjects(lab):
     lab_subjects = np.unique(lab_df['subject'].values)
     return len(lab_subjects)
 
+def load_session_indices(lab, subject_id):
+    df = pd.read_csv('/home/vg0233/PillowLab/LearningRules/data/IBL_training_protocol.csv')
+    df = format_IBL_behavioral_data(df)
+    assert lab in np.unique(df['lab'].values), f"Lab {lab} not found in data."
+    lab_df = df[df['lab']==lab]
+    lab_subjects = np.unique(lab_df['subject'].values)
+    assert subject_id < len(lab_subjects), f"Subject index {subject_id} out of bounds."
+    subject = lab_subjects[subject_id]
+    logger.info(f"Loading data for subject {subject}.")
+
+    X, Y, session_indices = get_mouse_design(lab_df, subject=subject, regressors=['stimIntensity', 'previousChoice', 'previousRewarded'])
+    return jnp.array(session_indices, dtype=jnp.int32)
+
 def trajectory_length(lab, subject_id):
     loader = IBLSingleTrajectoryLoader({
         'lab': lab,
@@ -417,27 +478,32 @@ if __name__=='__main__':
     # df = pd.read_csv('./data/ibl_learning_processed.csv')
 
     # labs = np.unique(df['lab'].values)
-    Ts = []
-    for lab in ['wittenlab', 'churchlandlab', 'angelakilab']:
-        for subject_id in range(get_number_subjects(lab)):
-            T = trajectory_length(lab, subject_id)
-            print(lab, subject_id, T)
-            Ts.append(T)
+    # Ts = []
+    # for lab in ['wittenlab', 'churchlandlab', 'angelakilab']:
+    #     for subject_id in range(get_number_subjects(lab)):
+    #         T = trajectory_length(lab, subject_id)
+    #         print(lab, subject_id, T)
+    #         Ts.append(T)
 
-    print(np.mean(Ts), np.std(Ts))
+    # print(np.mean(Ts), np.std(Ts))
 
     # for lab in labs:
     #     lab_df = df[df['lab']==lab]
     #     subjects = np.unique(lab_df['subject'].values)
     #     print(lab, len(subjects)
 
-    # loader = IBLSingleTrajectoryLoader({
-    #     'lab': 'wittenlab',
-    #     'subject_id': 1,
-    #     'regressors': ['stimIntensity', 'previousChoice', 'previousRewarded'],
-    #     'learning_rule': 'policy_gradient',
-    #     'seed': 0
-    # })
+    loader = IBLSingleTrajectoryLoader({
+        'lab': 'wittenlab',
+        'subject_id': 0,
+        'regressors': ['stimIntensity', 'previousChoice', 'previousRewarded'],
+        'learning_rule': 'policy_gradient',
+        'seed': 0
+    })
+    data = loader.load_data()
+    # print(np.unique(data['trajectory'].X[:,0]).round(3))
+    # print(data['trajectory'].Y)
+
+    print(load_session_indices('wittenlab', 0))
     # X, Y, sess_ind = get_mouse_design(
     #     df, subject='ibl_witten_02', 
     #     regressors=['contrastLeft', 'contrastRight', 'previousChoice', 'previousRewarded']
