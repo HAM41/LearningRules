@@ -1,14 +1,15 @@
 # Folders
-figures/
 __pycache__/
 data/
-saves/
 notebooks/
-slurm_outs/
-figures/
 X/
-postprocessing/
 notebooks/
 
-# Files
+# Model saves
+saves/
+postprocessing/posterior/
+
+# Outputs
+figures/
+slurm_outs/
 *.slurm

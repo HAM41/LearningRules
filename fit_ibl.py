@@ -12,6 +12,7 @@ import argparse
 import ibl
 import sys
 sys.path.append('../')
+import fit_utils
 import samplers
 import models, optim
 
@@ -106,108 +107,122 @@ def make_n_dimensional(points, key=None):
     return points_array
 
 def fit_EM(
-        X, Y, R=None, 
-        n_iters=200, model_kwargs={}, 
-        seed=0, N_particles=1000, 
-        day_flags=None, initial_params=None, 
-        m_step_iters=500,
-        posterior_type='smooth'
+        model,
+        X: List[jnp.ndarray], Y: List[jnp.ndarray], R: List[jnp.ndarray], day_flags: List[jnp.ndarray],
+        n_iters: int=200, m_step_iters=500, N_particles: int=1000, 
+        seed: int=0, initial_params: Optional[dict] = None,
         ):
     '''
     Fit model with SMC EM: posterior samples are obtained by SMC, and used to evalutate with Monte-Carlo the ELBO. 
     '''
     logging.info(f'Fitting model with SMC-EM.')
-    logging.info(f"Posterior type: {posterior_type}. N_particles: {N_particles}.")
-    T, D = X.shape
     key = jax.random.PRNGKey(seed)
-    model = models.GLMLearn(**model_kwargs)
-
-    # current_params = [-5.0, -1.0, 0.5]
-
-    if initial_params is None:
-        initial_params = ParamsGLMLearn(log_sigma=-3.0, log_sigma_day=-1.0, alpha=0.5 * jnp.ones(D+1))._asdict()
 
     learning_rate = 0.01
-    scheduler = optax.exponential_decay(
-            init_value=learning_rate,
-            transition_steps=int(m_step_iters/2), # 2 cycles of decay
-            decay_rate=0.1,
-            transition_begin=10)
-    
-    # opt = optax.adam(learning_rate)
-    m_step_optimizer = optax.amsgrad(learning_rate=learning_rate)
-    # m_step_optimizer = optax.chain(
-    #     optax.scale_by_adam(),
-    #     optax.scale_by_learning_rate(learning_rate=learning_rate),
-    # #     optax.scale_by_schedule(scheduler),
-    # )
-    logging.info(f'M-step optimizer: amsgrad, initial learning rate: {learning_rate}.')
-
-
+    m_step_optimizer = optax.adam(learning_rate=learning_rate)
+    logging.info(f'M-step optimizer: adam, initial learning rate: {learning_rate}.')
 
     liks = [] 
     params = initial_params
 
-    def get_samples(params):
+    def get_samples(params, subject_id):
         Zs, lik = model.posterior_samples(
-            key, params,
-            X, Y, R=R, day_flags=day_flags,
-            N_particles=N_particles, 
-            return_history=True,
-            verbose=False,
-            posterior_type=posterior_type
+            key, params, 
+            X[subject_id], Y[subject_id], R[subject_id], day_flags[subject_id],
+            N_particles=N_particles, verbose=False, LAG=True
             )
-        return Zs, lik
+        return Zs.mean(0), lik
     
-    def log_joint(params):
-        def log_joint_per_particle(z):
-            return model.log_joint(
-                X, Y, z, R=R, 
-                # params = ParamsGLMLearn(**_params),
-                params=params,
-                day_flags=day_flags,
-                )
+    # def log_joint(params):
+    #     def log_joint_per_particle(z):
+    #         return model.log_joint(
+    #             X, Y, z, R=R, 
+    #             # params = ParamsGLMLearn(**_params),
+    #             params=params,
+    #             day_flags=day_flags,
+    #             )
     
-        log_joint_MCvalues = jax.vmap(log_joint_per_particle)(Zs) 
-        # log_joint_MCvalues = jax.pmap(log_joint_per_particle)(Zs) 
-        val = jnp.mean(log_joint_MCvalues, axis=0)
-        return -val
+    #     log_joint_MCvalues = jax.vmap(log_joint_per_particle)(Zs) 
+    #     # log_joint_MCvalues = jax.pmap(log_joint_per_particle)(Zs) 
+    #     val = jnp.mean(log_joint_MCvalues, axis=0)
+    #     return -val
+
+    # @jax.jit
+    # @partial(jax.jit, static_argnums=(2,))
+    def neg_log_joint(params, Z, subject_id):
+        # def _func(_Z):
+        out = -model.log_joint(
+            X[subject_id], Y[subject_id], Z, R=R[subject_id], day_flags=day_flags[subject_id],
+            params=params,
+            )
+        return out
+        # return jax.nn.logsumexp(jax.vmap(_func)(Z)) - jnp.log(N_particles)
+        # return jnp.mean(jax.vmap(_func)(Z))
     
-    def prediction_score(params, split=0.6, window=500):
-        split_ind = int(len(X) * split)
-        if split_ind + window > len(X):
-            window = len(X) - split - 1
-        score = model.score_predict(
-            key, params,
-            X_hist=X[:split_ind], Y_hist=Y[:split_ind], R_hist=R[:split_ind], day_flags=day_flags,
-            X_pred=X[split_ind:split_ind+window], Y_pred=Y[split_ind:split_ind+window],
-            N_particles=N_particles
-        )
-        return score
+    # def prediction_score(params, split=0.6, window=500):
+    #     split_ind = int(len(X) * split)
+    #     if split_ind + window > len(X):
+    #         window = len(X) - split - 1
+    #     score = model.score_predict(
+    #         key, params,
+    #         X_hist=X[:split_ind], Y_hist=Y[:split_ind], R_hist=R[:split_ind], day_flags=day_flags,
+    #         X_pred=X[split_ind:split_ind+window], Y_pred=Y[split_ind:split_ind+window],
+    #         N_particles=N_particles
+    #     )
+    #     return score
+
+    def compute_noise_component(params, Z, subject_id):
+        learning_updates = jax.vmap(lambda t: model.update_weights(
+            key, Z[t], 
+            x=X[subject_id][t], y=Y[subject_id][t], r=R[subject_id][t], day_flag=day_flags[subject_id][t],
+            params=params, return_learning_signal=True,
+            )[1])(jnp.arange(len(X[subject_id])))
+        # learning_updates = learning_updates.mean(1)
+
+        if isinstance(model, models.TimeVarGLMLearn):
+            _, w_post = model.split_latent(Z)
+        else:
+            w_post = Z
+
+        learning_component = w_post[0] + jnp.cumsum(learning_updates, axis=0)
+        noise_component = w_post[1:] - learning_component[:-1]
+        return noise_component
 
     logging.info("Starting EM procedure.")
+    best_val_per_subject = [-jnp.inf]*len(X)
+    best_params_per_subject = [params]*len(X)
     for iter_id in jnp.arange(n_iters):
+        if len(X) > 1:
+            subject_id = jax.random.randint(jax.random.PRNGKey(iter_id), shape=(), minval=0, maxval=len(X)-1).item()
+        else:
+            subject_id = 0
 
         # E-step: Get posterior samples
-        Zs, lik = get_samples(params)
-        assert Zs.shape == (N_particles, T, D+1)
-        logging.info(f'[{iter_id} - E] Lik: {lik:5.2f}')
+        Z, lik = get_samples(params, subject_id)
+        logging.info(f'[{iter_id} - E] Subject {subject_id}, LL: {lik:5.2f}, params: {params}')
 
-        for split in [0.2, 0.5, 0.8]: 
-            logging.info(f"[{iter_id}] T500 Prediction score with {split} history: {prediction_score(params, split):.4f}")\
-        
+        noise_component = compute_noise_component(params, Z, subject_id)
+        logging.info(f'Noise component norm: {jnp.linalg.norm(noise_component):.2f}')
+
+        def objective(params):
+            return neg_log_joint(params, Z=Z, subject_id=subject_id)
+
         # M-step: Optimize log joint. Use optax for optimization
         opt_state = m_step_optimizer.init(params)
         for m_iter_id in range(m_step_iters):
 
             # Grad of vmap over particles
-            val, grad = jax.value_and_grad(log_joint)(params)
+            neg_val, grad = jax.value_and_grad(objective)(params)
+            val = -neg_val
+            if val > best_val_per_subject[subject_id]:
+                best_val_per_subject[subject_id] = val
+                best_params_per_subject[subject_id] = params
 
             # Update
-            updates, opt_state = m_step_optimizer.update(grad, opt_state, loss=val)
+            updates, opt_state = m_step_optimizer.update(grad, opt_state, loss=neg_val)
             params = optax.apply_updates(params, updates)
             if m_iter_id % 50 == 0:
-                logging.info(f'[{iter_id} - M - {m_iter_id}] joint: {-val:.2f}, log_alpha grad norm = {jnp.linalg.norm(grad.log_alpha):.2e}')
+                logging.info(f'[{iter_id} - M - {m_iter_id}] Subject {subject_id}, joint: {val:.2f}' + (f', log_alpha grad norm = {jnp.linalg.norm(grad.log_alpha):.2e}' if 'log_alpha' in grad._fields else ''))
 
         logging.info(f"[{iter_id} - M] Optim result: {params}")
         logging.info(f'Memory: {process.memory_info().rss/1e6:5.2f} MB')
@@ -231,17 +246,17 @@ def fit_EM(
         # ELBOs.append(ELBO)
         # # logging.info(f'[{iter_id}] Params: {res.x}')
         
-        liks.append(lik.item())
+        # liks.append(lik.item())
 
-    result_dict = {
-        'params': params,
-        'T': T,
-        'N_particles': N_particles,
-        'seed': seed,
-        'liks': liks
-    }
+    # result_dict = {
+    #     'params': params,
+    #     'T': T,
+    #     'N_particles': N_particles,
+    #     'seed': seed,
+    #     'liks': liks
+    # }
 
-    return params, result_dict
+    return params, (best_val_per_subject, best_params_per_subject), opt_state
 
 def fit_LaplaceEM(X, Y, R=None, n_iters=200, model_kwargs={}, seed=0, N_particles=1000, session_indices=[]):
     from jax.scipy.optimize import minimize
@@ -354,16 +369,21 @@ def find_initial(
     Perform grid search to find initial parameters for optimization.
     Returns list of `return_top_n` best parameters, in the sense of marginal log-likelihood, of type determined by the `model`.
     '''
-    _, d = X[0].shape
+    d = X[0].shape[-1]
     key = jax.random.PRNGKey(seed)
     
     # Define grid
     if isinstance(model, models.TimeVarGLMLearn):
-        betas = jnp.linspace(-5.0, 5.0, 6) if model.lapse else jnp.linspace(0.0, 1.0, 6)
+        betas = jnp.linspace(-5.0, 5.0, 6) if model.lapse else jnp.linspace(0.0, 1.0, 5)
         log_sigmas = jnp.linspace(-8.0, -3.0, 6)
-        log_sigma_days = jnp.linspace(-5.0, -2.0, 3)
+        log_qs = jnp.linspace(-9.0, -4.0, 4)
         log_alphas = jnp.linspace(-10.0, -1.0, 8)
-        grid_points = jnp.stack(jnp.meshgrid(log_alphas, log_sigmas, log_sigma_days, betas), axis=-1).reshape(-1,4)
+        grid_points = jnp.stack(jnp.meshgrid(log_alphas, log_sigmas, log_qs, betas), axis=-1).reshape(-1,4)
+    elif isinstance(model, models.AC):
+        log_alphas = jnp.linspace(-8.0, -2.0, 8)
+        log_sigmas = jnp.linspace(-8.0, -3.0, 6)
+        logit_betas = jnp.linspace(-5.0, 5.0, 8)
+        grid_points = jnp.stack(jnp.meshgrid(log_alphas, log_sigmas, logit_betas), axis=-1).reshape(-1,3)
     elif isinstance(model, models.GLMRegLearn):
         log_alphas = jnp.linspace(-10.0, -1.0, 8)
         log_sigmas = jnp.linspace(-8.0, -3.0, 6)
@@ -371,23 +391,41 @@ def find_initial(
         betas = jnp.array([0., 1.])
         gammas = jnp.array([0., 1.])
         grid_points = jnp.stack(jnp.meshgrid(log_alphas, log_sigmas, baselines, betas, gammas), axis=-1).reshape(-1,5)
+    elif isinstance(model, models.QLearning):
+        log_alphas = jnp.linspace(-8.0, -2.0, 8)
+        log_sigmas = jnp.linspace(-8.0, -3.0, 6)
+        percept_log_scales = jnp.linspace(-3.0, 0.0, 6)
+        grid_points = jnp.stack(jnp.meshgrid(log_alphas, log_sigmas, percept_log_scales), axis=-1).reshape(-1,3)
+    elif isinstance(model, models.GLMBaseLearn):
+        log_alphas = jnp.linspace(-8.0, -2.0, 8)
+        log_sigmas = jnp.linspace(-8.0, -3.0, 6)
+        log_sigma_days = jnp.linspace(-5.0, -2.0, 3)
+        betas = jnp.linspace(-1.0, 1.0, 5)
+        grid_points = jnp.stack(jnp.meshgrid(log_alphas, log_sigmas, log_sigma_days, betas), axis=-1).reshape(-1,4)
+    elif isinstance(model, models.DynamicGLMHMM):
+        log_sigma = jnp.linspace(-8.0, 2.0, 8)
+        alpha = jnp.linspace(0, 3, 8)
+        grid_points = jnp.stack(jnp.meshgrid(log_sigma, alpha), axis=-1).reshape(-1,2)
     else:
-        log_sigmas = jnp.linspace(-8.0, -3.0, 10)
-        log_sigma_days = jnp.linspace(-5.0, -2.0, 8)
-        log_alphas = jnp.linspace(-10.0, -1.0, 12)
+        log_sigmas = jnp.linspace(-8.0, -3.0, 8)
+        log_sigma_days = jnp.linspace(-5.0, -2.0, 5)
+        log_alphas = jnp.linspace(-10.0, -1.0, 10)
+        # ps = jnp.array([1.0, 2.0, 3.0, 4.0, 5.0])
         grid_points = jnp.stack(jnp.meshgrid(log_alphas, log_sigmas, log_sigma_days), axis=-1).reshape(-1,3)
     logging.info(f'Finding initialization from grid of {grid_points.shape} points.')
 
     def array_to_params(params_array):
         if isinstance(model, models.TimeVarGLMLearn):
-            log_alpha, log_sigma, log_sigma_day, beta_0 = params_array
+            log_alpha, log_sigma, log_q, beta_0 = params_array
             log_alpha_val = log_alpha * jnp.ones((d+1,)) if vector_alpha else log_alpha
+            baseline = jnp.zeros((d+1,)) if vector_alpha else 0.0
             # baseline = jnp.zeros((d+1,)) if vector_alpha else 0.0
             # params = parameters.ParamsTimeVarGLMLearn(
             #     beta_0=beta_0, log_alpha=log_alpha_val, log_sigma_0=log_sigma, log_sigma=log_sigma, log_sigma_day=log_sigma_day # * jnp.ones(model.latent_dim)
             #     )
             params = parameters.ParamsTimeVarGLMLearn(
-                beta_0=beta_0, log_alpha=log_alpha_val, log_sigma_0=log_sigma, log_sigma=log_sigma, log_sigma_day=log_sigma_day,
+                beta_0=beta_0, log_alpha=log_alpha_val, log_sigma_0=log_sigma, log_sigma=log_sigma, log_sigma_day=-3.0,
+                log_Q = log_q* jnp.ones((d+1,)), baseline=baseline
                 # baseline=baseline
             )
             
@@ -408,11 +446,38 @@ def find_initial(
                 gamma=gamma, beta=beta,
                 baseline=baseline,
             )
+        elif isinstance(model, models.GLMInterpLearn):
+            log_alpha, log_sigma, log_sigma_day = params_array
+            params = parameters.ParamsGLMInterpLearn(
+                log_alpha=log_alpha, log_sigma=log_sigma, log_sigma_day=log_sigma_day, 
+                Q=jnp.zeros((d+1,)),)
+        elif isinstance(model, models.QLearning):
+            log_alpha, log_sigma, percept_log_scale = params_array
+            params = parameters.ParamsQLearning(
+                log_alpha=log_alpha, log_sigma=log_sigma, percept_log_scale=percept_log_scale
+            )
+        elif isinstance(model, models.GLMBaseLearn):
+            log_alpha, log_sigma, log_sigma_day, beta = params_array
+            params = parameters.ParamsGLMBaseLearn(log_alpha=log_alpha, log_sigma=log_sigma, log_sigma_day=log_sigma_day, baseline_weights=beta * jnp.ones((5,5,)))
+        elif isinstance(model, models.DynamicGLMHMM):
+            log_sigma, alpha = params_array
+            params = parameters.ParamsDynamicGLMHMM(log_sigma=log_sigma, alpha=alpha)
+        elif isinstance(model, models.AC):
+            log_alpha, log_sigma, beta_0 = params_array
+            log_alpha_val = log_alpha * jnp.ones((d+1,)) if vector_alpha else log_alpha
+            # beta_0 = jnp.zeros((d+1,)) if vector_alpha else 0.0
+            beta_0_val = beta_0 * jnp.ones((d+1,))
+            log_q = -9.0
+            params = parameters.ParamsAC(
+                beta_0=beta_0_val, log_alpha=log_alpha_val, log_sigma_0=log_sigma, log_sigma=log_sigma, log_sigma_day=-3.0,
+                log_Q=log_q * jnp.ones((d+1,))
+            )
         else:
             log_alpha, log_sigma, log_sigma_day = params_array
             log_alpha_val = log_alpha * jnp.ones((d+1,)) if vector_alpha else log_alpha
-            params = ParamsGLMLearn(log_alpha=log_alpha_val, log_sigma=log_sigma, log_sigma_day=log_sigma_day)
+            params = ParamsGLMLearn(log_alpha=log_alpha_val, log_sigma=log_sigma, log_sigma_day=log_sigma_day)#, p=p)
         return params
+    
     
     logging.info(f"Memory available: {psutil.virtual_memory().available/1e6} MB")
 
@@ -428,6 +493,10 @@ def find_initial(
                 key, params, _X, _Y, R=_R, day_flags=_day_flags,
                 N_particles=N_particles,
             )
+            # _loglik = model.filtering_MLL(
+            #     key, params, _X, _Y, R=_R, day_flags=_day_flags,
+            #     N_particles=N_particles,
+            # )
             loglik += _loglik
         return -loglik
     
@@ -460,6 +529,10 @@ def find_initial(
     # Take lowest
     best_param_arrays = grid_points[sorted_indices[:return_top_n]]
     best_params = [array_to_params(params_array) for params_array in best_param_arrays]
+
+    # # Fix sigma
+    # logging.info("Fixing log sigma")
+    # best_params = [params._replace(log_sigma=-5.0) for params in best_params]
 
     # logging.info(f'Best params: [log_alpha, log_sigma, log_sigma_day]={best_param_arrays[0]}, neg MLL: {vals[sorted_indices[0]]:.2f}, ')
     return best_params
@@ -508,7 +581,7 @@ def fit_optax(
     # logging.info(f'Starting optimization. Optimizer: adam + reduce_on_plateau, learning rate: {learning_rate}')
 
     # Define loss
-    @partial(jax.jit, static_argnums=(1,))
+    # @partial(jax.jit, static_argnums=(1,))
     def neg_MLL(params, subject_id):
         '''Negative marginal log-likelihood, as a function of the parameters.'''
         # # Might need to add a loop over subjects
@@ -530,6 +603,35 @@ def fit_optax(
         )
         loglik += loglik_sub
         return -loglik
+    
+    @partial(jax.jit, static_argnums=(1,))
+    def neg_MLL2(params, subject_id):
+        log_lik = model.filtering_MLL(
+            key, params,
+            X[subject_id], Y[subject_id], R=R[subject_id], day_flags=day_flags[subject_id],
+            N_particles=N_particles,
+            )
+        return -log_lik
+    
+    def compute_noise_component(params, Z, subject_id):
+        learning_updates = jax.vmap(lambda t: model.update_weights(
+            key, Z[t], 
+            x=X[subject_id][t], y=Y[subject_id][t], r=R[subject_id][t], day_flag=day_flags[subject_id][t],
+            params=params, return_learning_signal=True,
+            )[1])(jnp.arange(len(X[subject_id])))
+        # learning_updates = learning_updates.mean(1)
+
+        if isinstance(model, models.TimeVarGLMLearn) or isinstance(model, models.AC):
+            _, w_post = model.split_latent(Z)
+        else:
+            w_post = Z
+
+        if learning_updates.ndim == 1:
+            learning_updates = learning_updates[:, jnp.newaxis]
+
+        learning_component = w_post[0] + jnp.cumsum(learning_updates, axis=0)
+        noise_component = w_post[1:] - learning_component[:-1]
+        return noise_component
     
     # @jax.jit
     # def next_step_predict_score(params):
@@ -559,6 +661,7 @@ def fit_optax(
     best_val_per_subject = [-jnp.inf]*len(X)
     best_params_per_subject = [params]*len(X)
     for i in range(n_iters):
+        # key, _ = jax.random.split(key)
         # with Pool(10) as pool:
         #     grads = pool.map(neg_evidence_value_and_grad, zip(X, Y, R, session_indices))
         # print(grads)
@@ -573,14 +676,27 @@ def fit_optax(
             best_val_per_subject[subject_id] = val
             best_params_per_subject[subject_id] = params
 
-        logging.info(f'[{i}] Subject {subject_id}, lik: {val:.2f}, params: {params}')
+        logging.info(f'[{i}] Subject {subject_id}, LL: {val:.2f}, L per trial: {jnp.exp(val/len(Y[subject_id])):.4f}, params: {params}')
         # if i % 10 == 0:
         #     evaluate(params)
             # logging.info(f'[{i}] \t2step score: {evaluate(params):.4f}')
         # val, grad = jax.value_and_grad(next_step_predict_score)(params)
 
         updates, opt_state = optimizer.update(grad, opt_state, loss=neg_val)
+        
+        # # Fix sigma
+        # updates = updates._replace(log_sigma=0.0)
         params = optax.apply_updates(params, updates)
+
+        if i % 20 == 0 and not isinstance(model, models.QLearning):
+            Zs, _ = model.posterior_samples(
+                key, params, 
+                X[subject_id], Y[subject_id], R[subject_id], day_flags[subject_id],
+                N_particles=N_particles, verbose=False, LAG=True
+                )
+            Z = Zs.mean(0)
+            noise_component = compute_noise_component(params, Z, subject_id)
+            logging.info(f'[{i}] Noise component norm: {jnp.linalg.norm(noise_component):.2f}')
 
 
         # if opt_state[1].lr != lr_scale:
@@ -748,6 +864,7 @@ def posterior_mcmc(
         mll = 0.
         for X_sub, Y_sub, R_sub, day_flags_sub in zip(X, Y, R, day_flags):
             mll += model.marginal_log_likelihood(key, params_prop, X_sub, Y_sub, R_sub, day_flags_sub, N_particles)
+            # mll += model.filtering_MLL(key, params_prop, X_sub, Y_sub, R_sub, day_flags_sub, N_particles)
         return mll
     
     @jax.jit
@@ -848,7 +965,7 @@ def posterior_mcmc(
     logging.info(f"Final params CI: {jnp.percentile(params_array_samples_t, q=jnp.array([2.5, 97.5]), axis=0).T}")
     logging.info(f"Marginal log-lik estimate: {log_fx.mean():.4f}")
     logging.info("*"*40)
-    return all_accepts, log_lik_samples, params_array_samples
+    return all_accepts, log_lik_samples, params_array_samples, (best_params, best_log_fx)
 
 if __name__=='__main__':
     parser = argparse.ArgumentParser(description="Argument parser for IBL fitting.")
@@ -861,37 +978,42 @@ if __name__=='__main__':
                         help="Subject index in the lab data.")
     parser.add_argument("--all-subjects", action='store_true',
                         help="Override subject ID and group all subjects together from lab.")
-    parser.add_argument("--learning-rule", type=str, default="policy_gradient", choices=["policy_gradient", "reinforce"], 
+    parser.add_argument("--learning-rule", type=str, default="reinforce", choices=["policy_gradient", "reinforce", "regression_gradient", "max_ent", "max_ent_MC"], 
                         help="Learning rule for the model.")
     parser.add_argument("--seed", type=int, default=0, 
                         help="Seed for random number generator")
     parser.add_argument("-N", "--N-particles", type=int, default=1000, 
                         help="Number of particles for SMC.")
     parser.add_argument("--model-class", type=str, default="GLMLearn", 
-                        choices=["GLMLearn", "TimeVarGLMLearn", "Psytrack", "GLMRegLearn", "GLMHMMLearn"],
+                        choices=["GLMLearn", "TimeVarGLMLearn", "Psytrack", "GLMRegLearn", "GLMHMMLearn", "GLMInterpLearn", "QLearning", "GLMBaseLearn", 'DynamicGLMHMM', "AC"],
                         help="Model class to use for fitting.")
     parser.add_argument("--vector-alpha", action='store_true',
                         help="Use vector alpha for GLM.")
     parser.add_argument("--lapse", action='store_true',
                         help="lapse for timevar GLM")
+    parser.add_argument("--EM", action='store_true', default=False,
+                        help="Use EM for inference. Default is to use optimization of MLL.")
 
     # Parse the command-line arguments
     args = parser.parse_args()
     logging.info(f"Arguments: {args}")
 
-    if args.model_class == "GLMLearn":
-        model = models.GLMLearn(learning_rule=args.learning_rule)
-    elif args.model_class == "TimeVarGLMLearn":
-        model = models.TimeVarGLMLearn(learning_rule=args.learning_rule, lapse=args.lapse, beta_dim=0)
-    elif args.model_class == "Psytrack":
-        model = models.Psytrack()
-    elif args.model_class == "GLMRegLearn":
-        args.learning_rule = 'regression_gradient'
-        model = models.GLMRegLearn(learning_rule='regression_gradient')
-    elif args.model_class == "GLMHMMLearn":
-        model = models.GLMHMMLearn(learning_rule=args.learning_rule)
-    else:
-        raise ValueError(f"Model class {args.model_class} not recognized.")
+    # if args.model_class == "GLMLearn":
+    #     model = models.GLMLearn(learning_rule=args.learning_rule)
+    # elif args.model_class == "TimeVarGLMLearn":
+    #     model = models.TimeVarGLMLearn(learning_rule=args.learning_rule, lapse=args.lapse, beta_dim=0)
+    # elif args.model_class == "Psytrack":
+    #     model = models.Psytrack()
+    # elif args.model_class == "GLMRegLearn":
+    #     args.learning_rule = 'regression_gradient'
+    #     model = models.GLMRegLearn(learning_rule='regression_gradient')
+    # elif args.model_class == "GLMHMMLearn":
+    #     model = models.GLMHMMLearn(learning_rule=args.learning_rule)
+    # elif args.model_class == "GLMInterpLearn":
+    #     model = models.GLMInterpLearn(learning_rule="interp_gradient")
+    # else:
+    #     raise ValueError(f"Model class {args.model_class} not recognized.")
+    model = fit_utils.load_model(args)
     # model = models.GLMHMMLearn(learning_rule=args.learning_rule)
 
 
@@ -906,10 +1028,12 @@ if __name__=='__main__':
     logging.info(f'Number of particles: {args.N_particles}. Seed: {seed}.')
 
     # Load IBL data
+    # regressors = ['stimIntensity']
     regressors = ['contrastLeft', 'contrastRight', 'previousChoice', 'previousRewarded'] #'stimIntensity',
 
     X_train, Y_train, R_train, day_flags_train = [], [], [], []
-    all_trajectories, all_held_out_trials = [], []
+    X_full, Y_full, R_full, day_flags_full = [], [], [], []
+    all_held_out_trials = []
     
     if args.all_subjects:
         n_subjects = ibl.get_number_subjects(args.lab)
@@ -931,13 +1055,22 @@ if __name__=='__main__':
         train_trajectory = loader.load_train_data()
         logging.info(f"Loaded IBL train data, subject id {subject_id}. T={len(train_trajectory.X)}. Params: {loader_params}")
 
-        X_train.append(train_trajectory.X)
-        Y_train.append(train_trajectory.Y)
-        R_train.append(train_trajectory.R)
+        if args.model_class == "QLearning":
+            X_train.append(train_trajectory.X[:, 1] - train_trajectory.X[:, 0])
+        else:
+            X_train.append(jnp.array(train_trajectory.X))
+        Y_train.append(jnp.array(train_trajectory.Y))
+        R_train.append(jnp.array(train_trajectory.R))
         day_flags_train.append(train_trajectory.day_flags)
 
         trajectory, held_out_trials = loader.load_test_data()
-        all_trajectories.append(trajectory)
+        if args.model_class == "QLearning":
+            X_full.append(trajectory.X[:, 1] - trajectory.X[:, 0])
+        else:
+            X_full.append(trajectory.X)
+        Y_full.append(trajectory.Y)
+        R_full.append(trajectory.R)
+        day_flags_full.append(trajectory.day_flags)
         all_held_out_trials.append(held_out_trials)
 
     if isinstance(model, models.TimeVarGLMLearn):
@@ -945,7 +1078,14 @@ if __name__=='__main__':
         model.beta_dim = beta_dim
         model.latent_dim = len(regressors) + beta_dim + 1
         logging.info(f"Model latent dim: {model.latent_dim}, beta dim: {beta_dim}")
+    elif isinstance(model, models.AC):
+        beta_dim = len(regressors) + 1
+        model.beta_dim = beta_dim
+        model.latent_dim = len(regressors) + beta_dim + 1
+        logging.info(f"Model latent dim: {model.latent_dim}, beta dim: {beta_dim}")
     elif isinstance(model, models.GLMHMMLearn):
+        model.latent_dim = len(regressors) + 1
+    else:
         model.latent_dim = len(regressors) + 1
 
     logging.info(f"Model: {model}")
@@ -998,7 +1138,7 @@ if __name__=='__main__':
         X_train, Y_train, R=R_train, day_flags=day_flags_train,
         N_particles=args.N_particles, seed=seed,
         return_top_n=-1,
-        vector_alpha=args.vector_alpha
+        vector_alpha=args.vector_alpha, vmap=True
         )
     initial_params = top_gridsearch_params[0]
 
@@ -1009,12 +1149,17 @@ if __name__=='__main__':
     #     params = initial_params
     # else:
     logging.info("-"*80)
-    logging.info('Step 2: Optimization of MLL with gradient ascent, 200 iters.')
-    optax_final_params, (best_val_per_subject, best_params_per_subject), res = fit_optax(
+    logging.info('Step 2: Optimization of MLL with gradient ascent.')
+    if args.EM:
+        fit_method = fit_EM
+    else:
+        fit_method = fit_optax
+
+    optax_final_params, (best_val_per_subject, best_params_per_subject), res = fit_method(
         model,
         X_train, Y_train, R=R_train, day_flags=day_flags_train, 
         N_particles=args.N_particles,
-        initial_params=initial_params, n_iters=500 if args.all_subjects else 200,
+        initial_params=initial_params, n_iters=400,
         )
     logging.info(f'Final params: {optax_final_params}')
     for sub in range(len(X_train)):
@@ -1029,13 +1174,20 @@ if __name__=='__main__':
             X_train[0], Y_train[0], R=R_train[0], day_flags=day_flags_train[0],
             N_particles=args.N_particles
             )
-        logging.info(f"Log-lik: {log_lik:.2f}")
+        logging.info(f"'marginal_log_likelihood' Log-lik: {log_lik:.2f}")
+
+        log_lik_filter = model.filtering_MLL(
+            key, params, 
+            X_train[0], Y_train[0], R=R_train[0], day_flags=day_flags_train[0],
+            N_particles=args.N_particles
+            )
+        logging.info(f"'filter' Log-lik: {log_lik_filter:.2f}")
 
     # Step 3
 
     logging.info("-"*80)
     logging.info('Step 3: Parameter posterior sampling with MCMC.')
-    all_accepts, log_lik_samples, posterior_samples = posterior_mcmc(
+    all_accepts, log_lik_samples, posterior_samples, _ = posterior_mcmc(
             model, key, params, 
             X_train, Y_train, R=R_train, day_flags=day_flags_train,
             N_particles=args.N_particles, n_iters=100, N_samples=500,
@@ -1059,7 +1211,7 @@ if __name__=='__main__':
     # Step 4 : Evaluation
 
     logging.info("-"*80)
-    logging.info("Evaluating model prediction (first animal).")
+    logging.info("Evaluating model (first animal).")
 
     lengths = parameters.params_to_array(params)[1]
     for eval_params_array in [posterior_means, posterior_meds]:
@@ -1068,13 +1220,54 @@ if __name__=='__main__':
         eval_params = parameters.array_to_params(params, eval_params_array, lengths)
         logging.info(f'Params: {eval_params}')
 
-        scores, loglik = model.next_step_prediction_score(
+        loglik = model.marginal_log_likelihood(
             key, eval_params, 
-            X_train[0], Y_train[0], R=R_train[0], day_flags=day_flags_train[0],
-            N_particles=args.N_particles, verbose=True
+            X_full[0], Y_full[0], R=R_full[0], day_flags=day_flags_full[0],
+            N_particles=args.N_particles
             )
-        logging.info(f"Total log-likelihood: {loglik:.2f}, per trial: {loglik/len(Y_train[0]):.4f}")
-        logging.info(f"Prediction score: {scores.mean():.4f} +/- {scores.std():.4f}, quartiles: {jnp.percentile(scores, jnp.array([25, 50, 75]))}")
+        logging.info(f"Complete trajectory 'marginal_log_likelihood': {loglik:.2f}, per trial: {loglik/len(Y_full[0]):.4f}, L per trial: {jnp.exp(loglik/len(Y_full[0])):.4f}")
+
+        loglik_filter = model.filtering_MLL(
+            key, eval_params, 
+            X_full[0], Y_full[0], R=R_full[0], day_flags=day_flags_full[0],
+            N_particles=args.N_particles
+            )
+        logging.info(f"Filtering (prior predictive) log-likelihood: {loglik_filter:.2f}, per trial: {loglik_filter/len(Y_full[0]):.4f}, L per trial: {jnp.exp(loglik_filter/len(Y_full[0])):.4f}")
+
+        if not isinstance(model, models.QLearning):
+            Zs, loglik2 = model.posterior_samples(
+                key, params, 
+                X_full[0], Y_full[0], R=R_full[0], day_flags=day_flags_full[0],
+                N_particles=args.N_particles, verbose=False, LAG=True
+                )
+            Z = Zs.mean(0)
+            
+            learning_updates = jax.vmap(lambda t: model.update_weights(
+                key, Z[t], 
+                x=jnp.array(X_full[0])[t], y=jnp.array(Y_full[0])[t], r=jnp.array(R_full[0])[t], day_flag=jnp.array(day_flags_full[0])[t],
+                params=params, return_learning_signal=True,
+                )[1])(jnp.arange(len(X_full[0])))
+            # learning_updates = learning_updates.mean(1)
+
+            if isinstance(model, models.TimeVarGLMLearn) or isinstance(model, models.AC):
+                _, w_post = model.split_latent(Z)
+            else:
+                w_post = Z
+
+            if learning_updates.ndim == 1:
+                learning_updates = learning_updates[:, None]
+
+            learning_component = w_post[0] + jnp.cumsum(learning_updates, axis=0)
+            noise_component = w_post[1:] - learning_component[:-1]
+            logging.info(f'Noise component norm: {jnp.linalg.norm(noise_component):.2f}, per trial: {jnp.linalg.norm(noise_component)/len(Y_full[0]):.4f}')
+
+        # scores, loglik = model.next_step_prediction_score(
+        #     key, eval_params, 
+        #     X_train[0], Y_train[0], R=R_train[0], day_flags=day_flags_train[0],
+        #     N_particles=args.N_particles, verbose=True
+        #     )
+        # logging.info(f"Total log-likelihood: {loglik:.2f}, per trial: {loglik/len(Y_train[0]):.4f}")
+        # logging.info(f"Prediction score: {scores.mean():.4f} +/- {scores.std():.4f}, quartiles: {jnp.percentile(scores, jnp.array([25, 50, 75]))}")
         
         # scores2, _ = model.two_step_prediction_score(
         #     key, eval_params,
@@ -1083,14 +1276,14 @@ if __name__=='__main__':
         #     )
         # logging.info(f"Two-step prediction score: {scores2.mean():.2f} +/- {scores2.std():.2f}, quartiles: {jnp.percentile(scores2, jnp.array([25, 50, 75]))}")
 
-        # Test
+        # # Test
 
-        test_ll, test_lls = test(
-            model, eval_params, all_held_out_trials[0],
-            all_trajectories[0].X, all_trajectories[0].Y, R=all_trajectories[0].R, day_flags=all_trajectories[0].day_flags,
-            N_particles=args.N_particles
-            )
-        logging.info(f"Test log-likelihood: {test_ll:.2f}, per trial: {test_lls.mean():.4f}")
+        # test_ll, test_lls = test(
+        #     model, eval_params, all_held_out_trials[0],
+        #     all_trajectories[0].X, all_trajectories[0].Y, R=all_trajectories[0].R, day_flags=all_trajectories[0].day_flags,
+        #     N_particles=args.N_particles
+        #     )
+        # logging.info(f"Test log-likelihood: {test_ll:.2f}, per trial: {test_lls.mean():.4f}")
 
     # sys.exit()
     
