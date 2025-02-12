@@ -10,8 +10,8 @@ class ParamsGLMLearn(NamedTuple):
     log_sigma: Union[float, ParameterProperties]
     log_sigma_day: Union[float, ParameterProperties]
     log_alpha: Union[float, jnp.ndarray, ParameterProperties]
-    z_0: float = 0.0
-    p: float = 5.0
+    # z_0: float = 0.0
+    # p: float = 5.0
 
 class ParamsPsytrack(NamedTuple):
     log_sigma: float
@@ -81,6 +81,15 @@ class ParamsDynamicGLMHMM(NamedTuple):
     log_sigma: float
     log_sigma_day: float = 1.0
     alpha: float = 2.0
+
+class ParamsAC(NamedTuple):
+    beta_0: Union[float, jnp.ndarray] = 0.0
+    log_alpha: float = -5.0
+    log_sigma_0: float = -5.0
+    log_sigma: float = -3.0
+    log_sigma_day: float = -2.0
+    log_Q: jnp.ndarray = jnp.array([-4.0])
+
 
 def handle_none_params(func):
     def wrapper(self, *args, params=None, **kwargs):
