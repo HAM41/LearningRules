@@ -135,6 +135,11 @@ def reward(X, Y, r1=1.0, r0=0.0) -> np.ndarray:
 
     return r
 
+@partial(jax.vmap, in_axes=(0,))
+def bias_correction(w: jnp.ndarray) -> jnp.ndarray:
+    _correction = w[0] * jnp.array([-1, 1, 1, 0, 0])
+    return w + _correction
+
 # @partial(jax.jit, static_argnums=(0,))
 def set_day_flags(T, session_indices):
     day_flags = jnp.zeros(T, dtype=bool)
@@ -172,7 +177,6 @@ def bernoulli_GLM_likelihood(w, x, y):
     '''
     vx = vec(x)
     LM = jnp.dot(w, vx)
-    # p = safe_sigmoid(sign(y) * LM)
     p = jnp.where(jnp.isnan(y), 1.0, sigmoid(sign(y) * LM))
     return p
 
@@ -186,12 +190,8 @@ def policy_gradient(w, x, r=None):
     return jnp.multiply(r, jnp.outer(jnp.multiply(p_R, 1 - p_R), vec(x)).squeeze())
 
 @jax.jit
-def reinforce(w, x, y, r=None):
+def reinforce(w, x, y, r):
     p = bernoulli_GLM_likelihood(w, x, y)
-    if r is None:
-        r = reward(x,y)
-    # if r.ndim == 1:
-    #     r = r[:, None]
     return r * jnp.outer(1-p, sign(y) * vec(x)).squeeze()
 
 @jax.jit
@@ -718,6 +718,76 @@ class QLearning():
         # Z = jnp.concatenate([jnp.array([z_0]), Z[:-1]])
 
         return log_lik
+
+    def forward_pass(self, 
+            key, params, 
+            X: Float[Array, "T M"], Y: Float[Array, "T"], R: Float[Array, "T"], day_flags: Bool[Array, "T"], 
+            N_particles: int=1000, predict_Y: bool=False,
+            ):
+        '''
+        Make a forward pass in the model, either using the animal decisions (predict_Y=False) or sampling decisions
+        (predict_Y=True). Predicition time-step to time-step likelihoods are returned.
+        '''
+        T = len(X)
+
+        if predict_Y:
+            assert self.reward_func is not None, "Reward function, (x_t, y_t) -> r_t, must be defined."
+
+            def scan_fn(carry, inputs):
+                z_t, log_lik = carry
+                X_t, X_next, Y_t, next_day_flag, subkey = inputs
+
+                # Sample Y
+                decision_key, update_key = jax.random.split(subkey)
+                Y_pred = self.decision(decision_key, z_t, params=params)
+                # R_pred = jax.vmap(lambda y: reward(X_t, y))(Y_pred)
+
+                # Log-lik
+                w_true = self.emission_likelihood(z_t, Y_t, params=params)
+                w_pred = self.emission_likelihood(z_t, Y_pred, params=params)
+                log_lik += jnp.log(jnp.mean(w_true))
+
+                # Update step
+                z_t = jax.random.choice(update_key, z_t, shape=(N_particles,), p=w_pred)
+
+                # Update z_t ~ p(z_t | z_{t-1})
+                z_next = jax.vmap(
+                    lambda z, y: self.update_weights(update_key, z, params=params, x=X_t, x_next=X_next, y=y, r=None, day_flag=next_day_flag)
+                    )(z_t, Y_pred).squeeze()
+                
+                return (z_next, log_lik), z_next
+        else:
+            def scan_fn(carry, inputs):
+                z_t, log_lik = carry
+                X_t, X_next, Y_t, next_day_flag, subkey = inputs
+
+                # Log-lik
+                w_t = self.emission_likelihood(z_t, Y_t, params=params)
+                log_lik += jnp.log(jnp.mean(w_t))
+
+                # Update step
+                z_t = jax.random.choice(subkey, z_t, shape=(N_particles,), p=w_t)
+
+                # Update z_t ~ p(z_t | z_{t-1})
+                z_next = self.update_weights(subkey, z_t, params=params, x=X_t, x_next=X_next, y=Y_t, r=None, day_flag=next_day_flag).squeeze()
+                
+                return (z_next, log_lik), z_next
+        
+        key, subkey = jax.random.split(key)
+        z_0 = self.sample_initial(subkey, params=params, X=X[0], N=N_particles)
+        carry = (z_0, 0.)
+        
+        next_day_flags = jnp.roll(day_flags, shift=-1)
+        subkeys = jax.random.split(key, num=T)
+        inputs = (X[:-1], X[1:], Y[:-1], next_day_flags[:-1], subkeys[:-1])
+        
+        (_, log_lik), Z = jax.lax.scan(scan_fn, carry, inputs) #, length=T)
+
+        # Replace Z[0] and shift other Zs
+        Z = jnp.concatenate([jnp.array([z_0]), Z[:-1]])
+        Z = Z.transpose(1,0,2)
+
+        return Z, log_lik
     
 class GLMLearn():
     r'''
@@ -785,10 +855,14 @@ class GLMLearn():
 
         # Add noise
         update_noise = jax.random.normal(key, shape=w.shape)
-        update_noise = jnp.where(day_flag, 
-                                 jnp.multiply(jnp.exp(params.log_sigma_day), update_noise),
-                                 jnp.multiply(jnp.exp(params.log_sigma), update_noise)
-                                 )
+        # update_noise = jnp.where(day_flag, 
+        #                          jnp.multiply(jnp.exp(params.log_sigma_day), update_noise),
+        #                          jnp.multiply(jnp.exp(params.log_sigma), update_noise)
+        #                          )
+        update_noise = jax.lax.select(day_flag,
+            jnp.multiply(jnp.exp(params.log_sigma_day), update_noise),
+            jnp.multiply(jnp.exp(params.log_sigma), update_noise)
+        )
         
         if return_learning_signal:
             return w + learning_signal + update_noise, learning_signal
@@ -966,6 +1040,7 @@ class GLMLearn():
             pbar = tqdm(range(0,T), desc='Bootstrap filter')
     
         log_lik = 0.
+        non_one_X_flag = True
         for t in range(0,T):
             key, subkey1, subkey2 = jax.random.split(key, 3)
 
@@ -976,6 +1051,14 @@ class GLMLearn():
                 tilde_z_t = self.sample_initial(subkey1, params=params, N=N_particles, d=M)
             else:
                 tilde_z_t = self.update_weights(subkey1, z_t, params=params, x=X[t-1], y=Y[t-1], r=R[t-1], day_flag=day_flags[t])
+            
+            # Correct the non-identifiability while we have the non_one_X_flag
+            stim_intensity_t = X[t][1] - X[t][0]
+            if non_one_X_flag:
+                if 0.9 > jnp.abs(stim_intensity_t):
+                    non_one_X_flag = False
+                    logging.info(f"Weights corrected up to t={t}.")
+                tilde_z_t = self.bias_correction(tilde_z_t)
 
             # 2. Evaluate importance weights p(y_t | xhat_t, V_t)
             #   Outcome: {tilde z_t^i, tilde w^i}, an approximation to p(z_t|y_{1:t})
@@ -1009,6 +1092,8 @@ class GLMLearn():
             if verbose:
                 pbar.update(1)
 
+
+
         if not return_history:
             z_history = z_t
 
@@ -1031,17 +1116,17 @@ class GLMLearn():
             tilde_z_t, marginal_log_lik = carry
             X_t, Y_t, R_t, next_day_flag, (subkey1, subkey2) = inputs
 
-            # 2. Evaluate importance weights p(y_t | xhat_t, V_t)
+            # 1. Evaluate importance weights p(y_t | xhat_t, V_t)
             tilde_w_t = self.emission_likelihood(tilde_z_t, X_t, Y_t, params=params)
             
-            # 3. Resample with replacement N particles according the importance weights
+            # 2. Update step : resample with replacement N particles according the importance weights
             z_t = jax.random.choice(subkey1, tilde_z_t, shape=(N_particles,), p=tilde_w_t)
 
-            # 4. Update log-likelihood estimate
+            # -- Update log-likelihood estimate
             log_lik = jnp.log(jnp.mean(tilde_w_t))
             marginal_log_lik += log_lik
             
-            # 1. Prediction step : tilde z_t ~ p(z_t | z_{t-1})
+            # 3. Prediction step : tilde z_t ~ p(z_t | z_{t-1})
             tilde_z_t = self.update_weights(subkey2, z_t, params=params, x=X_t, y=Y_t, r=R_t, day_flag=next_day_flag)
             
             return (tilde_z_t, marginal_log_lik), log_lik
@@ -1240,7 +1325,12 @@ class GLMLearn():
 
         def scan_fn(carry, inputs):
             t, tilde_z_t, log_lik, z_history = carry
-            X_t, Y_t, R_t, next_day_flag, (subkey1, subkey2) = inputs
+            X_t, Y_t, R_t, next_day_flag, correct_bias_flag, (subkey1, subkey2) = inputs
+
+            # Correct tilde_z_t for nonidentifability
+            # if correct_bias_flag:
+            #     tilde_z_t = bias_correction(tilde_z_t)
+            tilde_z_t = jax.lax.select(correct_bias_flag, self.bias_correction(tilde_z_t), tilde_z_t)
 
             # 2. Evaluate importance weights p(y_t | xhat_t, V_t)
             tilde_w_t = self.emission_likelihood(tilde_z_t, X_t, Y_t)
@@ -1267,11 +1357,16 @@ class GLMLearn():
         
         next_day_flags = jnp.roll(day_flags, shift=-1)
         subkeys = jax.random.split(key, num=(T, 2))
-        inputs = (X, Y, R, next_day_flags, subkeys)
+
+        correct_bias_flags = jnp.cumprod(jnp.abs(X[:,1] - X[:,0]) >= 0.9).astype(bool) # True until stim intensity goes below 0.9 in abs
+
+        inputs = (X, Y, R, next_day_flags, correct_bias_flags, subkeys)
         
         (_, _, log_lik, z_history), _ = jax.lax.scan(scan_fn, carry, inputs, length=T)
         return z_history, log_lik
-    
+
+    def bias_correction(self, w):
+        return bias_correction(w)
     
     def score_predict(self,
             key, params,
@@ -1697,36 +1792,74 @@ class GLMLearn():
         Z = jnp.concatenate([jnp.array([z_0]), Z_pred]); assert Z.shape == (T, latent_dim)
         return Y, Z, log_lik
 
-    def filter(self, 
+    def forward_pass(self, 
             key, params, 
             X: Float[Array, "T M"], Y: Float[Array, "T"], R: Float[Array, "T"], day_flags: Bool[Array, "T"], 
-            N_particles=1000
+            N_particles: int=1000, predict_Y: bool=False,
             ):
         '''
-        return p(w_{1:T} | y_{1:T}, x_{1:T}) under the prior, using the true data.
+        Make a forward pass in the model, either using the animal decisions (predict_Y=False) or sampling decisions
+        (predict_Y=True). Predicition time-step to time-step likelihoods are returned.
         '''
         T, M = X.shape
 
-        def scan_fn(carry, inputs):
-            z_t, log_lik = carry
-            X_t, Y_t, R_t, next_day_flag, subkey = inputs
+        if predict_Y:
+            assert self.reward_func is not None, "Reward function, (x_t, y_t) -> r_t, must be defined."
 
-            # Log-lik
-            lik = self.emission_likelihood(z_t, X_t, Y_t)
-            log_lik += jnp.log(jnp.mean(lik))
+            def scan_fn(carry, inputs):
+                tilde_z_t, log_lik = carry
+                X_t, Y_t, R_t, next_day_flag, correct_bias_flag, subkey = inputs
 
-            # Update z_t ~ p(z_t | z_{t-1})
-            z_next = self.update_weights(subkey, z_t, params=params, x=X_t, y=Y_t, r=R_t, day_flag=next_day_flag)
-            
-            return (z_next, log_lik), z_next
+                # Correct bias
+                tilde_z_t = jax.lax.select(correct_bias_flag, self.bias_correction(tilde_z_t), tilde_z_t)
+
+                # Evaluate likelihood/importance weights with sampled decision
+                decision_key, update_key = jax.random.split(subkey)
+                Y_pred = self.decision(decision_key, tilde_z_t, X_t)
+                R_pred = jax.vmap(lambda y: self.reward_func(X_t, y))(Y_pred)
+
+                # Log-lik
+                w_true = self.emission_likelihood(tilde_z_t, X_t, Y_t)
+                w_pred = self.emission_likelihood(tilde_z_t, X_t, Y_pred)
+                log_lik += jnp.log(jnp.mean(w_true)) # store log-lik of true data
+
+                # Update step
+                z_t = jax.random.choice(update_key, tilde_z_t, shape=(N_particles,), p=w_pred)
+
+                # Prediction step: z_t ~ p(z_t | z_{t-1})
+                z_next = jax.vmap(
+                    lambda z, y, r: self.update_weights(update_key, z, params=params, x=X_t, y=y, r=r, day_flag=next_day_flag)
+                    )(z_t, Y_pred, R_pred)
+                
+                return (z_next, log_lik), z_next
+        else:
+            def scan_fn(carry, inputs):
+                tilde_z_t, log_lik = carry
+                X_t, Y_t, R_t, next_day_flag, correct_bias_flag, subkey = inputs
+
+                # Correct bias
+                tilde_z_t = jax.lax.select(correct_bias_flag, self.bias_correction(tilde_z_t), tilde_z_t)
+
+                # Evaluate likelihood/importance weights with true decision
+                w_t = self.emission_likelihood(tilde_z_t, X_t, Y_t)
+                log_lik += jnp.log(jnp.mean(w_t))
+
+                # Update step
+                z_t = jax.random.choice(subkey, tilde_z_t, shape=(N_particles,), p=w_t)
+
+                # Prediction step: z_t ~ p(z_t | z_{t-1})
+                z_next = self.update_weights(subkey, z_t, params=params, x=X_t, y=Y_t, r=R_t, day_flag=next_day_flag)
+                
+                return (z_next, log_lik), z_next
         
         key, subkey = jax.random.split(key)
         z_0 = self.sample_initial(subkey, params=params, N=N_particles, d=M)
         carry = (z_0, 0.)
         
         next_day_flags = jnp.roll(day_flags, shift=-1)
+        correct_bias_flags = jnp.cumprod(jnp.abs(X[:,1] - X[:,0]) >= 0.9).astype(bool) # True until stim intensity goes below 0.9 in abs
         subkeys = jax.random.split(key, num=T)
-        inputs = (X, Y, R, next_day_flags, subkeys)
+        inputs = (X, Y, R, next_day_flags, correct_bias_flags, subkeys)
         
         (_, log_lik), Z = jax.lax.scan(scan_fn, carry, inputs) #, length=T)
 
@@ -1972,6 +2105,11 @@ class TimeVarGLMLearn(GLMLearn):
     def log_joint(self, X, Y, Z, params, R=None, day_flags=None):
         raise NotImplementedError
     
+    def bias_correction(self, z):
+        beta, w = self.split_latent(z)
+        w_corrected = bias_correction(w)
+        return self.merge_latent(beta, w_corrected)
+    
 class AC(GLMLearn):
     def __init__(self, beta_dim, sigmoid=False, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -2041,6 +2179,11 @@ class AC(GLMLearn):
         p_R = self.emission_likelihood(z, x, y=Y_R)
         y = jax.random.bernoulli(key, p_R).astype(int)
         return y
+    
+    def bias_correction(self, z):
+        beta, w = self.split_latent(z)
+        w_corrected = bias_correction(w)
+        return self.merge_latent(beta, w_corrected)
 
 
 class GLMRegLearn(GLMLearn):
