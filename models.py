@@ -346,7 +346,7 @@ class QLearning():
     
     def encode(self, key, X, params, N=1):
         noise = jax.random.normal(key, shape=X.shape + (N,))
-        percept = X + jnp.square(jnp.exp(params.percept_log_scale)) * noise
+        percept = X + jnp.exp(params.percept_log_scale) * noise
         return percept.squeeze()
     
     def transition_point(self, V, params):
@@ -356,7 +356,7 @@ class QLearning():
     def decision(self, key: PRNGKey, z, params):
         p_R = self.emission_likelihood(z, y=Y_R, params=params)
         y = jax.random.bernoulli(key, p_R).astype(int)
-        return y
+        return Y_vals[y]
     
     # def decision(self, m, V):
     #     if self.softmax:
@@ -396,51 +396,34 @@ class QLearning():
             self, 
             key: PRNGKey,
             w, x, x_next, 
-            params, y=None, r=None,
+            params, y, r=None,
             day_flag: bool=False, # unused
             return_learning_signal=False # unused
             ):
         m, V_L, V_R = self.split_latent(w)
 
-        # update V
         p_R = self.p_R(m, params)
+        key_m, key_R, key_L = jax.random.split(key, 3)
+        
+        def update_value(key, V, condition, p):
+            RPE = reward(x, y) - p * V
+            update = jnp.exp(params.log_alpha) * RPE
 
-        # Add noise
-        key, subkey1, subkey2 = jax.random.split(key, 3)
-        update_noise = jax.random.normal(subkey1, shape=V_L.shape)
-        update_noise = jnp.where(day_flag, 
+            update_noise = jax.random.normal(key, shape=V.shape)
+            update_noise = jnp.where(day_flag, 
                                  jnp.multiply(jnp.exp(params.log_sigma_day), update_noise),
                                  jnp.multiply(jnp.exp(params.log_sigma), update_noise)
                                  )
-        
-        update_noise_R = jax.random.normal(subkey2, shape=V_R.shape)
-        update_noise_R = jnp.where(day_flag, 
-                                 jnp.multiply(jnp.exp(params.log_sigma_day), update_noise_R),
-                                 jnp.multiply(jnp.exp(params.log_sigma), update_noise_R)
-                                 )
-        
-        V_R = jnp.where(
-            y == Y_R, 
-            V_R + jnp.multiply(jnp.exp(params.log_alpha), reward(x, y) - jnp.multiply(p_R, V_R)), 
-            V_R
-            )
-        V_R = V_R + update_noise_R
 
-        V_L = jnp.where(
-            y == Y_L, 
-            V_L + jnp.multiply(jnp.exp(params.log_alpha), reward(x, y) - jnp.multiply(1-p_R, V_L)), 
-            V_L
-            )
-        V_L = V_L + update_noise
-        # jax.debug.print('V_R = {}', V_R.mean())
-        # jax.debug.print("reward = {}", reward(x, y))
-        
-        # if y==Y_R:
-        #     V_R = V_R + jnp.multiply(jnp.exp(params.log_alpha), reward(x, y) - jnp.multiply(p_R, V_R))
-        # else:
-        #     V_L = V_L + jnp.multiply(jnp.exp(params.log_alpha), reward(x, y) - jnp.multiply(1-p_R, V_L))
+            # Compute the update if condition is true; else add zero.
+            return V + jnp.where(condition, update, 0.0) + update_noise
+
+        # Update V_R when y equals Y_R; update V_L when y equals Y_L.
+        V_R = update_value(key_R, V_R, y == Y_R, p_R)
+        V_L = update_value(key_L, V_L, y == Y_L, 1 - p_R)
+
         # Update m
-        m = self.encode(key, x_next, params, N=len(m) if m.ndim > 0 else 1)
+        m = self.encode(key_m, x_next, params, N=len(m) if m.ndim > 0 else 1)
         
         w = self.merge_latent(m, V_L, V_R)
         return w
@@ -452,7 +435,7 @@ class QLearning():
 
         # Compute Q values for each state
         Qs = jnp.stack([jnp.multiply(1-p_R, V_L), jnp.multiply(p_R, V_R)])
-        Qs = Qs / params.beta # temperature
+        Qs = Qs / jnp.exp(params.log_temp) # temperature
 
         # Compute decision likelihood p(y|Qs)
         if self.softmax:
@@ -477,7 +460,7 @@ class QLearning():
         m_key, V_key = jax.random.split(key)
         # m = jax.vmap(lambda _key: self.encode(_key, X, params))(jax.random.split(m_key, num=N))
         m = self.encode(m_key, X, params, N)
-        V = jnp.exp(params.log_alpha) * jax.random.normal(V_key, shape=(2, N))
+        V = 0.2 + 0.1 * jax.random.normal(V_key, shape=(2, N))
         # V = 0.2 * jnp.ones((2, N))
         return self.merge_latent(m, V[0], V[1])
         
@@ -616,7 +599,7 @@ class QLearning():
             params, 
             X, Y, R=None, day_flags=None,
             N_particles=1000, return_history=True, posterior_type='smooth', verbose=False,
-            LAG=False,
+            LAG=False, correct_bias=False
             ):
         if X.ndim == 1:
             T = len(X)
@@ -773,7 +756,7 @@ class QLearning():
     def forward_pass(self, 
             key, params, 
             X: Float[Array, "T M"], Y: Float[Array, "T"], R: Float[Array, "T"], day_flags: Bool[Array, "T"], 
-            N_particles: int=1000, predict_Y: bool=False, correct_bias=None,
+            N_particles: int=1000, predict_Y: bool=False, correct_bias=None, return_Z: bool=False,
             ):
         '''
         Make a forward pass in the model, either using the animal decisions (predict_Y=False) or sampling decisions
@@ -812,7 +795,10 @@ class QLearning():
                     lambda z, y: self.update_weights(update_key, z, params=params, x=X_t, x_next=X_next, y=y, r=None, day_flag=next_day_flag)
                     )(z_t, Y_pred).squeeze()
                 
-                return (z_next, log_lik), (log_lik_t, z_next)
+                if return_Z:
+                    return (z_next, log_lik), (log_lik_t, z_next)
+                else:
+                    return (z_next, log_lik), log_lik_t
         else:
             def scan_fn(carry, inputs):
                 z_t, log_lik = carry
@@ -833,7 +819,10 @@ class QLearning():
                 # Update z_t ~ p(z_t | z_{t-1})
                 z_next = self.update_weights(subkey, z_t, params=params, x=X_t, x_next=X_next, y=Y_t, r=None, day_flag=next_day_flag).squeeze()
                 
-                return (z_next, log_lik), (log_lik_t, z_next)
+                if return_Z:
+                    return (z_next, log_lik), (log_lik_t, z_next)
+                else:
+                    return (z_next, log_lik), log_lik_t
         
         key, subkey = jax.random.split(key)
         z_0 = self.sample_initial(subkey, params=params, X=X[0], N=N_particles)
@@ -843,11 +832,15 @@ class QLearning():
         subkeys = jax.random.split(key, num=T)
         inputs = (X[:-1], X[1:], Y[:-1], next_day_flags[:-1], subkeys[:-1])
         
-        (_, log_lik), (logliks, Z) = jax.lax.scan(scan_fn, carry, inputs) #, length=T)
+        if return_Z:
+            (_, log_lik), (logliks, Z) = jax.lax.scan(scan_fn, carry, inputs) #, length=T)
 
-        # Replace Z[0] and shift other Zs
-        Z = jnp.concatenate([jnp.array([z_0]), Z[:-1]])
-        Z = Z.transpose(1,0,2)
+            # Replace Z[0] and shift other Zs
+            Z = jnp.concatenate([jnp.array([z_0]), Z[:-1]])
+            Z = Z.transpose(1,0,2)
+        else:
+            (_, log_lik), logliks = jax.lax.scan(scan_fn, carry, inputs)
+            Z = None
 
         return (logliks, Z), log_lik
     
@@ -1723,12 +1716,12 @@ class GLMLearn():
         (_, _, log_lik), (Y_pred, Z_pred) = jax.lax.scan(scan_fn, init, inputs, length=T-1)
         Y = jnp.concatenate([jnp.array([y_0]), Y_pred]); assert Y.shape == (T,)
         Z = jnp.concatenate([jnp.array([z_0]), Z_pred]); assert Z.shape == (T, latent_dim)
-        return Y, Z, log_lik
+        return Y, Z
 
     def forward_pass(self, 
             key, params, 
             X: Float[Array, "T M"], Y: Float[Array, "T"], R: Float[Array, "T"], day_flags: Bool[Array, "T"], 
-            N_particles: int=1000, predict_Y: bool=False, correct_bias: bool=True
+            N_particles: int=1000, predict_Y: bool=False, correct_bias: bool=True, return_Z: bool=False
             ):
         '''
         Make a forward pass in the model, either using the animal decisions (predict_Y=False) or sampling decisions
@@ -1810,11 +1803,15 @@ class GLMLearn():
         subkeys = jax.random.split(key, num=T)
         inputs = (X, Y, R, next_day_flags, correct_bias_flags, subkeys)
         
-        (_, log_lik), (logliks, Z) = jax.lax.scan(scan_fn, carry, inputs) #, length=T)
+        if return_Z:
+            (_, log_lik), (logliks, Z) = jax.lax.scan(scan_fn, carry, inputs) #, length=T)
 
-        # Replace Z[0] and shift other Zs
-        Z = jnp.concatenate([jnp.array([z_0]), Z[:-1]])
-        Z = Z.transpose(1,0,2)
+            # Replace Z[0] and shift other Zs
+            Z = jnp.concatenate([jnp.array([z_0]), Z[:-1]])
+            Z = Z.transpose(1,0,2)
+        else:
+            (_, log_lik), (logliks, _) = jax.lax.scan(scan_fn, carry, inputs) #, length=T)
+            Z = None
 
         return (logliks, Z), log_lik
 
@@ -2289,7 +2286,52 @@ class GLMInterpLearn(GLMLearn):
             return w + learning_signal + update_noise
 
 
+class RVBF(GLMLearn):
+    r'''
+    Static GLM + Reinforce with vector baseline (VB) and forgetting (F) terms.
+    '''
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
 
+    def __repr__(self) -> str:
+        return f"RVBF()"
+    
+    def update_weights(
+            self, 
+            key: PRNGKey, w, x, 
+            params: parameters.ParamsGLMInterpLearn, y=None, r=None,
+            day_flag: bool=False,
+            return_noise=False, return_learning_signal=False):
+        
+        # Change in mean weights from learning rule
+        REINFORCE_term = reinforce(w, x, y, r=r-params.baseline)
+        learning_signal = jnp.multiply(jnp.exp(params.log_alpha), REINFORCE_term)
+
+        # Forgetting
+        forget_term = w @ jnp.diag(jnp.exp(params.log_Q))
+        learning_signal = learning_signal - forget_term
+
+        # Add noise with per-dimension scales
+        update_noise = jax.random.normal(key, shape=w.shape)
+        sigma = jnp.where(
+            day_flag,
+            jnp.exp(params.log_sigma_day),
+            jnp.exp(params.log_sigma)
+        )
+        # if sigma.ndim == 0:
+        update_noise = update_noise * sigma
+        # else:
+        #     update_noise = update_noise * sigma[None, :]
+        
+        # if return_noise:
+        #     return w + learning_signal + update_noise, update_noise
+        # else:
+        #     return w + learning_signal + update_noise
+        if return_learning_signal:
+            return w + learning_signal + update_noise, learning_signal
+        else:
+            return w + learning_signal + update_noise
+        
 
 
 class GLMHMMLearn(GLMLearn):
