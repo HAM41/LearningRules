@@ -3,6 +3,9 @@ import pandas as pd
 import jax 
 import jax.numpy as jnp
 import argparse
+from tqdm import tqdm
+from copy import deepcopy
+import time
 
 import os
 import sys
@@ -21,10 +24,17 @@ logger = logging.getLogger(__name__)
 def load_model(args, regressors):
     model = fit_utils.load_model(args)
 
-    if isinstance(model, models.TimeVarGLMLearn) or isinstance(model, models.AC):
+    if isinstance(model, models.TimeVarGLMLearn):
         beta_dim = len(regressors) + 1 if args.vector_alpha else 1
         model.beta_dim = beta_dim
         model.latent_dim = len(regressors) + beta_dim + 1
+        model.reward_func = ibl.format_reward_function(regressors, learning_rule=None)
+        logging.info(f"Model latent dim: {model.latent_dim}, beta dim: {beta_dim}")
+    elif isinstance(model, models.AC):
+        beta_dim = len(regressors) + 1
+        model.beta_dim = beta_dim
+        model.latent_dim = len(regressors) + beta_dim + 1
+        model.reward_func = ibl.format_reward_function(regressors, learning_rule='reinforce')
         logging.info(f"Model latent dim: {model.latent_dim}, beta dim: {beta_dim}")
     elif isinstance(model, models.GLMHMMLearn):
         model.latent_dim = len(regressors) + 1
@@ -33,6 +43,7 @@ def load_model(args, regressors):
         model.latent_dim = beta_dim + len(regressors) + 1
     else:
         model.latent_dim = len(regressors) + 1
+        model.reward_func = ibl.format_reward_function(regressors, learning_rule=args.learning_rule)
     return model
 
 def compute_posterior(args, model, params, X, Y, R, day_flags):
@@ -113,6 +124,159 @@ def compute_posterior(args, model, params, X, Y, R, day_flags):
     jnp.save(MODELDIR+f'min_noise_component_N{args.N_particles}x{n_iters}_ps{args.posterior_seed}.npy', min_noise_component)
     return
 
+def modeldir(args, model):
+    MODELDIR = HOMEDIR + f'/postprocessing/posterior/{args.lab}/{args.subject_id}/{model}/'
+    if not os.path.exists(MODELDIR):
+        os.makedirs(MODELDIR)
+    return MODELDIR
+
+def generate_prior_trajectory(
+        args, model, params, X, Y, R, day_flags, 
+        use_emissions=True, use_noise=True, posterior_latents=None, N_samples=1):
+    '''
+    Generate a latent prior trajectory, with and without emissions.
+    '''
+    key = jax.random.PRNGKey(args.posterior_seed)
+    
+    if posterior_latents is not None:
+        if isinstance(model, (models.TimeVarGLMLearn, models.AC)):
+            assert posterior_latents.shape[0] == len(X), "Posterior latents shape mismatch."
+            beta_post, w_post = model.split_latent(posterior_latents)
+        else:
+            logging.warning("Posterior latents unnecessary, no other latents than w.")
+        #     post_weights, _ = model.posterior_samples(
+        #         key, params, X, Y, R, day_flags, 
+        #         N_particles=args.N_particles, return_history=True, verbose=args.verbose
+        #         )
+        # else:
+    
+    _params = deepcopy(params)
+    if not use_noise:
+        _params = _params._replace(log_sigma=-10, log_sigma_day=-10)
+
+    # Initial conditions
+    z_t = model.sample_initial(key, params, N_samples, d=len(regressors)) #! global regressors
+    W_out = jnp.zeros((T, len(regressors)+1)) #! global regressors
+
+    if isinstance(model, (models.TimeVarGLMLearn, models.AC)):
+        w_t = model.split_latent(z_t)[1]
+    else:
+        w_t = z_t
+    W_out = W_out.at[0].set(w_t.mean(0))
+
+    # Generate dynamics
+    for t in tqdm(range(T-1)):
+        key, _ = jax.random.split(key)
+
+        if use_emissions:
+            Yt = Y[t]
+            Rt = R[t]
+        else:
+            Yt = model.decision(key, z_t, X[t])
+            Rt = R[t] if Yt == Y[t] else 0
+
+        # Update weights
+        z_next = model.update_weights(
+            key, z_t, x=X[t], y=Yt, r=Rt, day_flag=day_flags[t], 
+            params=_params, return_learning_signal=False,
+            )
+        z_t = z_next
+        
+        # Append w component
+        if isinstance(model, (models.TimeVarGLMLearn, models.AC)):
+            w_next = model.split_latent(z_next)[1]
+            if posterior_latents is not None:
+                beta_next = beta_post[:,t+1]
+                beta_next = jnp.tile(beta_next, (N_samples, 1))
+                z_next = model.merge_latent(beta_next, w_next)
+        else:
+            w_next = z_next
+        W_out = W_out.at[t+1].set(w_next.mean(0))
+    return W_out
+
+def generate_all_prior_trajectories(args, model, params, X, Y, R, day_flags, use_posterior_latents=True):
+    MODELDIR = modeldir(args, model)
+    # Compute posterior latents ahead of loops
+    if use_posterior_latents:
+        generate_posterior_trajectories(args, model, params, X, Y, R, day_flags)
+        # try:
+        #     posterior_latents = jnp.load(MODELDIR+f'posterior_mean_N{args.N_particles}_ps{args.posterior_seed}_scan.npy')
+        # except FileNotFoundError:
+        posterior_latents = jnp.load(MODELDIR+f'posterior_mean_N{args.N_particles}_ps{args.posterior_seed}_scan.npy')
+        # for i in range(args.n_posterior_samples):
+        #     key = jax.random.PRNGKey(args.posterior_seed+i)
+        #     post_weights, _ = model.posterior_samples_scan(
+        #         key, params, 
+        #         X, Y, R, day_flags,
+        #         N_particles=args.N_particles,
+        #         )
+        #     posterior_latents = post_weights.mean(0)
+        #     posterior_CI = jnp.percentile(post_weights, jnp.array([2.5, 97.5]), axis=0)
+        #     jnp.save(MODELDIR+f'posterior_mean_N{args.N_particles}_ps{args.posterior_seed+i}_scan.npy', posterior_latents)
+        #     jnp.save(MODELDIR+f'posterior_CI_N{args.N_particles}_ps{args.posterior_seed+i}_scan.npy', posterior_CI)
+    else:
+        posterior_latents = None
+        
+    for use_emissions in [True, False]:
+        for use_noise in [True, False]:
+            logging.info(f"Use emissions: {use_emissions}, use noise: {use_noise}")
+            Ws_theoretical = generate_prior_trajectory(
+                args, model, params, X, Y, R, day_flags, 
+                use_emissions=use_emissions, use_noise=use_noise, posterior_latents=posterior_latents, N_samples=1
+                )
+    
+            file_name = 'prior_useY{}_noise{}_postZ{}_N{}_ps{}.npy'.format(
+                use_emissions, use_noise, use_posterior_latents, args.N_particles, args.posterior_seed
+                )
+            jnp.save(MODELDIR+file_name, Ws_theoretical)
+            logging.info(f"Last weights: {Ws_theoretical[-1]}")
+    return
+
+def generate_posterior_trajectories(args, model, params, X, Y, R, day_flags) -> None:
+    for i in range(args.n_posterior_samples):
+        key = jax.random.PRNGKey(args.posterior_seed+i)
+        post_weights, _ = model.posterior_samples(
+            key, params, 
+            X, Y, R, day_flags,
+            N_particles=args.N_particles, LAG=True, verbose=True,
+            )
+        posterior_latents = post_weights.mean(0)
+        print(posterior_latents[:10])
+        print(posterior_latents[-10:])
+        posterior_CI = jnp.percentile(post_weights, jnp.array([2.5, 97.5]), axis=0)
+        jnp.save(MODELDIR+f'posterior_mean_N{args.N_particles}_ps{args.posterior_seed+i}_scan.npy', posterior_latents)
+        jnp.save(MODELDIR+f'posterior_CI_N{args.N_particles}_ps{args.posterior_seed+i}_scan.npy', posterior_CI)
+
+def evaluate_model(args, model, params, X, Y, R, day_flags):
+    '''
+    Evaluate model on data.
+    '''
+    key1, key2, key3 = jax.random.split(jax.random.PRNGKey(args.posterior_seed), 3)
+    
+    MLL, MLLs = model.marginal_log_likelihood(
+        key1, params, 
+        X, Y, R=R, day_flags=day_flags,
+        N_particles=args.N_particles, 
+        return_logliks=True
+        )
+    logging.info(f"Complete trajectory 'marginal_log_likelihood': {MLL:.2f}, avg per trial: {MLLs.mean():.4f}, avg L per trial: {jnp.exp(MLLs).mean():.4f}")
+
+    (forward_LLs, _), forward_LL = model.forward_pass(
+        key2, params,
+        X, Y, R=R, day_flags=day_flags,
+        N_particles=args.N_particles, predict_Y=False, return_Z=False,
+    )
+    logging.info(f'Forward pass (prior predictive, use Y) loglik: {forward_LL:.2f}, avg per trial: {forward_LLs.mean():.4f}, avg L per trial: {jnp.exp(forward_LLs).mean():.4f}')
+
+    (pred_LLs, _), pred_LL = model.forward_pass(
+        key3, params,
+        X, Y, R=R, day_flags=day_flags,
+        N_particles=args.N_particles, predict_Y=True, return_Z=False,
+    )
+    logging.info(f'Prediction (prior predictive, sample Y) loglik: {pred_LL:.2f}, avg per trial: {pred_LLs.mean():.4f}, avg L per trial: {jnp.exp(pred_LLs).mean():.4f}')
+    return MLL, forward_LL, pred_LL
+
+
 if __name__=='__main__':
     parser = argparse.ArgumentParser(description="Argument parser for IBL fitting.")
 
@@ -128,8 +292,7 @@ if __name__=='__main__':
                         help="Seed for random number generator")
     parser.add_argument("-N", "--N-particles", type=int, default=1000, 
                         help="Number of particles for SMC.")
-    parser.add_argument("--model-class", type=str, default="GLMLearn", 
-                        choices=["GLMLearn", "TimeVarGLMLearn", "Psytrack", "GLMRegLearn", "GLMHMMLearn", "GLMInterpLearn", "QLearning", "GLMBaseLearn", "AC"],
+    parser.add_argument("--model-class", type=str, default="GLMLearn",
                         help="Model class to use for fitting.")
     parser.add_argument("--vector-alpha", action='store_true',
                         help="Use vector alpha for GLM.")
@@ -139,18 +302,20 @@ if __name__=='__main__':
     parser.add_argument("--loop-post-samples", action='store_true', default=False)
     parser.add_argument("-v", "--verbose", action='store_true', default=False, 
                         help='Verbose during posterior sampling.')
+    parser.add_argument("--regressors", type=str, nargs='+', default=['contrastLeft', 'contrastRight', 'previousChoice', 'previousRewarded'],
+                        help="Regressors to use for the model.")
+    parser.add_argument("--n-posterior-samples", type=int, default=1,
+                        help="Number of posterior samples to compute.")
 
-    regressors = ['contrastLeft', 'contrastRight', 'previousChoice', 'previousRewarded'] #  'stimIntensity', 
     
     # Parse the command-line arguments
     args = parser.parse_args()
     logging.info(f"Arguments: {args}")
 
+    regressors = args.regressors # ['contrastLeft', 'contrastRight', 'previousChoice', 'previousRewarded'] #  'stimIntensity', 
     # Model
     model = load_model(args, regressors)
-    MODELDIR = HOMEDIR + f'/postprocessing/posterior/{args.lab}/{args.subject_id}/{model}/'
-    if not os.path.exists(MODELDIR):
-        os.makedirs(MODELDIR)
+    MODELDIR = modeldir(args, model)
 
     # Data
     loader_params = {
@@ -163,7 +328,9 @@ if __name__=='__main__':
 
     loader = ibl.IBLSingleTrajectoryLoader(loader_params)
     data = loader.load_data()
-    X, Y, R, day_flags = jnp.array(data['trajectory'].X), jnp.array(data['trajectory'].Y), data['trajectory'].R, data['trajectory'].day_flags
+    X, Y, R, day_flags = jnp.array(data['train_trajectory'].X), jnp.array(data['train_trajectory'].Y), data['train_trajectory'].R, data['train_trajectory'].day_flags
+    if args.model_class == "QLearning" and ('stimIntensity' not in regressors):
+        X = X[:, 1] - X[:, 0]
     dict = {'X': X, 'Y': Y, 'R': R, 'day_flags': day_flags}
     # pickle.dump(dict, open(SAVEDIR+f'data.pkl', 'wb'))
     
@@ -178,11 +345,20 @@ if __name__=='__main__':
     Y = Y[:T]
     R = R[:T]
     day_flags = day_flags[:T]
-    correct_choice = models.correct_choice(X[:,1]-X[:,0])
+    if args.model_class == "QLearning":
+        correct_choice = models.correct_choice(X)
+    else:
+        correct_choice = models.correct_choice(X[:,1]-X[:,0])
 
     # Load params from compiled entries table
-    entries = pd.read_pickle('./postprocessing/parsed_slurm_entries_wnoisecomponent.pkl')
-    sub_entries = entries.query(f"lab == '{args.lab}' and model == '{model}'").iloc[args.subject_id]
+    if 'stimIntensity' in regressors:
+        parsed_entries_file = './postprocessing/parsed_slurm_entries_wnoisecomponent_stimIntensity.pkl'
+    else:
+        parsed_entries_file = './postprocessing/parsed_slurm_entries_wnoisecomponent.pkl'
+    entries = pd.read_pickle(parsed_entries_file)
+    sub_entries = entries.query(
+        f"lab == '{args.lab}' and model == '{model}' and subject_id == {args.subject_id}"
+        ).iloc[0]
 
     params_array = jnp.array(sub_entries['params_array'])
     lengths = sub_entries['params_lengths']
@@ -190,4 +366,7 @@ if __name__=='__main__':
     params = parameters.array_to_params(params_name, params_array, lengths)
     logging.info(f"Loaded params: {params}")
 
-    compute_posterior(args, model, params, X, Y, R, day_flags)
+    evaluate_model(args, model, params, X, Y, R, day_flags)
+    # sys.exit()
+
+    generate_all_prior_trajectories(args, model, params, X, Y, R, day_flags, use_posterior_latents=True)
