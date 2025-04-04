@@ -291,6 +291,165 @@ def sample_particles_gumbel(key, tilde_z_t, log_w_t, N_particles):
     indices = jnp.argmax(log_w_t + noise, axis=-1)
     return tilde_z_t[indices]
 
+# def gumbel_softmax_sample(rng, p, temperature=1.0, eps=1e-10):
+#     """
+#     Draw a relaxed one-hot sample from categorical with probs p via Gumbel-Softmax.
+    
+#     Args:
+#         rng: JAX PRNG key
+#         p: 1D array of shape (K, ) with categorical probabilities (sum to 1)
+#         temperature: scalar temperature
+#         eps: small constant for numerical stability
+        
+#     Returns:
+#         A 'soft' one-hot vector of shape (K, ), i.e. sums to 1 but with continuous entries.
+#     """
+#     # Sample Gumbel noise
+#     g = jax.random.gumbel(rng, shape=p.shape)
+#     # Compute 'logits' = log(p) + Gumbel noise
+#     logits = jnp.log(p + eps) + g
+#     # Softmax
+#     y = jax.nn.softmax(logits / temperature)
+#     return y
+
+
+# def gumbel_softmax_sample_straight_through(rng, p, temperature=1.0):
+#     y_soft = gumbel_softmax_sample(rng, p, temperature)
+#     # Forward pass: pick discrete argmax
+#     idx = jnp.argmax(y_soft)
+#     y_hard = jnp.zeros_like(y_soft).at[idx].set(1.0)
+    
+#     # Straight-through gradient: 
+#     # forward uses y_hard, backward uses y_soft
+#     return y_hard + jax.lax.stop_gradient(y_soft - y_hard)
+
+
+# def multinomial_gumbel_softmax(rng, p, n_draws, temperature=1.0, straight_through=False):
+#     """
+#     Returns shape (n_draws, K) array of relaxed (or hard-straight-through) one-hot vectors.
+#     """
+#     subkeys = jax.random.split(rng, n_draws)
+    
+#     if straight_through:
+#         sampler = lambda k: gumbel_softmax_sample_straight_through(k, p, temperature)
+#     else:
+#         sampler = lambda k: gumbel_softmax_sample(k, p, temperature)
+    
+#     # vmap over multiple draws
+#     return jax.vmap(sampler)(subkeys)
+
+# import jax
+# import jax.numpy as jnp
+
+def sample_one_particle_gumbel(
+    rng,
+    p: jnp.ndarray,            # shape (N,)
+    tilde_z_t: jnp.ndarray,    # shape (N, M)
+    temperature: float = 1.0,
+    straight_through: bool = True,
+    eps: float = 1e-10
+) -> jnp.ndarray:
+    """
+    Draw one Gumbel-Softmax sample (relaxed or ST) from categorical 'p'
+    and map it onto a single new particle via a dot product with tilde_z_t.
+
+    Returns:
+      z_new: shape (M,)
+    """
+    # 1) sample Gumbel noise of same shape as p
+    g = jax.random.gumbel(rng, shape=p.shape)
+    logits = jnp.log(p + eps) + g
+
+    # 2) continuous "soft" one-hot
+    y_soft = jax.nn.softmax(logits / temperature)
+
+    if straight_through:
+        # Hard selection in forward pass
+        idx = jnp.argmax(y_soft)
+        y_hard = jnp.zeros_like(y_soft).at[idx].set(1.0)
+        # Straight-through gradient: forward uses y_hard, backward uses y_soft
+        y = y_hard + jax.lax.stop_gradient(y_soft - y_hard)
+    else:
+        # purely soft
+        y = y_soft
+
+    # 3) map one-hot to the actual (M,) state by dot product
+    #    shape: (N,) dot (N, M) => (M,)
+    z_new = y @ tilde_z_t
+    return z_new
+
+
+def resample_particles_gumbel_vmap(
+    rng,
+    tilde_z_t: jnp.ndarray,    # shape (N, M)
+    log_tilde_w_t: jnp.ndarray,# shape (N,)
+    temperature: float = 0.5,
+    straight_through: bool = True
+) -> jnp.ndarray:
+    """
+    Resamples N new particles via Gumbel-Softmax, returning shape (N, M).
+    Does so without building an (N x N) matrix.
+    """
+    # Convert log-weights to normalized probabilities
+    max_log_w = jnp.max(log_tilde_w_t)
+    logw_stable = log_tilde_w_t - max_log_w
+    w = jnp.exp(logw_stable)
+    p = w / jnp.sum(w)  # shape (N,)
+
+    N = tilde_z_t.shape[0]
+    subkeys = jax.random.split(rng, N)
+
+    # We'll vmap over 'N' draws:
+    def single_draw(subkey):
+        return sample_one_particle_gumbel(
+            subkey,
+            p=p,
+            tilde_z_t=tilde_z_t,
+            temperature=temperature,
+            straight_through=straight_through
+        )
+
+    # shape: (N, M)
+    z_new = jax.vmap(single_draw)(subkeys)
+    return z_new
+
+from functools import partial
+import jax.lax as lax
+
+def resample_particles_gumbel_scan(
+    rng,
+    tilde_z_t: jnp.ndarray,
+    log_tilde_w_t: jnp.ndarray,
+    temperature: float = 0.5,
+    straight_through: bool = True
+) -> jnp.ndarray:
+    # same setup to get p
+    max_log_w = jnp.max(log_tilde_w_t)
+    logw_stable = log_tilde_w_t - max_log_w
+    w = jnp.exp(logw_stable)
+    p = w / jnp.sum(w)
+    
+    N = tilde_z_t.shape[0]
+    subkeys = jax.random.split(rng, N)
+
+    def scan_body(carry, subkey):
+        # carry is not used except to hold the partial results
+        z_new = sample_one_particle_gumbel(
+            subkey,
+            p=p,
+            tilde_z_t=tilde_z_t,
+            temperature=temperature,
+            straight_through=straight_through
+        )
+        return carry, z_new
+
+    init_carry = None
+    # out shape: (N, M)
+    _, z_new_all = lax.scan(scan_body, init_carry, subkeys)
+    return z_new_all
+
+
+
 class LearningModel():
     '''
     A learning rule is a probability distribution over the next weights given the current weights and the data.
@@ -357,40 +516,6 @@ class QLearning():
         p_R = self.emission_likelihood(z, y=Y_R, params=params)
         y = jax.random.bernoulli(key, p_R).astype(int)
         return Y_vals[y]
-    
-    # def decision(self, m, V):
-    #     if self.softmax:
-    #         V_L, V_R = V
-    #         p_R = self.p_R(m)
-
-    #         # Compute Q values for each state
-    #         Qs = jnp.stack([jnp.multiply(1-p_R, V_L), jnp.multiply(p_R, V_R)])
-            
-    #         p = jax.nn.softmax(self.beta * Qs, axis=0)
-    #         if p.ndim > 1:
-    #             Y = np.array([np.random.binomial(1, p=_p[1]) for _p in p]).astype(int) #! make jax
-    #         else:
-    #             Y = jax.random.bernoulli(key, p[1]).astype(int)
-    #     else:
-    #         a = self.transition_point(V)
-    #         Y = jnp.array(m > a).astype(int)
-    #     return Y
-    
-    def update_values(self, V, x, y, m):
-        '''
-        #! deprecate in favor of update_weights()
-        Learning rule update
-        Args:
-            V: np.ndarray (2,N), left V[0,:] and right V[1,:] values
-            x: np.ndarray (N), 
-        '''
-        V_L, V_R = V
-        p_R = self.p_R(m)
-        if y==1:
-            V_R = V_R + self.alpha * (reward(x,y) - jnp.multiply(p_R, V_R))
-        else:
-            V_L = V_L + self.alpha * (reward(x,y) - jnp.multiply(1-p_R, V_L))
-        return jnp.stack([V_L, V_R])
 
     def update_weights(
             self, 
@@ -1096,9 +1221,13 @@ class GLMLearn():
 
         if verbose:
             pbar = tqdm(range(0,T), desc='Bootstrap filter')
+
+        if correct_bias and M == 4:
+            correct_bias_flags = jnp.cumprod(jnp.abs(X[:,1] - X[:,0]) >= 0.9).astype(bool) # True until stim intensity goes below 0.9 in abs
+        else:
+            correct_bias_flags = jnp.zeros(T, dtype=bool)
     
         log_lik = 0.
-        non_one_X_flag = True
         for t in range(0,T):
             key, subkey1, subkey2 = jax.random.split(key, 3)
 
@@ -1111,13 +1240,8 @@ class GLMLearn():
                 tilde_z_t = self.update_weights(subkey1, z_t, params=params, x=X[t-1], y=Y[t-1], r=R[t-1], day_flag=day_flags[t])
             
             # Correct the non-identifiability while we have the non_one_X_flag
-            if X.shape[-1] == 5:
-                stim_intensity_t = X[t][1] - X[t][0]
-                if non_one_X_flag and correct_bias:
-                    if 0.9 > jnp.abs(stim_intensity_t):
-                        non_one_X_flag = False
-                        logging.info(f"Weights corrected up to t={t}.")
-                    tilde_z_t = self.bias_correction(tilde_z_t)
+            if correct_bias_flags[t]:
+                tilde_z_t = self.bias_correction(tilde_z_t)
 
             # 2. Evaluate importance weights p(y_t | xhat_t, V_t)
             #   Outcome: {tilde z_t^i, tilde w^i}, an approximation to p(z_t|y_{1:t})
@@ -1183,15 +1307,20 @@ class GLMLearn():
             log_tilde_w_t = self.emission_loglikelihood(tilde_z_t, X_t, Y_t, params=params)
 
             # -- Normalize and handle numerical stability
-            #   jax.random.choice(replac=True) is invariant to scaling of p of the form a * p
+            #   jax.random.choice(replace=True) is invariant to scaling of p of the form a * p
             p = jnp.exp(log_tilde_w_t - jnp.max(log_tilde_w_t))
             
             # 2. Update step : resample with replacement N particles according the importance weights
             z_t = jax.random.choice(subkey1, tilde_z_t, shape=(N_particles,), p=p)
-            # z_t = sample_particles_gumbel(subkey1, tilde_z_t, log_tilde_w_t, N_particles)
+            # z_t = resample_particles_gumbel_scan(
+            #     rng=subkey1,
+            #     tilde_z_t=tilde_z_t,
+            #     log_tilde_w_t=log_tilde_w_t,
+            #     temperature=0.5,
+            #     straight_through=True
+            # )
 
             # -- Update log-likelihood estimate
-            # log_lik = jnp.log(jnp.mean(tilde_w_t))
             log_lik = logmeanexp(log_tilde_w_t)
             marginal_log_lik += log_lik
             
