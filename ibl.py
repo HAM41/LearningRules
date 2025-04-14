@@ -1,5 +1,5 @@
 r'''
-Author: Victor 
+Author: Victor Geadah
 
 This script contains functions to load and preprocess behavioral data from the IBL database.
 
@@ -14,6 +14,9 @@ from jaxtyping import Array, Float, Bool
 import jax
 import jax.numpy as jnp
 import models
+import os; import sys
+
+HOMEDIR = '/home/vg0233/PillowLab/LearningRules/'
 
 import logging
 logging.basicConfig(level=logging.INFO, format='[%(filename)s][%(asctime)s] %(levelname)s - %(message)s')
@@ -85,8 +88,8 @@ def load_IBL_behavioral_data(protocol: str='training') -> Tuple[pd.DataFrame, li
     if protocol == 'training':
         # Remove the animals that loaded with errors on some sessions in their training data.
         # This removed 38/100 amimals, 347037/1171032 trials (30 %)
-        logger.warning('WARNING: removing animals with trial loading errors.')
         error_animal_ids = np.unique(error_animals)
+        logger.warning(f'WARNING: removing {len(error_animal_ids)} animals with trial loading errors.')
         entries_df = entries_df[~entries_df['subject'].isin(error_animal_ids)]
     
     return entries_df, error_animals
@@ -100,76 +103,6 @@ def format_IBL_behavioral_data(df: pd.DataFrame) -> pd.DataFrame:
 
 def z_score(array):
     return (array - np.mean(array))/np.std(array)
-
-# def _get_mouse_design(dfAll, subject, sessStop=-1, D=4):
-#     '''
-#     function to give design matrix x and output vector y for a given subject until session sessStpo
-#     '''
-#     data = dfAll[dfAll['subject']==subject]   # Restrict data to the subject specified
-#     # keeping first 40 sessions
-#     dateToKeep = np.unique(data['date'])[0:sessStop]
-#     dataTemp = pd.DataFrame(data.loc[data['date'].isin(list(dateToKeep))])
-#     # getting correct answer for each trial
-#     correctSide = np.array(dataTemp['correctSide'])
-#     # design and out matrix
-#     x = np.zeros((dataTemp.shape[0], D))
-#     y = np.array(dataTemp['choice'])
-#     x[:,0] = 1 # bias
-#     if (D==2):
-#         x[:,1] = dataTemp['contrastRight'] - dataTemp['contrastLeft'] # 'stimulus intensity'
-#         x[:,1] = (x[:,1] - np.mean(x[:,1])) / np.std(x[:,1]) # z-scored
-#     elif (D==4):
-#         x[:,1] = dataTemp['contrastRight'] - dataTemp['contrastLeft'] # 'stimulus intensity'
-#         x[:,1] = (x[:,1] - np.mean(x[:,1])) / np.std(x[:,1]) # z-scored
-#         x[1:,2] = 2 * y[0:-1] - 1 # previous chioce as in Zoe's
-#         x[1:,3] = 2 * np.array(dataTemp['correctSide'])[0:-1] - 1 # previous reward as in Zoe's
-#     elif (D==3):
-#         p=5 # as used in Psytrack paper
-#         data['cL'] = np.tanh(p*data['contrastLeft'])/np.tanh(p) # tanh transformation of left contrasts
-#         data['cR'] = np.tanh(p*data['contrastRight'])/np.tanh(p) # tanh transformation of right contrasts
-#         x[:,1] = dataTemp['cL'] # contrast left transformed
-#         x[:,2] = dataTemp['cR'] # contrast right transformed
-#     elif (D==5):
-#         p=5 # as used in Psytrack paper
-#         data['cL'] = np.tanh(p*data['contrastLeft'])/np.tanh(p) # tanh transformation of left contrasts
-#         data['cR'] = np.tanh(p*data['contrastRight'])/np.tanh(p) # tanh transformation of right contrasts
-#         x[:,1] = dataTemp['cL'] # contrast left transformed
-#         x[:,2] = dataTemp['cR'] # contrast right transformed
-#         # not taking into account first and last of each session (probably no effect of that)Z2
-#         x[1:,3] = y[0:-1] # previous choice
-#         x[1:,4] = np.array(dataTemp['correctSide'])[0:-1] # previous rewarded
-   
-#     # session start indicies
-#     sessInd = [0]
-#     for date in dateToKeep:
-#         d = dataTemp[dataTemp['date']==date]
-#         for sess in np.unique(d['session']):
-#             dTemp = d[d['session'] == sess]
-#             dLength = len(dTemp.index.tolist())
-#             sessInd.append(sessInd[-1] + dLength)
-#     return x, y, sessInd, correctSide
-
-# def get_behavioral_data(df=None, subject: str='IBL-T1'):
-#     if df is None:
-#         df = pd.read_csv('./data/ibl_learning_processed.csv')
-#     df = df[df['subject']==subject]
-
-#     dates = np.unique(df['date'].values)
-#     sessions = np.unique(df['session'].values)
-
-#     X, Y = [], []
-#     # for date in dates:
-#     #     for session in sessions:
-#     #         sub_df = df.query(f"session == {session} and date == '{date}'")
-#     #         stim_intensity = sub_df['contrastRight'].values - sub_df['contrastLeft'].values
-#     #         if len(stim_intensity) > 0:
-#     #             X.append(list(z_score(stim_intensity)))
-#     #             Y.append(list(sub_df['choice'].values))
-
-#     stim_intensity = df['contrastRight'].values - df['contrastLeft'].values 
-#     X.append(list(z_score(stim_intensity)))
-#     Y.append(list(df['choice'].values))
-#     return X, Y
 
 def format_regressor_data(df: pd.DataFrame, regressor_name:str) -> np.ndarray:
     regressors_list = ['stimIntensity', 'contrastLeft', 'contrastRight', 
@@ -268,7 +201,7 @@ def load_session_indices(lab, subject_id):
         df.to_csv(f'IBL_{protocol}_protocol.csv', index=False)
         df = format_IBL_behavioral_data(df)
     else:
-        df = pd.read_csv('/home/vg0233/PillowLab/LearningRules/data/IBL_training_protocol.csv')
+        df = pd.read_csv(HOMEDIR + 'data/IBL_training_protocol.csv')
         df = format_IBL_behavioral_data(df)
 
     assert lab in np.unique(df['lab'].values), f"Lab {lab} not found in data."
@@ -294,27 +227,31 @@ def load_session_indices(lab, subject_id):
     
     return sess_ind
 
-def format_reward(X, Y, regressors, learning_rule) -> jnp.ndarray:
+def format_reward_function(regressors, learning_rule):
     if regressors[0] == 'stimIntensity':
         if learning_rule == 'policy_gradient':
-            R = jnp.asarray(models.effective_reward(X[:,0]))
+            return lambda x, y: models.effective_reward(x[0])
         else:
-            R = jnp.asarray(models.reward(X[:,0], Y))
+            return lambda x, y: models.reward(x[0], y)
     elif regressors[1] == 'contrastRight' and regressors[0] == 'contrastLeft':
         if learning_rule == 'policy_gradient':
-            R = jnp.asarray(models.effective_reward(X[:,1]-X[:,0]))
+            return lambda x, y: models.effective_reward(x[1]-x[0])
         else:
-            R = jnp.asarray(models.reward(X[:,1]-X[:,0], Y))
+            return lambda x, y: models.reward(x[1]-x[0], y)
     else:
         raise Exception('Reward function not implemented for this regressor set.')
+    
+def format_reward(X, Y, regressors, learning_rule) -> jnp.ndarray:
+    reward_func = format_reward_function(regressors, learning_rule)
+    R = jax.vmap(reward_func)(X, Y)
     return R
 
 class IBLDataTrajectory(NamedTuple):
     '''IBL single trajectory data, with T trials.'''
     X: Float[Array, "T M"]      # Regressors, M-dimensional
-    Y: Float[Array, "T"]        # Choices, in {0, 1}
+    Y: Float[Array, "T"]        # Choices, in {Y_L, Y_R}
     R: Float[Array, "T"]        # Rewards
-    day_flags: Bool[Array, "T"] # Day flags
+    day_flags: Bool[Array, "T"] # Day flags, True if new day/session
 
 def split_train_test_sessions(X, Y, R, day_flags, session_indices, held_out_sessions):
     '''
@@ -363,13 +300,12 @@ def hold_out_trials(X, Y, R, day_flags, held_out_trials):
     '''
     # Split data into training and test sets
     X_train = jnp.asarray(X).copy()
-    # X_train = X_train.at[held_out_trials].set(jnp.nan)
-   
+
+    # Mask held out trials in Y
     Y_train = jnp.asarray(Y).copy()
     Y_train = Y_train.at[held_out_trials].set(jnp.nan)
 
     R_train = jnp.asarray(R).copy()
-    # R_train = R_train.at[held_out_trials].set(jnp.nan)
 
     day_flags_train = jnp.asarray(day_flags).copy()
 
@@ -378,10 +314,33 @@ def hold_out_trials(X, Y, R, day_flags, held_out_trials):
 
 
 class IBLSingleTrajectoryLoader():
-    def __init__(self, params):
-        '''
-        params: dict, with keys:
-        '''
+    def __init__(self, params, DOWNLOAD=False):
+        """
+        Initialize the IBL data handler.
+        
+        Parameters:
+            params : dict
+                Dictionary containing the following keys:
+                - 'lab': str, name of the lab.
+                - 'subject_id': int, index of the subject.
+                - 'regressors': list, list of regressors to be used.
+                - 'learning_rule': str, learning rule to be applied.
+                - 'seed': int, random seed for reproducibility.
+            DOWNLOAD : bool, optional
+                If True, download the IBL data from the ONE API. If False, load the data from a local file. Default is False.
+        Attributes:
+            data : dict
+                Dictionary to store the processed data, including:
+                - 'session_indices': jnp.array, session indices.
+                - 'trajectory': IBLDataTrajectory, trajectory data.
+                - 'held_out_trials': jnp.array, indices of held-out trials.
+                - 'train_trajectory': IBLDataTrajectory, training trajectory data.
+        Raises:
+            FileNotFoundError
+                If the local data file is not found and DOWNLOAD is set to False.
+            AssertionError
+                If the specified lab or subject index is not found in the data.
+        """
         lab = params['lab']
         idx = params['subject_id']
         regressors = params['regressors']
@@ -391,14 +350,17 @@ class IBLSingleTrajectoryLoader():
         self.data = {}
 
         # Load IBL data
-        DOWNLOAD = False
         if DOWNLOAD:
             protocol = 'training'
             df, _ = load_IBL_behavioral_data(protocol)
             df.to_csv(f'IBL_{protocol}_protocol.csv', index=False)
             df = format_IBL_behavioral_data(df)
         else:
-            df = pd.read_csv('/home/vg0233/PillowLab/LearningRules/data/IBL_training_protocol.csv')
+            try:
+                df = pd.read_csv(HOMEDIR + 'data/IBL_training_protocol.csv')
+            except FileNotFoundError:
+                logger.error("IBL training protocol data not found. Use DOWNLOAD=True to download the data from the ONE api.")
+                sys.exit(1)
             df = format_IBL_behavioral_data(df)
 
         assert lab in np.unique(df['lab'].values), f"Lab {lab} not found in data."
@@ -418,13 +380,14 @@ class IBLSingleTrajectoryLoader():
         #TODO : check that reward and (choice vs correctchoice) are correctly aligned, or reward and rewardVolume
 
         # Split data into training and test sets
-        # TODO: training sets are much shorter, hold out trials instead
         key = jax.random.PRNGKey(seed)
+
         # n_sessions = len(session_indices)
         # held_out_sessions = jax.random.choice(key, n_sessions, shape=(int(n_sessions/10),), replace=False)
         # held_out_sessions = jnp.sort(held_out_sessions)
         # self.data['held_out_sessions']  = held_out_sessions
 
+        # Focus on held-out trials
         n_trials = len(X)
         held_out_trials = jax.random.choice(key, n_trials, shape=(int(n_trials/10),), replace=False)
         held_out_trials = jnp.sort(held_out_trials)
@@ -443,7 +406,7 @@ class IBLSingleTrajectoryLoader():
         return self.data['trajectory'], self.data['held_out_trials']
     
 def get_number_subjects(lab):
-    df = pd.read_csv('/home/vg0233/PillowLab/LearningRules/data/IBL_training_protocol.csv')
+    df = pd.read_csv(HOMEDIR + 'data/IBL_training_protocol.csv')
     df = format_IBL_behavioral_data(df)
     assert lab in np.unique(df['lab'].values), f"Lab {lab} not found in data."
     lab_df = df[df['lab']==lab]
@@ -451,7 +414,7 @@ def get_number_subjects(lab):
     return len(lab_subjects)
 
 def load_session_indices(lab, subject_id):
-    df = pd.read_csv('/home/vg0233/PillowLab/LearningRules/data/IBL_training_protocol.csv')
+    df = pd.read_csv(HOMEDIR + 'data/IBL_training_protocol.csv')
     df = format_IBL_behavioral_data(df)
     assert lab in np.unique(df['lab'].values), f"Lab {lab} not found in data."
     lab_df = df[df['lab']==lab]
@@ -475,47 +438,36 @@ def trajectory_length(lab, subject_id):
     return len(data['trajectory'].X)
 
 if __name__=='__main__':
-    # df = pd.read_csv('./data/ibl_learning_processed.csv')
+    HOMEDIR = '/home/vg0233/PillowLab/LearningRules/'
+    logging.warning(f"Y_L and Y_R are set to {Y_L} and {Y_R} as global variables.")
 
-    # labs = np.unique(df['lab'].values)
-    # Ts = []
-    # for lab in ['wittenlab', 'churchlandlab', 'angelakilab']:
-    #     for subject_id in range(get_number_subjects(lab)):
-    #         T = trajectory_length(lab, subject_id)
-    #         print(lab, subject_id, T)
-    #         Ts.append(T)
+    df = pd.read_csv(HOMEDIR + 'data/IBL_training_protocol.csv')
+    num_unique_animals = df['subject'].nunique()
+    print(f"Number of unique animals: {num_unique_animals}")
 
-    # print(np.mean(Ts), np.std(Ts))
+    # Print all lengths of trajectories
+    all_n_sessions = []
+    for lab in np.unique(df['lab'].values):
+        for subject_id in range(get_number_subjects(lab)):
+            try:
+                N_sessions = len(load_session_indices(lab, subject_id))
+                print(f"Number of sessions for {lab} subject {subject_id}: {N_sessions}")
+                all_n_sessions.append(N_sessions)
+            except:
+                print(f"Error loading data for {lab} subject {subject_id}.")
+    print(all_n_sessions)
+    # jnp.save(HOMEDIR + 'data/IBL_trajectory_lengths.npy', jnp.array(all_n_sessions))
 
-    # for lab in labs:
-    #     lab_df = df[df['lab']==lab]
-    #     subjects = np.unique(lab_df['subject'].values)
-    #     print(lab, len(subjects)
-
-    loader = IBLSingleTrajectoryLoader({
-        'lab': 'wittenlab',
-        'subject_id': 0,
-        'regressors': ['stimIntensity', 'previousChoice', 'previousRewarded'],
-        'learning_rule': 'policy_gradient',
-        'seed': 0
-    })
-    data = loader.load_data()
-    # print(np.unique(data['trajectory'].X[:,0]).round(3))
-    # print(data['trajectory'].Y)
-
-    print(load_session_indices('wittenlab', 0))
-    # X, Y, sess_ind = get_mouse_design(
-    #     df, subject='ibl_witten_02', 
-    #     regressors=['contrastLeft', 'contrastRight', 'previousChoice', 'previousRewarded']
+    # loader = IBLSingleTrajectoryLoader(
+    #     params ={
+    #     'lab': 'wittenlab',
+    #     'subject_id': 1,
+    #     'regressors': ['stimIntensity', 'previousChoice', 'previousRewarded'],
+    #     'learning_rule': 'policy_gradient',
+    #     'seed': 0
+    #     }, 
+    #     DOWNLOAD=False
     #     )
-
-    # # print(len(sess_ind))
-
-    # df_psytrack = pd.read_csv('/home/vg0233/PillowLab/LearningRules/data/ibl_learning_processed_PsyTrack2021.csv')
-    # df = pd.read_csv('/home/vg0233/PillowLab/LearningRules/data/IBL_training_protocol.csv')
-    # df['choice'] = -df['choice'] # Invert choices to match the convention of Y_L, Y_N, Y_R
-
-    # # # df.query("choice == 1.0")['rewardVolume'].values
-    # # print(jnp.unique(df.query("feedbackType == -1.0")['rewardVolume'].values, return_counts=True))
-    # print(df.query("subject == 'ibl_witten_12' and date == '2019-07-17'")[:10])
-    # print(df_psytrack.query("subject == 'ibl_witten_12' and date == '2019-07-17'")[:10])
+    
+    # data = loader.load_data()
+    # print(data)
