@@ -30,6 +30,16 @@ def load_model(args, regressors):
         model.latent_dim = len(regressors) + beta_dim + 1
         model.reward_func = ibl.format_reward_function(regressors, learning_rule=None)
         logging.info(f"Model latent dim: {model.latent_dim}, beta dim: {beta_dim}")
+    elif isinstance(model, models.TimeVarRVBF):
+        model.modulator = args.modulator
+        if model.modulator == 'lr':
+            beta_dim = 1
+        elif model.modulator == 'baseline':
+            beta_dim = len(regressors) + 1
+        model.beta_dim = beta_dim
+        model.latent_dim = len(regressors) + beta_dim + 1
+        model.reward_func = ibl.format_reward_function(regressors, learning_rule='reinforce')
+        logging.info(f"Model latent dim: {model.latent_dim}, beta dim: {beta_dim}")
     elif isinstance(model, models.AC):
         beta_dim = len(regressors) + 1
         model.beta_dim = beta_dim
@@ -132,14 +142,14 @@ def modeldir(args, model):
 
 def generate_prior_trajectory(
         args, model, params, X, Y, R, day_flags, 
-        use_emissions=True, use_noise=True, posterior_latents=None, N_samples=1):
+        use_emissions=True, use_noise=True, posterior_latents=None, N_samples=1, correct_bias=True):
     '''
     Generate a latent prior trajectory, with and without emissions.
     '''
     key = jax.random.PRNGKey(args.posterior_seed)
     
     if posterior_latents is not None:
-        if isinstance(model, (models.TimeVarGLMLearn, models.AC)):
+        if isinstance(model, (models.TimeVarGLMLearn, models.AC, models.TimeVarRVBF)):
             assert posterior_latents.shape[0] == len(X), "Posterior latents shape mismatch."
             beta_post, w_post = model.split_latent(posterior_latents)
         else:
@@ -158,14 +168,22 @@ def generate_prior_trajectory(
     z_t = model.sample_initial(key, params, N_samples, d=len(regressors)) #! global regressors
     W_out = jnp.zeros((T, len(regressors)+1)) #! global regressors
 
-    if isinstance(model, (models.TimeVarGLMLearn, models.AC)):
+    if isinstance(model, (models.TimeVarGLMLearn, models.AC, models.TimeVarRVBF)):
         w_t = model.split_latent(z_t)[1]
     else:
         w_t = z_t
     W_out = W_out.at[0].set(w_t.mean(0))
 
+    if correct_bias and len(regressors) == 4:
+        correct_bias_flags = jnp.cumprod(jnp.abs(X[:,1] - X[:,0]) >= 0.9).astype(bool)
+    else:
+        correct_bias_flags = jnp.zeros(T, dtype=bool)
+
+    if args.verbose:
+        pbar = tqdm(total=T-1)
+
     # Generate dynamics
-    for t in tqdm(range(T-1)):
+    for t in range(T-1):
         key, _ = jax.random.split(key)
 
         if use_emissions:
@@ -180,10 +198,14 @@ def generate_prior_trajectory(
             key, z_t, x=X[t], y=Yt, r=Rt, day_flag=day_flags[t], 
             params=_params, return_learning_signal=False,
             )
+        # Correct bias
+        if correct_bias_flags[t]:
+            z_next = model.bias_correction(z_next) 
         z_t = z_next
+
         
         # Append w component
-        if isinstance(model, (models.TimeVarGLMLearn, models.AC)):
+        if isinstance(model, (models.TimeVarGLMLearn, models.AC, models.TimeVarRVBF)):
             w_next = model.split_latent(z_next)[1]
             if posterior_latents is not None:
                 beta_next = beta_post[:,t+1]
@@ -192,6 +214,9 @@ def generate_prior_trajectory(
         else:
             w_next = z_next
         W_out = W_out.at[t+1].set(w_next.mean(0))
+
+        if args.verbose:
+            pbar.update(1)
     return W_out
 
 def generate_all_prior_trajectories(args, model, params, X, Y, R, day_flags, use_posterior_latents=True):
@@ -238,7 +263,7 @@ def generate_posterior_trajectories(args, model, params, X, Y, R, day_flags) -> 
         post_weights, _ = model.posterior_samples(
             key, params, 
             X, Y, R, day_flags,
-            N_particles=args.N_particles, LAG=True, verbose=True,
+            N_particles=args.N_particles, LAG=True, verbose=args.verbose,
             )
         posterior_latents = post_weights.mean(0)
         print(posterior_latents[:10])
@@ -247,7 +272,7 @@ def generate_posterior_trajectories(args, model, params, X, Y, R, day_flags) -> 
         jnp.save(MODELDIR+f'posterior_mean_N{args.N_particles}_ps{args.posterior_seed+i}_scan.npy', posterior_latents)
         jnp.save(MODELDIR+f'posterior_CI_N{args.N_particles}_ps{args.posterior_seed+i}_scan.npy', posterior_CI)
 
-def evaluate_model(args, model, params, X, Y, R, day_flags):
+def evaluate_model(args, model, params, X, Y, R, day_flags, held_out_trials=None):
     '''
     Evaluate model on data.
     '''
@@ -260,6 +285,9 @@ def evaluate_model(args, model, params, X, Y, R, day_flags):
         return_logliks=True
         )
     logging.info(f"Complete trajectory 'marginal_log_likelihood': {MLL:.2f}, avg per trial: {MLLs.mean():.4f}, avg L per trial: {jnp.exp(MLLs).mean():.4f}")
+    if held_out_trials is not None:
+        test_MLL = MLLs[held_out_trials].sum()
+        logging.info(f"Held out trials 'marginal_log_likelihood': {test_MLL:.2f}, avg per trial: {MLLs[held_out_trials].mean():.4f}, avg L per trial: {jnp.exp(MLLs[held_out_trials]).mean():.4f}")
 
     (forward_LLs, _), forward_LL = model.forward_pass(
         key2, params,
@@ -276,6 +304,85 @@ def evaluate_model(args, model, params, X, Y, R, day_flags):
     logging.info(f'Prediction (prior predictive, sample Y) loglik: {pred_LL:.2f}, avg per trial: {pred_LLs.mean():.4f}, avg L per trial: {jnp.exp(pred_LLs).mean():.4f}')
     return MLL, forward_LL, pred_LL
 
+def decompose_learning_noise(args, model, params, X, Y, R, day_flags, correct_bias=True):
+    '''
+    Decompose learning and noise components of the posterior.
+    '''
+    key = jax.random.PRNGKey(args.posterior_seed)
+    T, M = X.shape
+
+    # Get posterior samples
+    post_weights, _ = model.posterior_samples(
+            key, params, 
+            X, Y, R, day_flags,
+            N_particles=args.N_particles, verbose=args.verbose, LAG=True,
+            )
+    Z = post_weights#.mean(0)
+    
+    # Learning component
+    keys = jax.random.split(key, T)
+    if correct_bias and M == 4:
+        correct_bias_flags = jnp.cumprod(jnp.abs(X[:,1] - X[:,0]) >= 0.9).astype(bool) # True until stim intensity goes below 0.9 in abs
+    else:
+        correct_bias_flags = jnp.zeros(T, dtype=bool)
+
+    # def bias_correction(w):
+    #     bias = w[0]
+    #     correction = bias * jnp.array([-1, 1, 1, 0, 0]) # [remove, add, add, 0, 0]
+    #     return w + correction
+
+    def learning_update(t):
+        _, learning_signal = model.update_weights(
+            keys[t], Z[:,t], x=X[t], y=Y[t], r=R[t], 
+            day_flag=day_flags[t], correct_bias=correct_bias_flags[t],
+            params=params, return_learning_signal=True,
+        )
+
+        # learning_signal_bias_corrected = learning_signal
+        # jnp.where(
+        #     correct_bias_flags[t],
+        #     model.bias_correction(learning_signal), 
+        #     learning_signal
+        #     )
+        return learning_signal
+    
+    learning_updates = jax.vmap(learning_update)(jnp.arange(T)) # shape (T, N, weight_dim)
+    learning_updates = learning_updates.transpose(1, 0, 2) # shape (N, T, weight_dim)
+    
+    # Make sure updates are of shape (N, T, weight_dim)
+    if learning_updates.ndim == 2:
+        learning_updates = learning_updates[:, :, None]
+    
+    # Get weight component of posterior samples
+    if isinstance(model, (models.TimeVarGLMLearn, models.AC, models.TimeVarRVBF)):
+        _, w_post = model.split_latent(Z)
+    else:
+        w_post = Z
+
+    # Cumulative learning component
+    learning_component = w_post[:,0][:,None,:] + jnp.cumsum(learning_updates, axis=1) # shape (N, T, weight_dim)
+    noise_component = w_post[:,1:] - learning_component[:,:-1]
+    
+    # Average over particles
+    learning_component = learning_component.mean(0)
+    noise_component = noise_component.mean(0)
+    logging.info(f'Noise component norm: {jnp.linalg.norm(noise_component):.2f}, per trial: {jnp.linalg.norm(noise_component)/len(Y):.4f}')
+
+    # Report signal to noise ratio per regressor
+    SNRs = []
+    for i in range(learning_component.shape[1]):
+        learning_component_i = learning_component[:,i]
+        noise_component_i = noise_component[:,i]
+        snr = jnp.linalg.norm(learning_component_i)/jnp.linalg.norm(noise_component_i)
+        SNRs.append(snr.item())
+        logging.info(f'SNR for regressor {i}: {snr:.4f}')
+    logging.info(f'SNRs: {SNRs}')
+
+    # Save
+    jnp.save(MODELDIR+f'learning_component_N{args.N_particles}_ps{args.posterior_seed}.npy', learning_component)
+    jnp.save(MODELDIR+f'noise_component_N{args.N_particles}_ps{args.posterior_seed}.npy', noise_component)
+    
+    return learning_component, noise_component
 
 if __name__=='__main__':
     parser = argparse.ArgumentParser(description="Argument parser for IBL fitting.")
@@ -306,6 +413,8 @@ if __name__=='__main__':
                         help="Regressors to use for the model.")
     parser.add_argument("--n-posterior-samples", type=int, default=1,
                         help="Number of posterior samples to compute.")
+    parser.add_argument("--modulator", type=str, default='lr', choices=['lr', 'baseline'],
+                        help="Modulator for the TimeVarRVBF model.")
 
     
     # Parse the command-line arguments
@@ -328,7 +437,8 @@ if __name__=='__main__':
 
     loader = ibl.IBLSingleTrajectoryLoader(loader_params)
     data = loader.load_data()
-    X, Y, R, day_flags = jnp.array(data['train_trajectory'].X), jnp.array(data['train_trajectory'].Y), data['train_trajectory'].R, data['train_trajectory'].day_flags
+    # X, Y, R, day_flags = jnp.array(data['train_trajectory'].X), jnp.array(data['train_trajectory'].Y), data['train_trajectory'].R, data['train_trajectory'].day_flags
+    X, Y, R, day_flags = jnp.array(data['trajectory'].X), jnp.array(data['trajectory'].Y), data['trajectory'].R, data['trajectory'].day_flags
     if args.model_class == "QLearning" and ('stimIntensity' not in regressors):
         X = X[:, 1] - X[:, 0]
     dict = {'X': X, 'Y': Y, 'R': R, 'day_flags': day_flags}
@@ -366,7 +476,8 @@ if __name__=='__main__':
     params = parameters.array_to_params(params_name, params_array, lengths)
     logging.info(f"Loaded params: {params}")
 
-    evaluate_model(args, model, params, X, Y, R, day_flags)
-    # sys.exit()
+    evaluate_model(args, model, params, X, Y, R, day_flags, held_out_trials = data['held_out_trials'])
 
     generate_all_prior_trajectories(args, model, params, X, Y, R, day_flags, use_posterior_latents=True)
+
+    decompose_learning_noise(args, model, params, X, Y, R, day_flags)
