@@ -67,7 +67,7 @@ class ParamsQLearning(NamedTuple):
     log_sigma: float = -3.0
     log_sigma_day: float = -2.0
     log_alpha: float = -5.0
-    beta: float = 1.0
+    log_temp: float = 0.0
 
 class ParamsGLMBaseLearn(NamedTuple):
     log_sigma: Union[float, ParameterProperties]
@@ -90,6 +90,21 @@ class ParamsAC(NamedTuple):
     log_sigma_day: float = -2.0
     log_Q: jnp.ndarray = jnp.array([-4.0])
 
+class ParamsRVBF(NamedTuple):
+    log_sigma: Union[float, jnp.ndarray]
+    log_sigma_day: Union[float, jnp.ndarray]
+    log_alpha: Union[float, jnp.ndarray]
+    log_Q: jnp.ndarray
+    baseline: Union[float, jnp.ndarray]
+
+class ParamsTimeVarRVBF(NamedTuple):
+    log_sigma: Union[float, jnp.ndarray]
+    log_sigma_day: Union[float, jnp.ndarray]
+    log_alpha: Union[float, jnp.ndarray]
+    log_Q: jnp.ndarray
+    baseline: Union[float, jnp.ndarray]
+    beta_0: Union[float, jnp.ndarray] = 0.0
+    log_sigma_0: float = -5.0
 
 def handle_none_params(func):
     def wrapper(self, *args, params=None, **kwargs):
@@ -143,6 +158,35 @@ def get_param_name(model_repr) -> str:
         return f"Params{match.group(1)}"
     return None
 
+def label_to_parameterclass(name: str) -> NamedTuple:
+    name = name.lower()
+    if name == 'ac':
+        return ParamsAC
+    elif name == 'glmbaselearn':
+        return ParamsGLMBaseLearn
+    elif name == 'glmhmmlearn':
+        return ParamsGLMHMMLearn
+    elif name == 'glminterplearn':
+        return ParamsGLMInterpLearn
+    elif name == 'glmreglearn':
+        return ParamsGLMRegLearn
+    elif name == 'glmlearn':
+        return ParamsGLMLearn
+    elif name == 'psytrack':
+        return ParamsPsytrack
+    elif name == 'timevarglmlearn':
+        return ParamsTimeVarGLMLearn
+    elif name == 'dynamicglmhmm':
+        return ParamsDynamicGLMHMM
+    elif name == 'qlearning':
+        return ParamsQLearning
+    elif name == 'rvbf':
+        return ParamsRVBF
+    else:
+        raise ValueError(f"Unknown parameter class name: {name}")
+
+def get_params_labels(name: str) -> List[str]:
+    return label_to_parameterclass(name)._fields
 
 class GLMLearn_():
     def __init__(self, log_sigma: float=-1.0, alpha: float=0.0, not_trainable: list=[]) -> None:
@@ -180,4 +224,7 @@ if __name__=='__main__':
     # print(params.from_array(params_array, lengths))
 
     print(array_to_params(params, params_array, lengths))
+
+    print("Attributes of ParamsGLMLearn:", ParamsGLMLearn._fields)
+    # print(get_param_name("ParamsGLMLearn(log_sigma=0.0, log_alpha=0.0)"))
 
