@@ -380,10 +380,10 @@ def find_initial(
         log_alphas = jnp.linspace(-10.0, -1.0, 8)
         grid_points = jnp.stack(jnp.meshgrid(log_alphas, log_sigmas, log_qs, betas), axis=-1).reshape(-1,4)
     elif isinstance(model, models.AC):
-        log_alphas = jnp.linspace(-8.0, -2.0, 8)
+        log_alphas = jnp.linspace(-8.0, -2.0, 6)
         log_sigmas = jnp.linspace(-8.0, -3.0, 6)
-        logit_betas = jnp.linspace(-5.0, 5.0, 8)
-        grid_points = jnp.stack(jnp.meshgrid(log_alphas, log_sigmas, logit_betas), axis=-1).reshape(-1,3)
+        logit_betas = jnp.linspace(-5.0, 5.0, 6) if model.sigmoid else jnp.linspace(-1.0, 1.0, 6)
+        grid_points = jnp.stack(jnp.meshgrid(log_alphas, log_sigmas, logit_betas, log_sigmas), axis=-1).reshape(-1,4)
     elif isinstance(model, models.GLMRegLearn):
         log_alphas = jnp.linspace(-10.0, -1.0, 8)
         log_sigmas = jnp.linspace(-8.0, -3.0, 6)
@@ -392,10 +392,11 @@ def find_initial(
         gammas = jnp.array([0., 1.])
         grid_points = jnp.stack(jnp.meshgrid(log_alphas, log_sigmas, baselines, betas, gammas), axis=-1).reshape(-1,5)
     elif isinstance(model, models.QLearning):
-        log_alphas = jnp.linspace(-8.0, -2.0, 8)
-        log_sigmas = jnp.linspace(-8.0, -3.0, 6)
+        log_alphas = jnp.linspace(-8.0, -2.0, 6)
+        log_sigmas = jnp.linspace(-8.0, -3.0, 4)
         percept_log_scales = jnp.linspace(-3.0, 0.0, 6)
-        grid_points = jnp.stack(jnp.meshgrid(log_alphas, log_sigmas, percept_log_scales), axis=-1).reshape(-1,3)
+        log_temps = jnp.linspace(-2.0, 3.0, 6)
+        grid_points = jnp.stack(jnp.meshgrid(log_alphas, log_sigmas, percept_log_scales, log_temps), axis=-1).reshape(-1,4)
     elif isinstance(model, models.GLMBaseLearn):
         log_alphas = jnp.linspace(-8.0, -2.0, 8)
         log_sigmas = jnp.linspace(-8.0, -3.0, 6)
@@ -406,6 +407,20 @@ def find_initial(
         log_sigma = jnp.linspace(-8.0, 2.0, 8)
         alpha = jnp.linspace(0, 3, 8)
         grid_points = jnp.stack(jnp.meshgrid(log_sigma, alpha), axis=-1).reshape(-1,2)
+    elif isinstance(model, models.RVBF):
+        log_alphas = jnp.linspace(-8.0, -2.0, 6)
+        log_sigmas = jnp.linspace(-8.0, -3.0, 5)
+        log_sigma_days = jnp.linspace(-5.0, -2.0, 3)
+        log_qs = jnp.linspace(-9.0, -4.0, 3)
+        baselines = jnp.array([-1.0, 0.0, 1.0])
+        grid_points = jnp.stack(jnp.meshgrid(log_alphas, log_sigmas, log_sigma_days, log_qs, baselines), axis=-1).reshape(-1,5)
+    elif isinstance(model, models.TimeVarRVBF):
+        log_alphas = jnp.linspace(-8.0, -2.0, 6)
+        log_sigmas = jnp.linspace(-8.0, -4.0, 5)
+        log_sigma_days = jnp.linspace(-5.0, -3.0, 3)
+        log_sigmas_0 = jnp.linspace(-8.0, -4.0, 5)
+        baselines = jnp.array([-1.0, 0.0, 1.0])
+        grid_points = jnp.stack(jnp.meshgrid(log_alphas, log_sigmas, log_sigma_days, log_sigmas_0, baselines), axis=-1).reshape(-1,5)
     else:
         log_sigmas = jnp.linspace(-8.0, -3.0, 8)
         log_sigma_days = jnp.linspace(-5.0, -2.0, 5)
@@ -452,9 +467,9 @@ def find_initial(
                 log_alpha=log_alpha, log_sigma=log_sigma, log_sigma_day=log_sigma_day, 
                 Q=jnp.zeros((d+1,)),)
         elif isinstance(model, models.QLearning):
-            log_alpha, log_sigma, percept_log_scale = params_array
+            log_alpha, log_sigma, percept_log_scale, log_temp = params_array
             params = parameters.ParamsQLearning(
-                log_alpha=log_alpha, log_sigma=log_sigma, percept_log_scale=percept_log_scale
+                log_alpha=log_alpha, log_sigma=log_sigma, percept_log_scale=percept_log_scale, log_temp=log_temp,
             )
         elif isinstance(model, models.GLMBaseLearn):
             log_alpha, log_sigma, log_sigma_day, beta = params_array
@@ -463,21 +478,40 @@ def find_initial(
             log_sigma, alpha = params_array
             params = parameters.ParamsDynamicGLMHMM(log_sigma=log_sigma, alpha=alpha)
         elif isinstance(model, models.AC):
-            log_alpha, log_sigma, beta_0 = params_array
+            log_alpha, log_sigma, beta_0, log_sigma_0 = params_array
             log_alpha_val = log_alpha * jnp.ones((d+1,)) if vector_alpha else log_alpha
             # beta_0 = jnp.zeros((d+1,)) if vector_alpha else 0.0
             beta_0_val = beta_0 * jnp.ones((d+1,))
             log_q = -9.0
             params = parameters.ParamsAC(
-                beta_0=beta_0_val, log_alpha=log_alpha_val, log_sigma_0=log_sigma, log_sigma=log_sigma, log_sigma_day=-3.0,
+                beta_0=beta_0_val, log_alpha=log_alpha_val, log_sigma_0=log_sigma_0, log_sigma=log_sigma, log_sigma_day=-3.0,
                 log_Q=log_q * jnp.ones((d+1,))
+            )
+        elif isinstance(model, models.RVBF):
+            log_alpha, log_sigma, log_sigma_day, log_q, baseline = params_array
+            log_alpha_val = log_alpha * jnp.ones((d+1,)) if vector_alpha else log_alpha
+            baseline_val = baseline * jnp.ones((d+1,)) if vector_alpha else baseline
+            log_sigma = log_sigma * jnp.ones((d+1,)) if vector_alpha else log_sigma
+            log_sigma_day = log_sigma_day * jnp.ones((d+1,)) if vector_alpha else log_sigma_day
+            params = parameters.ParamsRVBF(
+                log_alpha=log_alpha_val, log_sigma=log_sigma, log_sigma_day=log_sigma_day, log_Q=log_q * jnp.ones((d+1,)), baseline=baseline_val
+            )
+        elif isinstance(model, models.TimeVarRVBF):
+            log_alpha, log_sigma, log_sigma_day, log_sigma_0, baseline = params_array
+            log_alpha_val = log_alpha * jnp.ones((d+1,)) if vector_alpha else log_alpha
+            baseline_val = baseline * jnp.ones((d+1,)) if vector_alpha else baseline
+            log_sigma = log_sigma * jnp.ones((d+1,)) if vector_alpha else log_sigma
+            log_sigma_day = log_sigma_day * jnp.ones((d+1,)) if vector_alpha else log_sigma_day
+            log_q = -5.0
+            params = parameters.ParamsTimeVarRVBF(
+                log_alpha=log_alpha_val, log_sigma=log_sigma, log_sigma_day=log_sigma_day, log_Q=log_q * jnp.ones((d+1,)), 
+                baseline=baseline_val, log_sigma_0=log_sigma_0, 
             )
         else:
             log_alpha, log_sigma, log_sigma_day = params_array
             log_alpha_val = log_alpha * jnp.ones((d+1,)) if vector_alpha else log_alpha
             params = ParamsGLMLearn(log_alpha=log_alpha_val, log_sigma=log_sigma, log_sigma_day=log_sigma_day)#, p=p)
         return params
-    
     
     logging.info(f"Memory available: {psutil.virtual_memory().available/1e6} MB")
 
@@ -493,10 +527,6 @@ def find_initial(
                 key, params, _X, _Y, R=_R, day_flags=_day_flags,
                 N_particles=N_particles,
             )
-            # _loglik = model.filtering_MLL(
-            #     key, params, _X, _Y, R=_R, day_flags=_day_flags,
-            #     N_particles=N_particles,
-            # )
             loglik += _loglik
         return -loglik
     
@@ -541,8 +571,8 @@ def find_initial(
 def fit_optax(
         model,
         X: List[jnp.ndarray], Y: List[jnp.ndarray], R: List[jnp.ndarray], day_flags: List[jnp.ndarray],
-        n_iters: int=200, N_particles: int=10000, 
-        seed: int=0, initial_params: Optional[dict] = None,
+        n_iters: int=200, N_particles: int=1000, 
+        seed: int=0, initial_params: Optional[dict] = None, correct_bias=True,
         ):
     '''
     Fit model via optimization of the marginal log-likelihood (MLL) using optax. 
@@ -676,7 +706,7 @@ def fit_optax(
             best_val_per_subject[subject_id] = val
             best_params_per_subject[subject_id] = params
 
-        logging.info(f'[{i}] Subject {subject_id}, LL: {val:.2f}, L per trial: {jnp.exp(val/len(Y[subject_id])):.4f}, params: {params}')
+        logging.info(f'[{i}] Subject {subject_id}, LL: {val:.4f}, L per trial: {jnp.exp(val/len(Y[subject_id])):.4f}, params: {params}')
         # if i % 10 == 0:
         #     evaluate(params)
             # logging.info(f'[{i}] \t2step score: {evaluate(params):.4f}')
@@ -688,15 +718,32 @@ def fit_optax(
         # updates = updates._replace(log_sigma=0.0)
         params = optax.apply_updates(params, updates)
 
-        if i % 20 == 0 and not isinstance(model, models.QLearning):
-            Zs, _ = model.posterior_samples(
-                key, params, 
+        if i % 20 == 0:
+            # if not isinstance(model, models.QLearning): # not implemented for Q-learning
+            #     Zs, _ = model.posterior_samples_scan(
+            #         key, params, 
+            #         X[subject_id], Y[subject_id], R[subject_id], day_flags[subject_id],
+            #         N_particles=N_particles, verbose=False, correct_bias=correct_bias,
+            #         )
+            #     Z = Zs.mean(0)
+            #     noise_component = compute_noise_component(params, Z, subject_id)
+            #     logging.info(f'[{i}] Noise component norm: {jnp.linalg.norm(noise_component):.2f}')
+
+            # Forward pass liks and predicitions
+
+            _, forward_loglik = model.forward_pass(
+                key, params,
                 X[subject_id], Y[subject_id], R[subject_id], day_flags[subject_id],
-                N_particles=N_particles, verbose=False, LAG=True
-                )
-            Z = Zs.mean(0)
-            noise_component = compute_noise_component(params, Z, subject_id)
-            logging.info(f'[{i}] Noise component norm: {jnp.linalg.norm(noise_component):.2f}')
+                N_particles=N_particles, predict_Y=False, correct_bias=correct_bias,
+            )
+            logging.info(f'[{i}] Forward pass loglik: {forward_loglik:.2f}, L per trial: {jnp.exp(forward_loglik/len(Y[subject_id])):.4f}')
+
+            _, prediction_loglik = model.forward_pass(
+                key, params,
+                X[subject_id], Y[subject_id], R[subject_id], day_flags[subject_id],
+                N_particles=N_particles, predict_Y=True, correct_bias=correct_bias,
+            )
+            logging.info(f'[{i}] Prediction loglik: {prediction_loglik:.2f}, L per trial: {jnp.exp(prediction_loglik/len(Y[subject_id])):.4f}')
 
 
         # if opt_state[1].lr != lr_scale:
@@ -766,8 +813,6 @@ def plot_landscape(X, Y, R=None, model_kwargs={}, seed=0, N_particles=10000, day
 
     # Compute neg MLL over grid
     grid_points = jnp.stack(jnp.meshgrid(logsigmas, logsigma_days, alphas), axis=-1).reshape(-1,3)
-    # grid_points = jnp.array([grid_points[:,0], jnp.ones_like(grid_points[:,0])*-2.0, grid_points[:,1]]).T
-    # grid_points = pairs_to_triples(grid_points)
     vals = jax.vmap(neg_MLL)(grid_points)
 
     # for i, val in enumerate(vals):
@@ -877,21 +922,15 @@ def posterior_mcmc(
         params_array, log_fx, best_log_fx, best_params_array = carry
         key = inputs
         key, proposal_key, accept_key, eval_key = jax.random.split(key, 4)
-        # jax.debug.print('---- = {}', None)
 
         # Proposal step
         params_array_prop = proposal(params_array).sample(seed=proposal_key)
-        # jax.debug.print("diff prop = {}", params_array_prop - params_array)
 
         # Acceptance step
         log_fx_prop = log_target_func(params_array_prop, eval_key)
-        # jax.debug.print('log_fx_prop diff = {}', log_fx_prop - log_fx)
 
         log_ratio = log_fx_prop - log_fx
         accept = jnp.log(jax.random.uniform(accept_key)) < log_ratio
-        # jax.debug.print('accept = {}', accept)
-
-        # jax.debug.print('params_array_prop shape = {}', params_array.shape)
 
         params_array = jnp.where(accept[:, None], params_array_prop, params_array)
         log_fx = jnp.where(accept, log_fx_prop, log_fx)
@@ -925,7 +964,7 @@ def posterior_mcmc(
             med_params = array_to_params(jnp.median(MH_state[0], axis=0))
             logging.info(f"[{i}/{n_iters}] Med params: {med_params}, accept frac: {accepts.sum()/N_samples:.4f}")
             logging.info(f"CI: {jnp.percentile(MH_state[0], q=jnp.array([2.5, 97.5]), axis=0).T}")
-            logging.info(f"Marginal log prob estimate: {log_fx.mean():.4f}")
+            logging.info(f"Marginal log prob estimate: {MH_state[1].mean():.4f}")
 
         all_accepts.append(accepts)
         log_lik_samples.append(MH_state[1])
@@ -985,7 +1024,7 @@ if __name__=='__main__':
     parser.add_argument("-N", "--N-particles", type=int, default=1000, 
                         help="Number of particles for SMC.")
     parser.add_argument("--model-class", type=str, default="GLMLearn", 
-                        choices=["GLMLearn", "TimeVarGLMLearn", "Psytrack", "GLMRegLearn", "GLMHMMLearn", "GLMInterpLearn", "QLearning", "GLMBaseLearn", 'DynamicGLMHMM', "AC"],
+                        choices=["GLMLearn", "TimeVarGLMLearn", "Psytrack", "GLMRegLearn", "GLMHMMLearn", "GLMInterpLearn", "QLearning", "GLMBaseLearn", 'DynamicGLMHMM', "AC", "RVBF", "TimeVarRVBF"],
                         help="Model class to use for fitting.")
     parser.add_argument("--vector-alpha", action='store_true',
                         help="Use vector alpha for GLM.")
@@ -993,29 +1032,18 @@ if __name__=='__main__':
                         help="lapse for timevar GLM")
     parser.add_argument("--EM", action='store_true', default=False,
                         help="Use EM for inference. Default is to use optimization of MLL.")
+    parser.add_argument("--regressors", type=str, nargs='+', default=['contrastLeft', 'contrastRight', 'previousChoice', 'previousRewarded'],
+                        help="Regressors to use for the model.")
+    parser.add_argument("--modulator", type=str, default='lr', choices=['lr', 'baseline'],
+                        help="Modulator for the TimeVarRVBF model.")
+    parser.add_argument("--protocol", type=str, default='training', choices=['training', 'no_curriculum'],
+                        help="Protocol of the IBL mouse data. See `ibl.py' for details.")
 
     # Parse the command-line arguments
     args = parser.parse_args()
     logging.info(f"Arguments: {args}")
 
-    # if args.model_class == "GLMLearn":
-    #     model = models.GLMLearn(learning_rule=args.learning_rule)
-    # elif args.model_class == "TimeVarGLMLearn":
-    #     model = models.TimeVarGLMLearn(learning_rule=args.learning_rule, lapse=args.lapse, beta_dim=0)
-    # elif args.model_class == "Psytrack":
-    #     model = models.Psytrack()
-    # elif args.model_class == "GLMRegLearn":
-    #     args.learning_rule = 'regression_gradient'
-    #     model = models.GLMRegLearn(learning_rule='regression_gradient')
-    # elif args.model_class == "GLMHMMLearn":
-    #     model = models.GLMHMMLearn(learning_rule=args.learning_rule)
-    # elif args.model_class == "GLMInterpLearn":
-    #     model = models.GLMInterpLearn(learning_rule="interp_gradient")
-    # else:
-    #     raise ValueError(f"Model class {args.model_class} not recognized.")
     model = fit_utils.load_model(args)
-    # model = models.GLMHMMLearn(learning_rule=args.learning_rule)
-
 
     try:
         # Override subject index with SLURM array task ID
@@ -1029,7 +1057,7 @@ if __name__=='__main__':
 
     # Load IBL data
     # regressors = ['stimIntensity']
-    regressors = ['contrastLeft', 'contrastRight', 'previousChoice', 'previousRewarded'] #'stimIntensity',
+    regressors = args.regressors # ['contrastLeft', 'contrastRight', 'previousChoice', 'previousRewarded'] #'stimIntensity',
 
     X_train, Y_train, R_train, day_flags_train = [], [], [], []
     X_full, Y_full, R_full, day_flags_full = [], [], [], []
@@ -1050,6 +1078,7 @@ if __name__=='__main__':
             'regressors': regressors,
             'learning_rule': args.learning_rule,
             'seed': seed,
+            'protocol': args.protocol,
         }
         loader = ibl.IBLSingleTrajectoryLoader(loader_params)
         train_trajectory = loader.load_train_data()
@@ -1064,7 +1093,7 @@ if __name__=='__main__':
         day_flags_train.append(train_trajectory.day_flags)
 
         trajectory, held_out_trials = loader.load_test_data()
-        if args.model_class == "QLearning":
+        if args.model_class == "QLearning" and ('stimIntensity' not in regressors):
             X_full.append(trajectory.X[:, 1] - trajectory.X[:, 0])
         else:
             X_full.append(trajectory.X)
@@ -1082,26 +1111,25 @@ if __name__=='__main__':
         beta_dim = len(regressors) + 1
         model.beta_dim = beta_dim
         model.latent_dim = len(regressors) + beta_dim + 1
+        model.reward_func = ibl.format_reward_function(regressors, learning_rule='reinforce')
         logging.info(f"Model latent dim: {model.latent_dim}, beta dim: {beta_dim}")
     elif isinstance(model, models.GLMHMMLearn):
         model.latent_dim = len(regressors) + 1
+    elif isinstance(model, models.TimeVarRVBF):
+        model.modulator = args.modulator
+        if model.modulator == 'lr':
+            beta_dim = 1
+        elif model.modulator == 'baseline':
+            beta_dim = len(regressors) + 1
+        model.beta_dim = beta_dim
+        model.latent_dim = len(regressors) + beta_dim + 1
+        model.reward_func = ibl.format_reward_function(regressors, learning_rule='reinforce')
+        logging.info(f"Model latent dim: {model.latent_dim}, beta dim: {beta_dim}")
     else:
         model.latent_dim = len(regressors) + 1
+        model.reward_func = ibl.format_reward_function(regressors, learning_rule=args.learning_rule)
 
     logging.info(f"Model: {model}")
-
-    # # ----------------------------------------------------------------
-
-    # params_prop = parameters.ParamsGLMRegLearn(
-    #     log_alpha=-5.0, log_sigma=-5.0, log_sigma_day=-2.0,
-    #     Q=0.1*jnp.ones((len(regressors)+1,)), A=jnp.zeros((len(regressors)+1,)), kappa=0.0, gamma=1.0, beta=0.0
-    # )
-    # mll = 0.
-    # for X_sub, Y_sub, R_sub, day_flags_sub in zip(X_train, Y_train, R_train, day_flags_train):
-    #     mll_sub = model.marginal_log_likelihood(key, params_prop, X_sub, Y_sub, R_sub, day_flags_sub, args.N_particles)
-    #     print(mll_sub)
-    #     mll += mll_sub
-    # sys.exit()
 
     # ----------------------------------------------------------------
 
@@ -1110,29 +1138,6 @@ if __name__=='__main__':
     logging.info('Starting fitting.')
     logging.info("-"*80)
     logging.info('Step 1: Grid search for initialization.')
-    # if args.model_class=='GLMRegLearn':
-    #     if args.lab == 'churchlandlab':
-    #         initial_params = parameters.ParamsGLMRegLearn(
-    #             log_sigma=-3.2918177, log_sigma_day=-0.5843039, log_alpha=-7.4775195, 
-    #             log_Q=jnp.array([-1.0949459 , -0.9147258 , -1.2326078 , -5.773313  ,  0.22863653]), 
-    #             A=jnp.array([1.1391435 , 0.14701512, 1.1840682 , 1.922756  , 1.5582631 ]), 
-    #             kappa=-0.5811514, gamma=5.236843, beta=2.9526005
-    #             )
-    #     elif args.lab == 'angelakilab':
-    #         initial_params = parameters.ParamsGLMRegLearn(
-    #             log_sigma=-2.9640515, log_sigma_day=-0.4096092, log_alpha=-6.9554944, 
-    #             log_Q=jnp.array([-1.3152139 , -2.2668571 , -2.188151  ,  0.6743673 ,  0.46285427]), 
-    #             A=jnp.array([ 0.92911386,  1.571796  , -2.522617  ,  0.7491756 , -0.414231  ]), 
-    #             kappa=0.3793468, gamma=6.666929, beta=0.9958925
-    #             )
-    #     else:
-    #         initial_params = parameters.ParamsGLMRegLearn( # From fit over all subjects, wittenlab
-    #             log_sigma=-3.9975085, log_sigma_day=-1.1263875, log_alpha=-7.400881, 
-    #             log_Q=jnp.array([-1.983385 , -3.3855224, -2.104853 , -5.3707175, -3.882742 ]), 
-    #             A=jnp.array([ 0.19803199, -0.83782893,  0.52024233,  0.6252689 , -0.20578817]), 
-    #             kappa=0.00834371, gamma=4.356594, beta=1.7858037
-    #             )
-    # else:
     top_gridsearch_params = find_initial(
         model,
         X_train, Y_train, R=R_train, day_flags=day_flags_train,
@@ -1141,6 +1146,7 @@ if __name__=='__main__':
         vector_alpha=args.vector_alpha, vmap=True
         )
     initial_params = top_gridsearch_params[0]
+    # initial_params = top_gridsearch_params[-1]
 
     # Step 2
 
@@ -1159,7 +1165,7 @@ if __name__=='__main__':
         model,
         X_train, Y_train, R=R_train, day_flags=day_flags_train, 
         N_particles=args.N_particles,
-        initial_params=initial_params, n_iters=400,
+        initial_params=initial_params, n_iters=100,
         )
     logging.info(f'Final params: {optax_final_params}')
     for sub in range(len(X_train)):
@@ -1227,12 +1233,26 @@ if __name__=='__main__':
             )
         logging.info(f"Complete trajectory 'marginal_log_likelihood': {loglik:.2f}, per trial: {loglik/len(Y_full[0]):.4f}, L per trial: {jnp.exp(loglik/len(Y_full[0])):.4f}")
 
-        loglik_filter = model.filtering_MLL(
-            key, eval_params, 
+        # loglik_filter = model.filtering_MLL(
+        #     key, eval_params, 
+        #     X_full[0], Y_full[0], R=R_full[0], day_flags=day_flags_full[0],
+        #     N_particles=args.N_particles
+        #     )
+        # logging.info(f"Filtering (prior predictive) log-likelihood: {loglik_filter:.2f}, per trial: {loglik_filter/len(Y_full[0]):.4f}, L per trial: {jnp.exp(loglik_filter/len(Y_full[0])):.4f}")
+
+        _, forward_loglik = model.forward_pass(
+            key, params,
             X_full[0], Y_full[0], R=R_full[0], day_flags=day_flags_full[0],
-            N_particles=args.N_particles
-            )
-        logging.info(f"Filtering (prior predictive) log-likelihood: {loglik_filter:.2f}, per trial: {loglik_filter/len(Y_full[0]):.4f}, L per trial: {jnp.exp(loglik_filter/len(Y_full[0])):.4f}")
+            N_particles=args.N_particles, predict_Y=False,
+        )
+        logging.info(f'Forward pass (prior predictive, use Y) loglik: {forward_loglik:.2f}, L per trial: {jnp.exp(forward_loglik/len(Y_full[0])):.4f}')
+
+        _, prediction_loglik = model.forward_pass(
+            key, params,
+            X_full[0], Y_full[0], R=R_full[0], day_flags=day_flags_full[0],
+            N_particles=args.N_particles, predict_Y=True
+        )
+        logging.info(f'Prediction (prior predictive, sample Y) loglik: {prediction_loglik:.2f}, L per trial: {jnp.exp(prediction_loglik/len(Y_full[0])):.4f}')
 
         if not isinstance(model, models.QLearning):
             Zs, loglik2 = model.posterior_samples(
@@ -1249,7 +1269,7 @@ if __name__=='__main__':
                 )[1])(jnp.arange(len(X_full[0])))
             # learning_updates = learning_updates.mean(1)
 
-            if isinstance(model, models.TimeVarGLMLearn) or isinstance(model, models.AC):
+            if isinstance(model, models.TimeVarGLMLearn) or isinstance(model, models.AC) or isinstance(model, models.TimeVarRVBF):
                 _, w_post = model.split_latent(Z)
             else:
                 w_post = Z
