@@ -42,14 +42,21 @@ def load_IBL_behavioral_data(protocol: str='training') -> Tuple[pd.DataFrame, li
     '''
     from one.api import ONE
     ONE.setup(base_url='https://openalyx.internationalbrainlab.org', silent=True)
+    ONE.cache_clear()
     one = ONE(password='international')
 
-    # Select only the subjects that moved to biasedChoiceWorld
-    _, infos_biasedCW = one.search(task_protocol='biasedChoiceWorld', details=True)
-    subjects = np.unique([info['subject'] for info in infos_biasedCW])
+    if protocol == 'no_curriculum':
+        # Select the eids associated with '2024_Q3_Pan_Vazquez_et_al' tag
+        one.load_cache(tag='2024_Q3_Pan_Vazquez_et_al')
 
-    # Get eids and infos for these subjects
-    eids, infos = one.search(subject=subjects, task_protocol=protocol, details=True)
+        eids, infos = one.search(details=True)
+    else:
+        # Select only the subjects that moved to biasedChoiceWorld
+        _, infos_biasedCW = one.search(task_protocol='biasedChoiceWorld', details=True)
+        subjects = np.unique([info['subject'] for info in infos_biasedCW])
+
+        # Get eids and infos for these subjects
+        eids, infos = one.search(subject=subjects, task_protocol=protocol, details=True)
 
     # Select keys for trial data that are not time dependent (e.g. 'goCue_times')
     keys = ['contrastLeft', 'contrastRight', 'choice', 'probabilityLeft', 'feedbackType', 'rewardVolume']
@@ -85,13 +92,15 @@ def load_IBL_behavioral_data(protocol: str='training') -> Tuple[pd.DataFrame, li
     entries_df = pd.DataFrame(entries)
     entries_df = entries_df.fillna(0) # NaNs are on the contrast information, which is 0 when not present
     
-    if protocol == 'training':
-        # Remove the animals that loaded with errors on some sessions in their training data.
-        # This removed 38/100 amimals, 347037/1171032 trials (30 %)
-        error_animal_ids = np.unique(error_animals)
-        logger.warning(f'WARNING: removing {len(error_animal_ids)} animals with trial loading errors.')
-        entries_df = entries_df[~entries_df['subject'].isin(error_animal_ids)]
-    
+    # Remove the animals that loaded with errors on some sessions in their training data.
+    # This removed 38/100 amimals, 347037/1171032 trials (30 %)
+    error_animal_ids = np.unique(error_animals)
+    logger.warning(f'WARNING: removing {len(error_animal_ids)} animals with trial loading errors.')
+    entries_df = entries_df[~entries_df['subject'].isin(error_animal_ids)]
+
+    # Sort by date and session for per animal
+    entries_df = entries_df.sort_values(by=['subject', 'date', 'session'], ignore_index=True)
+
     return entries_df, error_animals
 
 def format_IBL_behavioral_data(df: pd.DataFrame) -> pd.DataFrame:
@@ -346,22 +355,21 @@ class IBLSingleTrajectoryLoader():
         regressors = params['regressors']
         learning_rule = params['learning_rule']
         seed = params['seed']
+        protocol = params.get('protocol', 'training')
 
         self.data = {}
 
         # Load IBL data
         if DOWNLOAD:
-            protocol = 'training'
             df, _ = load_IBL_behavioral_data(protocol)
-            df.to_csv(f'IBL_{protocol}_protocol.csv', index=False)
-            df = format_IBL_behavioral_data(df)
+            df.to_csv(f'data/IBL_{protocol}_protocol.csv', index=False)
         else:
             try:
-                df = pd.read_csv(HOMEDIR + 'data/IBL_training_protocol.csv')
+                df = pd.read_csv(HOMEDIR + f'data/IBL_{protocol}_protocol.csv')
             except FileNotFoundError:
-                logger.error("IBL training protocol data not found. Use DOWNLOAD=True to download the data from the ONE api.")
+                logger.error(f"IBL '{protocol}' protocol data not found. Expected in {HOMEDIR+'data/'}. Use DOWNLOAD=True to download the data from the ONE api.")
                 sys.exit(1)
-            df = format_IBL_behavioral_data(df)
+        df = format_IBL_behavioral_data(df)
 
         assert lab in np.unique(df['lab'].values), f"Lab {lab} not found in data."
         lab_df = df[df['lab']==lab]
@@ -437,37 +445,64 @@ def trajectory_length(lab, subject_id):
     data = loader.load_data()
     return len(data['trajectory'].X)
 
+
 if __name__=='__main__':
     HOMEDIR = '/home/vg0233/PillowLab/LearningRules/'
     logging.warning(f"Y_L and Y_R are set to {Y_L} and {Y_R} as global variables.")
 
-    df = pd.read_csv(HOMEDIR + 'data/IBL_training_protocol.csv')
-    num_unique_animals = df['subject'].nunique()
-    print(f"Number of unique animals: {num_unique_animals}")
+    # df = pd.read_csv(HOMEDIR + 'data/IBL_training_protocol.csv')
+    # num_unique_animals = df['subject'].nunique()
+    # print(f"Number of unique animals: {num_unique_animals}")
 
-    # Print all lengths of trajectories
-    all_n_sessions = []
-    for lab in np.unique(df['lab'].values):
-        for subject_id in range(get_number_subjects(lab)):
-            try:
-                N_sessions = len(load_session_indices(lab, subject_id))
-                print(f"Number of sessions for {lab} subject {subject_id}: {N_sessions}")
-                all_n_sessions.append(N_sessions)
-            except:
-                print(f"Error loading data for {lab} subject {subject_id}.")
-    print(all_n_sessions)
-    # jnp.save(HOMEDIR + 'data/IBL_trajectory_lengths.npy', jnp.array(all_n_sessions))
+    # # Print all lengths of trajectories
+    # all_n_sessions = []
+    # for lab in np.unique(df['lab'].values):
+    #     for subject_id in range(get_number_subjects(lab)):
+    #         try:
+    #             N_sessions = len(load_session_indices(lab, subject_id))
+    #             print(f"Number of sessions for {lab} subject {subject_id}: {N_sessions}")
+    #             all_n_sessions.append(N_sessions)
+    #         except:
+    #             print(f"Error loading data for {lab} subject {subject_id}.")
+    # print(all_n_sessions)
+    # # jnp.save(HOMEDIR + 'data/IBL_trajectory_lengths.npy', jnp.array(all_n_sessions))
 
+    df = pd.read_csv(HOMEDIR + 'data/IBL_no_curriculum_protocol.csv')
+    # print(df.sort_values(by=['subject', 'date', 'session'], ignore_index=True))
+
+    # first_subject = df['subject'].values[0]
+    # df_first_subject = df[df['subject'] == first_subject]
+    # print(df_first_subject)
+    # print(df_first_subject.sort_values(by=['date', 'session'], ascending=[True, True], ignore_index=True))
+
+    for subject in df['subject'].unique():
+        df_subject = df[df['subject'] == subject]
+        
+        # Check that sorted and unsorted are the same
+        df_sorted = df_subject.sort_values(by=['date', 'session'], ascending=[True, True], ignore_index=True)
+        test = np.array_equal(df_subject.values, df_sorted.values)
+        if test:
+            print(f"Data for subject {subject} is sorted.")
+        else:
+            print(f"Data for subject {subject} is NOT sorted.")
+
+    # subject_id = 0
     # loader = IBLSingleTrajectoryLoader(
     #     params ={
     #     'lab': 'wittenlab',
-    #     'subject_id': 1,
-    #     'regressors': ['stimIntensity', 'previousChoice', 'previousRewarded'],
-    #     'learning_rule': 'policy_gradient',
-    #     'seed': 0
+    #     'subject_id': subject_id,
+    #     'regressors': ['contrastLeft', 'contrastRight',  'previousChoice', 'previousRewarded'],
+    #     'learning_rule': 'reinforce',
+    #     'seed': 0,
+    #     'protocol': 'no_curriculum',
     #     }, 
     #     DOWNLOAD=False
     #     )
-    
-    # data = loader.load_data()
-    # print(data)
+    # for subject_id in range(30):
+        
+    #     data = loader.load_data()
+
+    #     # Print running average of R
+    #     T = len(data['trajectory'].Y)
+    #     running_avg = np.convolve(data['trajectory'].R, np.ones(int(T/10))/int(T/10), mode='valid')
+    #     print(running_avg[::int(T/10)])
