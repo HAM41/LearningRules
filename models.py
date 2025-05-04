@@ -1005,7 +1005,7 @@ class GLMLearn():
         return f"GLMLearn({self.learning_rule})"
         
     def decision(self, key: PRNGKey, w, x):
-        p_R = bernoulli_GLM_likelihood(w, x, y=Y_R)
+        p_R = self.emission_likelihood(w, x, y=Y_R)
         y = Y_vals[jax.random.bernoulli(key, p_R).astype(int)]
         return y
     
@@ -1017,7 +1017,9 @@ class GLMLearn():
             params, y=None, r=None,
             day_flag: bool=False,
             return_learning_signal=False, 
-            return_mean=False):
+            return_mean=False,
+            correct_bias=False,
+            ):
         
         # Change in mean weights from learning rule
         if self.learning_rule == 'reinforce':
@@ -1043,6 +1045,12 @@ class GLMLearn():
             jnp.multiply(jnp.exp(params.log_sigma_day), update_noise),
             jnp.multiply(jnp.exp(params.log_sigma), update_noise)
         )
+
+        # if correct_bias:
+        #     learning_signal = learning_signal.at[..., 0].set(0.0)
+        #     update_noise = update_noise.at[..., 0].set(0.0)
+        learning_signal = jnp.where(correct_bias, learning_signal.at[..., 0].set(0.0), learning_signal)
+        update_noise = jnp.where(correct_bias, update_noise.at[..., 0].set(0.0), update_noise)
         
         if return_learning_signal:
             return w + learning_signal + update_noise, learning_signal
@@ -1198,12 +1206,15 @@ class GLMLearn():
             #   Outcome: {tilde z_t^i, 1/N}, an approximation to p(z_t|y_{1:t-1})
             if t == 0:
                 tilde_z_t = self.sample_initial(subkey1, params=params, N=N_particles, d=M)
+                if correct_bias_flags[t]:
+                    tilde_z_t = self.bias_correction(tilde_z_t)
             else:
-                tilde_z_t = self.update_weights(subkey1, z_t, params=params, x=X[t-1], y=Y[t-1], r=R[t-1], day_flag=day_flags[t])
+                tilde_z_t = self.update_weights(subkey1, z_t, params=params, x=X[t-1], y=Y[t-1], r=R[t-1], 
+                                                day_flag=day_flags[t], correct_bias=correct_bias_flags[t])
             
             # Correct the non-identifiability while we have the non_one_X_flag
-            if correct_bias_flags[t]:
-                tilde_z_t = self.bias_correction(tilde_z_t)
+            # if correct_bias_flags[t]:
+            #     tilde_z_t = self.bias_correction(tilde_z_t)
 
             # 2. Evaluate importance weights p(y_t | xhat_t, V_t)
             #   Outcome: {tilde z_t^i, tilde w^i}, an approximation to p(z_t|y_{1:t})
@@ -1338,7 +1349,7 @@ class GLMLearn():
             # if correct_bias_flag:
             #     tilde_z_t = bias_correction(tilde_z_t)
             # jax.debug.print('correct_bias_flag = {}', correct_bias_flag)
-            tilde_z_t = jax.lax.select(correct_bias_flag, self.bias_correction(tilde_z_t), tilde_z_t)
+            # tilde_z_t = jax.lax.select(correct_bias_flag, self.bias_correction(tilde_z_t), tilde_z_t)
 
             # 2. Evaluate importance weights p(y_t | xhat_t, V_t)
             # tilde_w_t = self.emission_likelihood(tilde_z_t, X_t, Y_t)
@@ -1356,7 +1367,8 @@ class GLMLearn():
             log_lik += logmeanexp(log_tilde_w_t)
             
             # 1. Prediction step : tilde z_t ~ p(z_t | z_{t-1})
-            tilde_z_t = self.update_weights(subkey2, z_t, params=params, x=X_t, y=Y_t, r=R_t, day_flag=next_day_flag)
+            tilde_z_t = self.update_weights(subkey2, z_t, params=params, x=X_t, y=Y_t, r=R_t, day_flag=next_day_flag,
+                                            correct_bias=correct_bias_flag)
             
             return (t+1, tilde_z_t, log_lik, z_history), None
         
@@ -1364,7 +1376,6 @@ class GLMLearn():
         tilde_z_t = self.sample_initial(subkey, params=params, N=N_particles, d=M)
         assert self.latent_dim is not None, "Latent dimension not defined."
         z_history = jnp.zeros((N_particles, T, self.latent_dim), dtype=jnp.float32) # float16
-        carry = (0, tilde_z_t, 0., z_history)
         
         next_day_flags = jnp.roll(day_flags, shift=-1)
         subkeys = jax.random.split(key, num=(T, 2))
@@ -1373,7 +1384,11 @@ class GLMLearn():
             correct_bias_flags = jnp.cumprod(jnp.abs(X[:,1] - X[:,0]) >= 0.9).astype(bool) # True until stim intensity goes below 0.9 in abs
         else:
             correct_bias_flags = jnp.zeros(T, dtype=bool)
+        
+        if correct_bias_flags[0]:
+            tilde_z_t = self.bias_correction(tilde_z_t)
 
+        carry = (0, tilde_z_t, 0., z_history)
         inputs = (X, Y, R, next_day_flags, correct_bias_flags, subkeys)
         
         (_, _, log_lik, z_history), _ = jax.lax.scan(scan_fn, carry, inputs, length=T)
@@ -1601,8 +1616,8 @@ class GLMLearn():
                 tilde_z_t, log_lik = carry
                 X_t, Y_t, R_t, next_day_flag, correct_bias_flag, subkey = inputs
 
-                # Correct bias
-                tilde_z_t = jax.lax.select(correct_bias_flag, self.bias_correction(tilde_z_t), tilde_z_t)
+                # # Correct bias
+                # tilde_z_t = jax.lax.select(correct_bias_flag, self.bias_correction(tilde_z_t), tilde_z_t)
 
                 # Evaluate likelihood/importance weights with sampled decision
                 decision_key, update_key = jax.random.split(subkey)
@@ -1625,7 +1640,10 @@ class GLMLearn():
 
                 # Prediction step: z_t ~ p(z_t | z_{t-1})
                 z_next = jax.vmap(
-                    lambda z, y, r: self.update_weights(update_key, z, params=params, x=X_t, y=y, r=r, day_flag=next_day_flag)
+                    lambda z, y, r: self.update_weights(
+                        update_key, z, params=params, x=X_t, y=y, r=r, 
+                        day_flag=next_day_flag, correct_bias=correct_bias_flag
+                        )
                     )(z_t, Y_pred, R_pred)
                 
                 return (z_next, log_lik), (log_lik_t, z_next)
@@ -1634,8 +1652,8 @@ class GLMLearn():
                 tilde_z_t, log_lik = carry
                 X_t, Y_t, R_t, next_day_flag, correct_bias_flag, subkey = inputs
 
-                # Correct bias
-                tilde_z_t = jax.lax.select(correct_bias_flag, self.bias_correction(tilde_z_t), tilde_z_t)
+                # # Correct bias
+                # tilde_z_t = jax.lax.select(correct_bias_flag, self.bias_correction(tilde_z_t), tilde_z_t)
 
                 # Evaluate likelihood/importance weights with true decision
                 w_t = self.emission_likelihood(tilde_z_t, X_t, Y_t)
@@ -1650,7 +1668,10 @@ class GLMLearn():
                 # z_t = sample_particles_gumbel(subkey, tilde_z_t, log_w_t, N_particles)
 
                 # Prediction step: z_t ~ p(z_t | z_{t-1})
-                z_next = self.update_weights(subkey, z_t, params=params, x=X_t, y=Y_t, r=R_t, day_flag=next_day_flag)
+                z_next = self.update_weights(
+                    subkey, z_t, params=params, x=X_t, y=Y_t, r=R_t, 
+                    day_flag=next_day_flag, correct_bias=correct_bias_flag
+                    )
 
                 # jax.debug.print("log tilde w_t = {}, p = {}, log_lik = {}, tilde_z_t = {}, z_t = {}, Y_t={}, z_next = {}", log_w_t, jnp.exp(log_w_t - log_w_t.max()), log_lik_t, tilde_z_t[0], z_t[0],Y_t, z_next[0])
                 
@@ -1787,7 +1808,8 @@ class Psytrack(GLMLearn):
     def __repr__(self) -> str:
         return f"Psytrack()"
 
-    def update_weights(self, key: PRNGKey, w, x, params: ParamsPsytrack, y=None, r=None, day_flag: bool = False, return_learning_signal=False):
+    def update_weights(self, key: PRNGKey, w, x, params: ParamsPsytrack, y=None, r=None, day_flag: bool = False, 
+                       return_learning_signal=False, correct_bias=False):
         # Add noise
         update_noise = jax.random.normal(key, shape=w.shape)
         update_noise = jnp.where(day_flag, 
@@ -1857,7 +1879,7 @@ class TimeVarGLMLearn(GLMLearn):
         else:
             log_learning_rate = params.log_alpha + beta_t
         
-        learning_signal = jnp.multiply(jnp.exp(log_learning_rate), regression_gradient(w_t, x, y, r, params))
+        # learning_signal = jnp.multiply(jnp.exp(log_learning_rate), regression_gradient(w_t, x, y, r, params))
         # learning_signal = jnp.multiply(jnp.exp(params.log_alpha), regression_gradient(w_t, x, y, params, r1=beta_t[:,1], r0=beta_t[:,0]))
 
          # Add noise
@@ -1957,7 +1979,8 @@ class AC(GLMLearn):
         assert z.shape == (N, self.beta_dim + d + 1)
         return z
     
-    def update_weights(self, key: PRNGKey, z, x, params, y=None, r=None, day_flag=False, return_learning_signal=False):
+    def update_weights(self, key: PRNGKey, z, x, params, y=None, r=None, 
+                       day_flag=False, return_learning_signal=False, correct_bias=False):
         beta_t, w_t = self.split_latent(z)
         key, beta_key, w_key = jax.random.split(key, 3)
 
@@ -1974,20 +1997,29 @@ class AC(GLMLearn):
 
          # Add noise
         update_noise = jax.random.normal(w_key, shape=w_t.shape)
-        update_noise = jnp.where(day_flag, 
-                                 jnp.multiply(jnp.exp(params.log_sigma_day), update_noise),
-                                 jnp.multiply(jnp.exp(params.log_sigma), update_noise)
-                                 )
+        sigma_t = jnp.where(
+            day_flag,
+            jnp.exp(params.log_sigma_day),
+            jnp.exp(params.log_sigma)
+        )
+        update_noise = update_noise * sigma_t
+
+        # Correct bias
+        # if correct_bias:
+        #     learning_signal = learning_signal.at[..., 0].set(0.0)
+        #     update_noise = update_noise.at[..., 0].set(0.0)
+        learning_signal = jnp.where(correct_bias, learning_signal.at[..., 0].set(0.0), learning_signal)
+        update_noise = jnp.where(correct_bias, update_noise.at[..., 0].set(0.0), update_noise)
         
         # Combine and update
-        w_t = w_t + learning_signal + update_noise
-        beta_t = beta_t + jnp.exp(params.log_sigma_0) * jax.random.normal(beta_key, shape=beta_t.shape)
-        z_t = self.merge_latent(beta_t, w_t)
+        w_next = w_t + learning_signal + update_noise
+        beta_next = beta_t + jnp.exp(params.log_sigma_0) * jax.random.normal(beta_key, shape=beta_t.shape)
+        z_next = self.merge_latent(beta_next, w_next)
 
         if return_learning_signal:
-            return z_t, learning_signal
+            return z_next, learning_signal
         else:
-            return z_t
+            return z_next
     
     def emission_likelihood(self, z, x, y, params=None):
         _, w = self.split_latent(z)
@@ -2153,7 +2185,8 @@ class GLMInterpLearn(GLMLearn):
 
 class RVBF(GLMLearn):
     r'''
-    Static GLM + Reinforce with vector baseline (VB) and forgetting (F) terms.
+    Policy: Bernoulli GLM
+    Learning rule: Reinforce (R) with vectorized (V) parameters, including baseline (B) and forgetting (F) terms. 
     '''
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -2166,7 +2199,7 @@ class RVBF(GLMLearn):
             key: PRNGKey, w, x, 
             params: parameters.ParamsGLMInterpLearn, y=None, r=None,
             day_flag: bool=False,
-            return_noise=False, return_learning_signal=False):
+            return_noise=False, return_learning_signal=False, correct_bias=False):
         
         # Change in mean weights from learning rule
         REINFORCE_term = reinforce(w, x, y, r=r-params.baseline)
@@ -2183,21 +2216,111 @@ class RVBF(GLMLearn):
             jnp.exp(params.log_sigma_day),
             jnp.exp(params.log_sigma)
         )
-        # if sigma.ndim == 0:
         update_noise = update_noise * sigma
-        # else:
-        #     update_noise = update_noise * sigma[None, :]
-        
-        # if return_noise:
-        #     return w + learning_signal + update_noise, update_noise
-        # else:
-        #     return w + learning_signal + update_noise
+
+        # Correct for bias if needed
+        learning_signal = jnp.where(correct_bias, learning_signal.at[..., 0].set(0.0), learning_signal)
+        update_noise = jnp.where(correct_bias, update_noise.at[..., 0].set(0.0), update_noise)
+
         if return_learning_signal:
             return w + learning_signal + update_noise, learning_signal
         else:
             return w + learning_signal + update_noise
         
+class TimeVarRVBF(GLMLearn):
+    r'''
+    RVBF model with time-varying learning rate (modulator = 'lr') or time-varying baseline (modulator = 'baseline').
+    Modulator is a function of the latent variable beta_t, which is a scalar or vector.
+        beta_t = log(alpha_t) or beta_t = baseline_t
+        beta_0 = 0. by default
+    '''
+    def __init__(self, modulator: str='lr', beta_dim: int=1, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.modulator = modulator
+        self.beta_dim = beta_dim # len(beta), 1 for scalar.
 
+    def __repr__(self) -> str:
+        return f"TimeVarRVBF(modulator={self.modulator}, beta_dim={self.beta_dim})"
+
+    def split_latent(self, z):
+        # Split latent variable into beta and weights, over last axis
+        if z.ndim == 1:
+            beta, w = jnp.array(z[:self.beta_dim]), z[self.beta_dim:]
+        else:
+            beta, w = z[..., :self.beta_dim], z[..., self.beta_dim:]
+        return beta, w
+    
+    def merge_latent(self, beta, w):
+        return jnp.concatenate([beta, w], axis=-1)
+
+    def sample_initial(self, key: PRNGKey, params, N: int, d: int=1):
+        '''Sample from the initial distribution p(z_0)'''
+        beta = params.beta_0 + jnp.exp(params.log_sigma_0) * jax.random.normal(key, shape=(N, self.beta_dim))
+        w = super().sample_initial(key, params=None, N=N, d=d)
+        z = self.merge_latent(beta, w)
+        assert z.shape == (N, self.beta_dim + d + 1)
+        return z
+        
+    def update_weights(self, key: PRNGKey, z, x, params, y=None, r=None, 
+                       day_flag=False, return_learning_signal=False, correct_bias=False):
+        beta_t, w_t = self.split_latent(z)
+        key, beta_key, w_key = jax.random.split(key, 3)
+
+        if self.modulator == 'lr':
+            log_alpha_t = params.log_alpha + beta_t
+            baseline_t = params.baseline
+        elif self.modulator == 'baseline':
+            log_alpha_t = params.log_alpha
+            baseline_t = beta_t
+
+        # Change in mean weights from learning rule
+        REINFORCE_term = reinforce(w_t, x, y, r=r-baseline_t)
+        learning_signal = jnp.multiply(jnp.exp(log_alpha_t), REINFORCE_term)
+
+        # Forgetting
+        forget_term = w_t @ jnp.diag(jnp.exp(params.log_Q))
+        learning_signal = learning_signal - forget_term
+
+        # Add noise with per-dimension scales
+        update_noise = jax.random.normal(w_key, shape=w_t.shape)
+        sigma = jnp.where(
+            day_flag,
+            jnp.exp(params.log_sigma_day),
+            jnp.exp(params.log_sigma)
+        )
+        update_noise = update_noise * sigma
+
+        # Correct for bias if needed
+        # if correct_bias:
+        #     learning_signal = learning_signal.at[..., 0].set(0.0)
+        #     update_noise = update_noise.at[..., 0].set(0.0)
+        learning_signal = jnp.where(correct_bias, learning_signal.at[..., 0].set(0.0), learning_signal)
+        update_noise = jnp.where(correct_bias, update_noise.at[..., 0].set(0.0), update_noise)
+
+        # Combine and update
+        beta_next = beta_t + jnp.exp(params.log_sigma_0) * jax.random.normal(beta_key, shape=beta_t.shape)
+        w_next = w_t + learning_signal + update_noise
+        z_next = self.merge_latent(beta_next, w_next)
+
+        if return_learning_signal:
+            return z_next, learning_signal
+        else:
+            return z_next
+    
+    def emission_likelihood(self, z, x, y, params=None):
+        _, w = self.split_latent(z)
+        p = bernoulli_GLM_likelihood(w, x, y)
+        return p
+    
+    def emission_loglikelihood(self, z, x, y, params=None):
+        _, w = self.split_latent(z)
+        log_p = bernoulli_GLM_loglikelihood(w, x, y)
+        return log_p
+    
+    def bias_correction(self, z):
+        beta, w = self.split_latent(z)
+        w_corrected = bias_correction(w)
+        return self.merge_latent(beta, w_corrected)
 
 class GLMHMMLearn(GLMLearn):
     def __init__(self, **kwargs) -> None:
@@ -2430,6 +2553,95 @@ class DynamicGLMHMM():
         else:
             return marginal_log_lik
 
+def reinforce_bernoulli(v, q, r, baseline=0.):
+    return -(r-baseline) * 1/((1-v) - q)
+
+class HRL(GLMLearn):
+    def __init__(self, **kwargs) -> None:
+        pass
+
+    def __repr__(self) -> str:
+        return f"HRL()"
+
+    def split_latent(self, z):
+        # Split latent variable into option, q, and weights over the last axis.
+        if z.ndim == 1:
+            option, q, w = z[0], z[1], z[2:]
+        else:
+            option, q, w = z[..., 0], z[..., 1], z[..., 2:]
+        return option, q, w
+
+    def merge_latent(self, option, q, w):
+        # Ensure option and q are at least 1D so that concatenation reverses split_latent.
+        option = jnp.atleast_1d(option)
+        q = jnp.atleast_1d(q)
+        # If w is 3D but option or q are only 2D, unsqueeze them on the last axis.
+        if option.ndim == w.ndim - 1:
+            option = jnp.expand_dims(option, axis=-1)
+        if q.ndim == w.ndim - 1:
+            q = jnp.expand_dims(q, axis=-1)
+        return jnp.concatenate([option, q, w], axis=-1)
+    
+    def update_weights(self, key: PRNGKey, z, x, params, y=None, r=None, 
+                       day_flag=False, return_learning_signal=False, correct_bias=False):
+        option_t, q_t, w_t = self.split_latent(z)
+        key, option_key, w_key = jax.random.split(key, 3)
+
+        # Top level option PG
+        RF_top = reinforce_bernoulli(option_t, q_t, r, baseline=params.baseline_0)
+        learning_signal_0 = jnp.multiply(jnp.exp(params.log_alpha_0), RF_top)
+
+        # Bottom level weights PG
+        RF_bottom = reinforce(w_t, x, y, r=r-params.baseline_1)
+        learning_signal_1 = jnp.multiply(jnp.exp(params.log_alpha_1), RF_bottom)
+
+        # Update noise
+        update_noise_1 = jax.random.normal(w_key, shape=w_t.shape)
+        sigma_1 = jnp.where(day_flag, jnp.exp(params.log_sigma_day), jnp.exp(params.log_sigma))
+        update_noise_1 = update_noise_1 * sigma_1
+        
+        update_noise_0 = jax.random.normal(option_key, shape=option_t.shape) * jnp.exp(params.log_sigma_0)
+        
+        # Correct for bias if needed
+        learning_signal_1 = jnp.where(correct_bias, learning_signal_1.at[..., 0].set(0.0), learning_signal_1)
+        update_noise_1 = jnp.where(correct_bias, update_noise_1.at[..., 0].set(0.0), update_noise_1)
+        
+        # Combine and update
+        q_next = q_t + learning_signal_0 + update_noise_0
+        option_next = jax.random.bernoulli(option_key, p=jax.nn.sigmoid(q_next)).astype(int)
+        w_next = w_t + learning_signal_1 + update_noise_1
+
+        z_next = self.merge_latent(option_next, q_next, w_next)
+        if return_learning_signal:
+            return z_next, learning_signal_1
+        else:
+            return z_next
+        
+    def emission_likelihood(self, z, x, y, params=None):
+        option, _, w = self.split_latent(z)
+        p = jnp.where(option, 
+                        0.5,
+                        bernoulli_GLM_likelihood(w, x, y),
+                        )
+        return p
+    
+    def emission_loglikelihood(self, z, x, y, params=None):
+        return jnp.log(self.emission_likelihood(z, x, y))
+
+    def sample_initial(self, key: PRNGKey, params, N: int, d: int=1):
+        '''Sample from the initial distribution p(z_0)'''
+        q0 = params.q0 + jnp.exp(params.log_sigma_0) * jax.random.normal(key, shape=(N,))
+        option = jax.random.bernoulli(key, p=jax.nn.sigmoid(q0)).astype(int)
+        w = super().sample_initial(key, params=None, N=N, d=d)
+        return self.merge_latent(option, q0, w)
+
+    def bias_correction(self, z):
+        option, q, w = self.split_latent(z)
+        if w.shape[-1] == 5:
+            w_corrected = bias_correction(w)
+        else:
+            w_corrected = w
+        return self.merge_latent(option, q, w_corrected)
 
 if __name__=='__main__':
     # Seed for reproducibility
