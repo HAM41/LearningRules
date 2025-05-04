@@ -51,6 +51,9 @@ def load_model(args, regressors):
     elif isinstance(model, models.GLMBaseLearn):
         beta_dim = len(regressors) + 1 if args.vector_alpha else 1
         model.latent_dim = beta_dim + len(regressors) + 1
+    elif isinstance(model, models.HRL):
+        model.latent_dim = len(regressors) + 1 + 2
+        model.reward_func = ibl.format_reward_function(regressors, learning_rule='reinforce')
     else:
         model.latent_dim = len(regressors) + 1
         model.reward_func = ibl.format_reward_function(regressors, learning_rule=args.learning_rule)
@@ -106,8 +109,10 @@ def compute_posterior(args, model, params, X, Y, R, day_flags):
             )[1])(jnp.arange(T))
         learning_updates = learning_updates.mean(1)
 
-        if isinstance(model, models.TimeVarGLMLearn) or isinstance(model, models.AC):
-            beta_post, w_post = model.split_latent(post_weights[i])
+        # if isinstance(model, models.TimeVarGLMLearn) or isinstance(model, models.AC):
+        #     beta_post, w_post = model.split_latent(post_weights[i])
+        if hasattr(model, 'split_latent'):
+            w_post = model.split_latent(post_weights[i])[-1]
         else:
             w_post = post_weights[i]
 
@@ -135,7 +140,7 @@ def compute_posterior(args, model, params, X, Y, R, day_flags):
     return
 
 def modeldir(args, model):
-    MODELDIR = HOMEDIR + f'/postprocessing/posterior/{args.lab}/{args.subject_id}/{model}/'
+    MODELDIR = HOMEDIR + f'/postprocessing/posterior/{args.lab}/{args.subject_id}/{model}/{args.protocol}/'
     if not os.path.exists(MODELDIR):
         os.makedirs(MODELDIR)
     return MODELDIR
@@ -149,9 +154,10 @@ def generate_prior_trajectory(
     key = jax.random.PRNGKey(args.posterior_seed)
     
     if posterior_latents is not None:
-        if isinstance(model, (models.TimeVarGLMLearn, models.AC, models.TimeVarRVBF)):
+        # if isinstance(model, (models.TimeVarGLMLearn, models.AC, models.TimeVarRVBF)):
+        if hasattr(model, 'split_latent'):
             assert posterior_latents.shape[0] == len(X), "Posterior latents shape mismatch."
-            beta_post, w_post = model.split_latent(posterior_latents)
+            beta_post = model.split_latent(posterior_latents)[:-1]
         else:
             logging.warning("Posterior latents unnecessary, no other latents than w.")
         #     post_weights, _ = model.posterior_samples(
@@ -168,8 +174,9 @@ def generate_prior_trajectory(
     z_t = model.sample_initial(key, params, N_samples, d=len(regressors)) #! global regressors
     W_out = jnp.zeros((T, len(regressors)+1)) #! global regressors
 
-    if isinstance(model, (models.TimeVarGLMLearn, models.AC, models.TimeVarRVBF)):
-        w_t = model.split_latent(z_t)[1]
+    # if isinstance(model, (models.TimeVarGLMLearn, models.AC, models.TimeVarRVBF)):
+    if hasattr(model, 'split_latent'):
+        w_t = model.split_latent(z_t)[-1]
     else:
         w_t = z_t
     W_out = W_out.at[0].set(w_t.mean(0))
@@ -205,12 +212,20 @@ def generate_prior_trajectory(
 
         
         # Append w component
-        if isinstance(model, (models.TimeVarGLMLearn, models.AC, models.TimeVarRVBF)):
-            w_next = model.split_latent(z_next)[1]
+        # if isinstance(model, (models.TimeVarGLMLearn, models.AC, models.TimeVarRVBF)):
+        if hasattr(model, 'split_latent'):
+            w_next = model.split_latent(z_next)[-1]
             if posterior_latents is not None:
-                beta_next = beta_post[:,t+1]
-                beta_next = jnp.tile(beta_next, (N_samples, 1))
-                z_next = model.merge_latent(beta_next, w_next)
+                if isinstance(beta_post, tuple):
+                    beta_next_list = []
+                    for beta_elem in beta_post:
+                        assert len(beta_elem) == len(X), "Posterior latents shape mismatch."
+                        beta_next_list.append(jnp.tile(beta_elem[t+1], (N_samples, 1)))
+                    z_next = model.merge_latent(*beta_next_list, w_next)
+                else:
+                    assert len(beta_post) == len(X), "Posterior latents shape mismatch."
+                    beta_next = jnp.tile(beta_post[t+1], (N_samples, 1))
+                    z_next = model.merge_latent(beta_next, w_next)
         else:
             w_next = z_next
         W_out = W_out.at[t+1].set(w_next.mean(0))
@@ -354,8 +369,9 @@ def decompose_learning_noise(args, model, params, X, Y, R, day_flags, correct_bi
         learning_updates = learning_updates[:, :, None]
     
     # Get weight component of posterior samples
-    if isinstance(model, (models.TimeVarGLMLearn, models.AC, models.TimeVarRVBF)):
-        _, w_post = model.split_latent(Z)
+    # if isinstance(model, (models.TimeVarGLMLearn, models.AC, models.TimeVarRVBF)):
+    if hasattr(model, 'split_latent'):
+        w_post = model.split_latent(Z)[-1]
     else:
         w_post = Z
 
@@ -415,6 +431,8 @@ if __name__=='__main__':
                         help="Number of posterior samples to compute.")
     parser.add_argument("--modulator", type=str, default='lr', choices=['lr', 'baseline'],
                         help="Modulator for the TimeVarRVBF model.")
+    parser.add_argument("--protocol", type=str, default='training', choices=['training', 'no_curriculum'],
+                        help="Protocol of the IBL mouse data. See `ibl.py' for details.")
 
     
     # Parse the command-line arguments
@@ -433,6 +451,7 @@ if __name__=='__main__':
         'regressors': regressors,
         'learning_rule': args.learning_rule,
         'seed': args.seed,
+        'protocol': args.protocol,
     }
 
     loader = ibl.IBLSingleTrajectoryLoader(loader_params)
@@ -441,9 +460,14 @@ if __name__=='__main__':
     X, Y, R, day_flags = jnp.array(data['trajectory'].X), jnp.array(data['trajectory'].Y), data['trajectory'].R, data['trajectory'].day_flags
     if args.model_class == "QLearning" and ('stimIntensity' not in regressors):
         X = X[:, 1] - X[:, 0]
-    dict = {'X': X, 'Y': Y, 'R': R, 'day_flags': day_flags}
-    # pickle.dump(dict, open(SAVEDIR+f'data.pkl', 'wb'))
-    
+    data_dict = {'X': X, 'Y': Y, 'R': R, 'day_flags': day_flags}
+
+    # DATA_SAVEDIR = HOMEDIR + f'/data/processed/{args.lab}/{args.subject_id}/{args.protocol}'
+    # if not os.path.exists(DATA_SAVEDIR): 
+    #     os.makedirs(DATA_SAVEDIR)
+    # pickle.dump(data_dict, open(DATA_SAVEDIR+'/data.pkl', 'wb'))
+    # sys.exit()
+
     # train_trajectory = loader.load_train_data()
     # X_train, Y_train, R_train, day_flags_train = train_trajectory.X, train_trajectory.Y, train_trajectory.R, train_trajectory.day_flags
     # session_indices = data['session_indices']
@@ -464,10 +488,10 @@ if __name__=='__main__':
     if 'stimIntensity' in regressors:
         parsed_entries_file = './postprocessing/parsed_slurm_entries_wnoisecomponent_stimIntensity.pkl'
     else:
-        parsed_entries_file = './postprocessing/parsed_slurm_entries_wnoisecomponent.pkl'
+        parsed_entries_file = './postprocessing/parsed_slurm_entries_2.pkl'
     entries = pd.read_pickle(parsed_entries_file)
     sub_entries = entries.query(
-        f"lab == '{args.lab}' and model == '{model}' and subject_id == {args.subject_id}"
+        f"lab == '{args.lab}' and model == '{model}' and subject_id == {args.subject_id} and protocol == '{args.protocol}'"
         ).iloc[0]
 
     params_array = jnp.array(sub_entries['params_array'])
