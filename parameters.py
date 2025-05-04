@@ -106,6 +106,16 @@ class ParamsTimeVarRVBF(NamedTuple):
     beta_0: Union[float, jnp.ndarray] = 0.0
     log_sigma_0: float = -5.0
 
+class ParamsHRL(NamedTuple):
+    log_sigma: Union[float, jnp.ndarray]
+    log_sigma_day: Union[float, jnp.ndarray]
+    log_alpha_0: float
+    log_alpha_1: Union[float, jnp.ndarray]
+    baseline_1: Union[float, jnp.ndarray]
+    baseline_0: float = 0.0
+    log_sigma_0: float = -5.0
+    q0: float = 0.0
+
 def handle_none_params(func):
     def wrapper(self, *args, params=None, **kwargs):
         if params is None:
