@@ -16,6 +16,7 @@ import pickle
 import fit_utils
 import ibl
 import models, parameters
+from fit_ibl import posterior_mcmc
 
 import logging
 logging.basicConfig(level=logging.INFO, format='[%(filename)s][%(asctime)s] %(levelname)s - %(message)s')
@@ -109,8 +110,6 @@ def compute_posterior(args, model, params, X, Y, R, day_flags):
             )[1])(jnp.arange(T))
         learning_updates = learning_updates.mean(1)
 
-        # if isinstance(model, models.TimeVarGLMLearn) or isinstance(model, models.AC):
-        #     beta_post, w_post = model.split_latent(post_weights[i])
         if hasattr(model, 'split_latent'):
             w_post = model.split_latent(post_weights[i])[-1]
         else:
@@ -152,6 +151,7 @@ def generate_prior_trajectory(
     Generate a latent prior trajectory, with and without emissions.
     '''
     key = jax.random.PRNGKey(args.posterior_seed)
+    T = len(X)
     
     if posterior_latents is not None:
         # if isinstance(model, (models.TimeVarGLMLearn, models.AC, models.TimeVarRVBF)):
@@ -186,52 +186,108 @@ def generate_prior_trajectory(
     else:
         correct_bias_flags = jnp.zeros(T, dtype=bool)
 
-    if args.verbose:
-        pbar = tqdm(total=T-1)
-
-    # Generate dynamics
-    for t in range(T-1):
-        key, _ = jax.random.split(key)
-
-        if use_emissions:
-            Yt = Y[t]
-            Rt = R[t]
-        else:
-            Yt = model.decision(key, z_t, X[t])
-            Rt = R[t] if Yt == Y[t] else 0
-
-        # Update weights
-        z_next = model.update_weights(
-            key, z_t, x=X[t], y=Yt, r=Rt, day_flag=day_flags[t], 
-            params=_params, return_learning_signal=False,
-            )
-        # Correct bias
-        if correct_bias_flags[t]:
-            z_next = model.bias_correction(z_next) 
-        z_t = z_next
-
-        
-        # Append w component
-        # if isinstance(model, (models.TimeVarGLMLearn, models.AC, models.TimeVarRVBF)):
-        if hasattr(model, 'split_latent'):
-            w_next = model.split_latent(z_next)[-1]
-            if posterior_latents is not None:
-                if isinstance(beta_post, tuple):
+    if hasattr(model, 'split_latent'):
+        if posterior_latents is not None:
+            if isinstance(beta_post, tuple):
+                def keep_posterior_latents(t, z_next):
+                    w_next = model.split_latent(z_next)[-1]
                     beta_next_list = []
                     for beta_elem in beta_post:
-                        assert len(beta_elem) == len(X), "Posterior latents shape mismatch."
                         beta_next_list.append(jnp.tile(beta_elem[t+1], (N_samples, 1)))
                     z_next = model.merge_latent(*beta_next_list, w_next)
-                else:
-                    assert len(beta_post) == len(X), "Posterior latents shape mismatch."
+                    return w_next, z_next
+            else:
+                assert len(beta_post) == len(X), "Posterior latents shape mismatch."
+                def keep_posterior_latents(t, z_next):
+                    w_next = model.split_latent(z_next)[-1]
                     beta_next = jnp.tile(beta_post[t+1], (N_samples, 1))
                     z_next = model.merge_latent(beta_next, w_next)
-        else:
+                    return w_next, z_next
+    else:
+        def keep_posterior_latents(t, z_next):
             w_next = z_next
-        W_out = W_out.at[t+1].set(w_next.mean(0))
+            return w_next, z_next
 
-        if args.verbose:
-            pbar.update(1)
+    def scan_fn(carry, inputs):
+        t, z_carry, W_out = carry
+        X_t, Y_t, R_t, next_day_flag, correct_bias_flag, key = inputs
+        
+        # Update the latents p(z_{t+1} | z_t, y_t, x_t)
+        if use_emissions:
+            # Use the true, data emissions Y_t and corresponding rewards R_t
+            # Update the latents p(z_{t+1} | z_t, y_{t,data}, x_t)
+            z_next = model.update_weights(
+                        key, z_carry, x=X_t, y=Y_t, r=R_t, day_flag=next_day_flag, 
+                        params=_params, return_learning_signal=False, correct_bias=correct_bias_flag,
+                        )
+        else:
+            # Sample emissions y_{t,sample} ~ p(y_t | z_t, x_t)
+            Y_prior_t = model.decision(key, z_carry, X_t)
+            R_prior_t = jnp.where(Y_prior_t == Y_t, R_t, 0.)
+
+            # Update the latents p(z_{t+1} | z_t, y_{t,sample}, x_t) for each particle
+            z_next = jax.vmap(
+                lambda z, y, r: model.update_weights(
+                        key, z, x=X_t, y=y, r=r, day_flag=next_day_flag, 
+                        params=_params, return_learning_signal=False, correct_bias=correct_bias_flag,
+                        )
+            )(z_carry, Y_prior_t, R_prior_t)
+        
+        # Keep the posterior mean for the non-weight latents. 
+        # This step has no effect if beta_dim = 0 
+        w_next, z_next = keep_posterior_latents(t, z_next)
+        W_out = W_out.at[t+1].set(w_next.mean(0))
+        return (t+1, z_next, W_out), None
+    
+    # Scan over time
+    keys = jax.random.split(key, T-1)
+    inputs = jax.vmap(lambda t: (X[t], Y[t], R[t], day_flags[t], correct_bias_flags[t], keys[t]))(jnp.arange(T-1))
+    carry = (0, z_t, W_out)
+    W_out = jax.lax.scan(scan_fn, carry, inputs)[0][-1]
+
+    # # Generate dynamics
+    # for t in range(T-1):
+    #     key, _ = jax.random.split(key)
+
+    #     if use_emissions:
+    #         Yt = Y[t]
+    #         Rt = R[t]
+    #     else:
+    #         Yt = model.decision(key, z_t, X[t])
+    #         Rt = R[t] if Yt == Y[t] else 0
+
+    #     # Update weights
+    #     z_next = model.update_weights(
+    #         key, z_t, x=X[t], y=Yt, r=Rt, day_flag=day_flags[t], 
+    #         params=_params, return_learning_signal=False,
+    #         )
+    #     # Correct bias
+    #     if correct_bias_flags[t]:
+    #         z_next = model.bias_correction(z_next) 
+    #     z_t = z_next
+
+        
+    #     # Append w component
+    #     # if isinstance(model, (models.TimeVarGLMLearn, models.AC, models.TimeVarRVBF)):
+    #     if hasattr(model, 'split_latent'):
+    #         w_next = model.split_latent(z_next)[-1]
+    #         if posterior_latents is not None:
+    #             if isinstance(beta_post, tuple):
+    #                 beta_next_list = []
+    #                 for beta_elem in beta_post:
+    #                     assert len(beta_elem) == len(X), "Posterior latents shape mismatch."
+    #                     beta_next_list.append(jnp.tile(beta_elem[t+1], (N_samples, 1)))
+    #                 z_next = model.merge_latent(*beta_next_list, w_next)
+    #             else:
+    #                 assert len(beta_post) == len(X), "Posterior latents shape mismatch."
+    #                 beta_next = jnp.tile(beta_post[t+1], (N_samples, 1))
+    #                 z_next = model.merge_latent(beta_next, w_next)
+    #     else:
+    #         w_next = z_next
+    #     W_out = W_out.at[t+1].set(w_next.mean(0))
+
+    #     if args.verbose:
+    #         pbar.update(1)
     return W_out
 
 def generate_all_prior_trajectories(args, model, params, X, Y, R, day_flags, use_posterior_latents=True):
@@ -260,12 +316,16 @@ def generate_all_prior_trajectories(args, model, params, X, Y, R, day_flags, use
     for use_emissions in [True, False]:
         for use_noise in [True, False]:
             logging.info(f"Use emissions: {use_emissions}, use noise: {use_noise}")
+            if use_noise:
+                _N_samples = 1 # since we average over samples
+            else:
+                _N_samples = args.N_particles
             Ws_theoretical = generate_prior_trajectory(
                 args, model, params, X, Y, R, day_flags, 
-                use_emissions=use_emissions, use_noise=use_noise, posterior_latents=posterior_latents, N_samples=1
+                use_emissions=use_emissions, use_noise=use_noise, posterior_latents=posterior_latents, N_samples=_N_samples
                 )
     
-            file_name = 'prior_useY{}_noise{}_postZ{}_N{}_ps{}.npy'.format(
+            file_name = 'prior_useY{}_noise{}_postZ{}_N{}_ps{}_scan.npy'.format(
                 use_emissions, use_noise, use_posterior_latents, args.N_particles, args.posterior_seed
                 )
             jnp.save(MODELDIR+file_name, Ws_theoretical)
@@ -275,10 +335,10 @@ def generate_all_prior_trajectories(args, model, params, X, Y, R, day_flags, use
 def generate_posterior_trajectories(args, model, params, X, Y, R, day_flags) -> None:
     for i in range(args.n_posterior_samples):
         key = jax.random.PRNGKey(args.posterior_seed+i)
-        post_weights, _ = model.posterior_samples(
+        post_weights, _ = model.posterior_samples_scan(
             key, params, 
             X, Y, R, day_flags,
-            N_particles=args.N_particles, LAG=True, verbose=args.verbose,
+            N_particles=args.N_particles, verbose=args.verbose, # LAG=True,
             )
         posterior_latents = post_weights.mean(0)
         print(posterior_latents[:10])
@@ -327,12 +387,14 @@ def decompose_learning_noise(args, model, params, X, Y, R, day_flags, correct_bi
     T, M = X.shape
 
     # Get posterior samples
-    post_weights, _ = model.posterior_samples(
+    post_weights, _ = model.posterior_samples_scan(
             key, params, 
             X, Y, R, day_flags,
-            N_particles=args.N_particles, verbose=args.verbose, LAG=True,
+            N_particles=args.N_particles, verbose=args.verbose, #LAG=True,
             )
-    Z = post_weights#.mean(0)
+    Z = post_weights.mean(0)
+    logging.warning(f"Considering only posterior mean. Posterior weights shape: {Z.shape}")
+    jnp.save(MODELDIR+f'posterior_mean_N{args.N_particles}_ps{args.posterior_seed}_scan_2.npy', Z)
     
     # Learning component
     keys = jax.random.split(key, T)
@@ -348,7 +410,7 @@ def decompose_learning_noise(args, model, params, X, Y, R, day_flags, correct_bi
 
     def learning_update(t):
         _, learning_signal = model.update_weights(
-            keys[t], Z[:,t], x=X[t], y=Y[t], r=R[t], 
+            keys[t], Z[t], x=X[t], y=Y[t], r=R[t], 
             day_flag=day_flags[t], correct_bias=correct_bias_flags[t],
             params=params, return_learning_signal=True,
         )
@@ -361,12 +423,12 @@ def decompose_learning_noise(args, model, params, X, Y, R, day_flags, correct_bi
         #     )
         return learning_signal
     
-    learning_updates = jax.vmap(learning_update)(jnp.arange(T)) # shape (T, N, weight_dim)
-    learning_updates = learning_updates.transpose(1, 0, 2) # shape (N, T, weight_dim)
+    learning_updates = jax.vmap(learning_update)(jnp.arange(T)) # shape (T, weight_dim)
+    # learning_updates = learning_updates.transpose(1, 0, 2) # shape (N, T, weight_dim)
     
-    # Make sure updates are of shape (N, T, weight_dim)
-    if learning_updates.ndim == 2:
-        learning_updates = learning_updates[:, :, None]
+    # # Make sure updates are of shape (N, T, weight_dim)
+    # if learning_updates.ndim == 2:
+    #     learning_updates = learning_updates[:, :, None]
     
     # Get weight component of posterior samples
     # if isinstance(model, (models.TimeVarGLMLearn, models.AC, models.TimeVarRVBF)):
@@ -374,15 +436,72 @@ def decompose_learning_noise(args, model, params, X, Y, R, day_flags, correct_bi
         w_post = model.split_latent(Z)[-1]
     else:
         w_post = Z
+    weight_updates = w_post[1:] - w_post[:-1] # shape (T-1, weight_dim)
+    noise_updates = weight_updates - learning_updates[:-1] # shape (T-1, weight_dim)
+    assert jnp.allclose(noise_updates + learning_updates[:-1], weight_updates), "Weight updates do not match learning and noise updates."
+    # learning_along_weight = jnp.divide(
+    #     jnp.einsum('ntk,ntk->nt', learning_updates[:,:-1], weight_updates), # shape (N, T-1)
+    #     # jnp.multiply(learning_updates[:,:-1], weight_updates).sum(axis=2), # shape (N, T-1)
+    #     jnp.linalg.norm(weight_updates, axis=-1) # shape (N, T-1)
+    #     )
+    # logging.info(f"Fraction of learning along weight update: {learning_along_weight.mean():.4f}")
 
-    # Cumulative learning component
-    learning_component = w_post[:,0][:,None,:] + jnp.cumsum(learning_updates, axis=1) # shape (N, T, weight_dim)
-    noise_component = w_post[:,1:] - learning_component[:,:-1]
+
+    # # Cosine sim from mean
+    # cosine_learning_weight_mean = jnp.divide(
+    #     jnp.einsum('tk,tk->t', learning_updates.mean(0)[:-1], weight_updates.mean(0)),
+    #     jnp.linalg.norm(learning_updates.mean(0)[:-1], axis=-1) * jnp.linalg.norm(weight_updates.mean(0), axis=-1)
+    #     )
+    # logging.info(f"Cosine similarity of learning and weight update from mean: {cosine_learning_weight_mean.mean():.4f}")
+
+    # learning_along_weight_mean = jnp.divide(
+    #     jnp.einsum('tk,tk->t', learning_updates.mean(0)[:-1], weight_updates.mean(0)), # shape (N, T-1)
+    #     # jnp.multiply(learning_updates[:,:-1], weight_updates).sum(axis=2), # shape (N, T-1)
+    #     jnp.linalg.norm(weight_updates.mean(0), axis=-1) # shape (N, T-1)
+    #     )
+    # logging.info(f"Fraction of learning along weight update mean: {learning_along_weight_mean.mean():.4f}")
+
+    # learning_along_weight_per_reg = jnp.divide(
+    #     jnp.multiply(learning_updates[:,:-1], weight_updates),
+    #     jnp.clip(jnp.abs(weight_updates), 1e-08)
+    # ).mean(0).mean(0)
+    # logging.info(f"Fraction of learning along weight update per regressor: {learning_along_weight_per_reg}")
+
+
+    @jax.jit
+    def cosine_similarity(a, b):
+        '''Cosine similarity between two vectors.'''
+        return jnp.dot(a, b) / (jnp.linalg.norm(a) * jnp.linalg.norm(b))
+
+    @jax.jit
+    def project_fraction(a, b):
+        '''Fraction of the projection of a onto b, signed by orientation of a with respect to b.'''
+        return jnp.dot(a, b) / jnp.dot(b, b)
+
+    cosine_learning_weight = jax.vmap(cosine_similarity)(learning_updates[:-1], weight_updates)
+    logging.info(f"Cosine similarity between learning and weight update: {cosine_learning_weight.mean():.8f}")
+
+    learning_projections = jax.vmap(project_fraction)(learning_updates[:-1], weight_updates)
+    logging.info(f"Fraction of learning along weight update: {learning_projections.mean():.8f}")
+    logging.info(f"Fraction of learning along weight update, abs: {jnp.abs(learning_projections).mean():.8f}")
+
+    # try:
+    #     learning_projections_mean = jax.vmap(project_fraction)(learning_updates.mean(0)[:-1], weight_updates.mean(0))
+    #     logging.info(f"Fraction of learning along weight update mean: {learning_projections_mean.mean():.4f}")
+    # except Exception as e:
+    #     logging.warning(f"Error in computing learning projections mean: {e}")
+
+    noise_projections = jax.vmap(project_fraction)(noise_updates, weight_updates)
+    logging.info(f"Fraction of noise along weight update: {noise_projections.mean():.8f}")
     
-    # Average over particles
-    learning_component = learning_component.mean(0)
-    noise_component = noise_component.mean(0)
-    logging.info(f'Noise component norm: {jnp.linalg.norm(noise_component):.2f}, per trial: {jnp.linalg.norm(noise_component)/len(Y):.4f}')
+    # Cumulative learning component
+    learning_component = w_post[0][None, :] + jnp.cumsum(learning_updates, axis=0) # shape (N, T, weight_dim)
+    noise_component = w_post[1:] - learning_component[:-1]
+
+    # # Average over particles
+    # learning_component = learning_component.mean(0)
+    # noise_component = noise_component.mean(0)
+    logging.info(f'Noise component norm: {jnp.linalg.norm(noise_component):.4f}, per trial: {jnp.linalg.norm(noise_component)/len(Y):.4f}')
 
     # Report signal to noise ratio per regressor
     SNRs = []
@@ -395,10 +514,47 @@ def decompose_learning_noise(args, model, params, X, Y, R, day_flags, correct_bi
     logging.info(f'SNRs: {SNRs}')
 
     # Save
-    jnp.save(MODELDIR+f'learning_component_N{args.N_particles}_ps{args.posterior_seed}.npy', learning_component)
-    jnp.save(MODELDIR+f'noise_component_N{args.N_particles}_ps{args.posterior_seed}.npy', noise_component)
+    jnp.save(MODELDIR+f'learning_component_N{args.N_particles}_ps{args.posterior_seed}_2.npy', learning_component)
+    jnp.save(MODELDIR+f'noise_component_N{args.N_particles}_ps{args.posterior_seed}_2.npy', noise_component)
     
     return learning_component, noise_component
+
+def get_parameter_posterior(args, model, params, X, Y, R, day_flags):
+    '''
+    Get parameter posterior samples.
+    '''
+    key = jax.random.PRNGKey(args.posterior_seed)
+    logging.info(f"Getting parameter MCMC posterior samples for {model}...")
+    _, log_lik_samples, posterior_samples, _ = posterior_mcmc(
+            model, key, params, 
+            [X], [Y], R=[R], day_flags=[day_flags],
+            N_particles=args.N_particles, n_iters=100, N_samples=500,
+            verbose=True, proposal_scale=0.5
+            )
+    
+    BURN_IN = 50
+    logging.info(f"")
+    logging.info(f"Marginal log-likelihood estimate: {log_lik_samples[-BURN_IN:].mean():.2f}")
+
+    posterior_samples = posterior_samples[-BURN_IN:].reshape(-1, posterior_samples.shape[-1])
+    ci = jnp.percentile(posterior_samples, q=jnp.array([2.5, 97.5]), axis=0).T
+    posterior_means = jnp.mean(posterior_samples, axis=0)
+    posterior_meds = jnp.median(posterior_samples, axis=0)
+
+    # Summary stats
+    n = posterior_samples.shape[0]
+    sample_mean = jnp.mean(posterior_samples, axis=0)
+    sample_var = jnp.var(posterior_samples, axis=0, ddof=1)
+    summary_stats_dict = {'n': n, 'sample_mean': sample_mean, 'sample_var': sample_var}
+    logging.info(f"Summary stats dict: {summary_stats_dict}")
+    pickle.dump(summary_stats_dict, open(MODELDIR+f'posterior_summary_stats_N{args.N_particles}_ps{args.posterior_seed}.pkl', 'wb'))
+
+    # log_ari_means = jax.scipy.special.logsumexp(log_alpha_samples, axis=0) - jnp.log(log_alpha_samples.shape[0])
+
+    logging.info("Posterior alpha:")
+    for i in range(len(posterior_means)):
+        logging.info(f"alpha_{i}: mean = {posterior_means[i]:.2f}, med = {posterior_meds[i]:.2f}, CI = [{ci[i,0]:.2f}, {ci[i,1]:.2f}]")
+    return summary_stats_dict
 
 if __name__=='__main__':
     parser = argparse.ArgumentParser(description="Argument parser for IBL fitting.")
@@ -504,4 +660,6 @@ if __name__=='__main__':
 
     generate_all_prior_trajectories(args, model, params, X, Y, R, day_flags, use_posterior_latents=True)
 
-    decompose_learning_noise(args, model, params, X, Y, R, day_flags)
+    # decompose_learning_noise(args, model, params, X, Y, R, day_flags)
+
+    # get_parameter_posterior(args, model, params, X, Y, R, day_flags)
