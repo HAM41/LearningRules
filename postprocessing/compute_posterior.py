@@ -145,12 +145,12 @@ def modeldir(args, model):
     return MODELDIR
 
 def generate_prior_trajectory(
-        args, model, params, X, Y, R, day_flags, 
+        key, model, params, X, Y, R, day_flags, 
         use_emissions=True, use_noise=True, posterior_latents=None, N_samples=1, correct_bias=True):
     '''
     Generate a latent prior trajectory, with and without emissions.
     '''
-    key = jax.random.PRNGKey(args.posterior_seed)
+    # key = jax.random.PRNGKey(args.posterior_seed)
     T = len(X)
     
     if posterior_latents is not None:
@@ -167,8 +167,8 @@ def generate_prior_trajectory(
         # else:
     
     _params = deepcopy(params)
-    if not use_noise:
-        _params = _params._replace(log_sigma=-10, log_sigma_day=-10)
+    # if not use_noise:
+    #     _params = _params._replace(log_sigma=-10, log_sigma_day=-10)
 
     # Initial conditions
     z_t = model.sample_initial(key, params, N_samples, d=len(regressors)) #! global regressors
@@ -205,7 +205,7 @@ def generate_prior_trajectory(
                     return w_next, z_next
     else:
         def keep_posterior_latents(t, z_next):
-            w_next = z_next
+            w_next = z_next.copy()
             return w_next, z_next
 
     def scan_fn(carry, inputs):
@@ -223,15 +223,18 @@ def generate_prior_trajectory(
         else:
             # Sample emissions y_{t,sample} ~ p(y_t | z_t, x_t)
             Y_prior_t = model.decision(key, z_carry, X_t)
+            # jax.debug.print('z_carry.shape = {}, Y_prior_t.shape = {}, Y_prior_t.std = {}', z_carry.shape, Y_prior_t.shape, Y_prior_t.std())
             R_prior_t = jnp.where(Y_prior_t == Y_t, R_t, 0.)
+            subkeys = jax.random.split(key, N_samples)
 
             # Update the latents p(z_{t+1} | z_t, y_{t,sample}, x_t) for each particle
             z_next = jax.vmap(
-                lambda z, y, r: model.update_weights(
-                        key, z, x=X_t, y=y, r=r, day_flag=next_day_flag, 
+                lambda subkey, z, y, r: model.update_weights(
+                        subkey, z, x=X_t, y=y, r=r, day_flag=next_day_flag, 
                         params=_params, return_learning_signal=False, correct_bias=correct_bias_flag,
                         )
-            )(z_carry, Y_prior_t, R_prior_t)
+            )(subkeys, z_carry, Y_prior_t, R_prior_t)
+            # jax.debug.print('z_next.shape = {}, z_next.std = {}', z_next.shape, z_next.std())
         
         # Keep the posterior mean for the non-weight latents. 
         # This step has no effect if beta_dim = 0 
@@ -245,49 +248,6 @@ def generate_prior_trajectory(
     carry = (0, z_t, W_out)
     W_out = jax.lax.scan(scan_fn, carry, inputs)[0][-1]
 
-    # # Generate dynamics
-    # for t in range(T-1):
-    #     key, _ = jax.random.split(key)
-
-    #     if use_emissions:
-    #         Yt = Y[t]
-    #         Rt = R[t]
-    #     else:
-    #         Yt = model.decision(key, z_t, X[t])
-    #         Rt = R[t] if Yt == Y[t] else 0
-
-    #     # Update weights
-    #     z_next = model.update_weights(
-    #         key, z_t, x=X[t], y=Yt, r=Rt, day_flag=day_flags[t], 
-    #         params=_params, return_learning_signal=False,
-    #         )
-    #     # Correct bias
-    #     if correct_bias_flags[t]:
-    #         z_next = model.bias_correction(z_next) 
-    #     z_t = z_next
-
-        
-    #     # Append w component
-    #     # if isinstance(model, (models.TimeVarGLMLearn, models.AC, models.TimeVarRVBF)):
-    #     if hasattr(model, 'split_latent'):
-    #         w_next = model.split_latent(z_next)[-1]
-    #         if posterior_latents is not None:
-    #             if isinstance(beta_post, tuple):
-    #                 beta_next_list = []
-    #                 for beta_elem in beta_post:
-    #                     assert len(beta_elem) == len(X), "Posterior latents shape mismatch."
-    #                     beta_next_list.append(jnp.tile(beta_elem[t+1], (N_samples, 1)))
-    #                 z_next = model.merge_latent(*beta_next_list, w_next)
-    #             else:
-    #                 assert len(beta_post) == len(X), "Posterior latents shape mismatch."
-    #                 beta_next = jnp.tile(beta_post[t+1], (N_samples, 1))
-    #                 z_next = model.merge_latent(beta_next, w_next)
-    #     else:
-    #         w_next = z_next
-    #     W_out = W_out.at[t+1].set(w_next.mean(0))
-
-    #     if args.verbose:
-    #         pbar.update(1)
     return W_out
 
 def generate_all_prior_trajectories(args, model, params, X, Y, R, day_flags, use_posterior_latents=True):
@@ -312,7 +272,8 @@ def generate_all_prior_trajectories(args, model, params, X, Y, R, day_flags, use
         #     jnp.save(MODELDIR+f'posterior_CI_N{args.N_particles}_ps{args.posterior_seed+i}_scan.npy', posterior_CI)
     else:
         posterior_latents = None
-        
+    
+    key = jax.random.PRNGKey(args.posterior_seed)
     for use_emissions in [True, False]:
         for use_noise in [True, False]:
             logging.info(f"Use emissions: {use_emissions}, use noise: {use_noise}")
@@ -320,8 +281,10 @@ def generate_all_prior_trajectories(args, model, params, X, Y, R, day_flags, use
                 _N_samples = 1 # since we average over samples
             else:
                 _N_samples = args.N_particles
+
+            key, subkey = jax.random.split(key)
             Ws_theoretical = generate_prior_trajectory(
-                args, model, params, X, Y, R, day_flags, 
+                subkey, model, params, X, Y, R, day_flags, 
                 use_emissions=use_emissions, use_noise=use_noise, posterior_latents=posterior_latents, N_samples=_N_samples
                 )
     
@@ -334,18 +297,25 @@ def generate_all_prior_trajectories(args, model, params, X, Y, R, day_flags, use
 
 def generate_posterior_trajectories(args, model, params, X, Y, R, day_flags) -> None:
     for i in range(args.n_posterior_samples):
+        logging.info(f"Posterior sample {i+1}/{args.n_posterior_samples}")
         key = jax.random.PRNGKey(args.posterior_seed+i)
-        post_weights, _ = model.posterior_samples_scan(
+        if hasattr(model, 'posterior_samples_scan'):
+            posterior_samples_func = model.posterior_samples_scan
+        else:
+            posterior_samples_func = model.posterior_samples
+        post_weights, _ = posterior_samples_func(
             key, params, 
             X, Y, R, day_flags,
             N_particles=args.N_particles, verbose=args.verbose, # LAG=True,
             )
         posterior_latents = post_weights.mean(0)
-        print(posterior_latents[:10])
-        print(posterior_latents[-10:])
+        logging.info(f"First latents: {posterior_latents[:10].mean(0)}")
+        logging.info(f"Last latents: {posterior_latents[-10:].mean(0)}")
         posterior_CI = jnp.percentile(post_weights, jnp.array([2.5, 97.5]), axis=0)
+        posterior_std = jnp.std(post_weights, axis=0)
         jnp.save(MODELDIR+f'posterior_mean_N{args.N_particles}_ps{args.posterior_seed+i}_scan.npy', posterior_latents)
         jnp.save(MODELDIR+f'posterior_CI_N{args.N_particles}_ps{args.posterior_seed+i}_scan.npy', posterior_CI)
+        jnp.save(MODELDIR+f'posterior_std_N{args.N_particles}_ps{args.posterior_seed+i}_scan.npy', posterior_std)
 
 def evaluate_model(args, model, params, X, Y, R, day_flags, held_out_trials=None):
     '''
@@ -471,7 +441,7 @@ def decompose_learning_noise(args, model, params, X, Y, R, day_flags, correct_bi
     @jax.jit
     def cosine_similarity(a, b):
         '''Cosine similarity between two vectors.'''
-        return jnp.dot(a, b) / (jnp.linalg.norm(a) * jnp.linalg.norm(b))
+        return jnp.dot(a, b) / jnp.clip(jnp.linalg.norm(a) * jnp.linalg.norm(b), 1e-10)
 
     @jax.jit
     def project_fraction(a, b):
@@ -587,18 +557,20 @@ if __name__=='__main__':
                         help="Number of posterior samples to compute.")
     parser.add_argument("--modulator", type=str, default='lr', choices=['lr', 'baseline'],
                         help="Modulator for the TimeVarRVBF model.")
-    parser.add_argument("--protocol", type=str, default='training', choices=['training', 'no_curriculum'],
+    parser.add_argument("--protocol", type=str, default='training', choices=['training', 'no_curriculum', 'training_biasedChoiceWorld'],
                         help="Protocol of the IBL mouse data. See `ibl.py' for details.")
+    parser.add_argument("--remove-Q", type=int, default=0, choices=[0, 1],
+                        help="Remove forgetting parameter.")
+    parser.add_argument("--remove-baseline", type=int, default=0, choices=[0, 1],
+                        help="Remove baseline parameter.")
 
-    
     # Parse the command-line arguments
     args = parser.parse_args()
     logging.info(f"Arguments: {args}")
 
+
     regressors = args.regressors # ['contrastLeft', 'contrastRight', 'previousChoice', 'previousRewarded'] #  'stimIntensity', 
-    # Model
-    model = load_model(args, regressors)
-    MODELDIR = modeldir(args, model)
+
 
     # Data
     loader_params = {
@@ -618,10 +590,18 @@ if __name__=='__main__':
         X = X[:, 1] - X[:, 0]
     data_dict = {'X': X, 'Y': Y, 'R': R, 'day_flags': day_flags}
 
-    # DATA_SAVEDIR = HOMEDIR + f'/data/processed/{args.lab}/{args.subject_id}/{args.protocol}'
-    # if not os.path.exists(DATA_SAVEDIR): 
-    #     os.makedirs(DATA_SAVEDIR)
-    # pickle.dump(data_dict, open(DATA_SAVEDIR+'/data.pkl', 'wb'))
+    if 'stimIntensity' in regressors:
+        parsed_entries_file = './postprocessing/parsed_slurm_entries_stimIntensity.pkl'
+        args.protocol = 'stimIntensity_regressors'
+    # Model
+    model = load_model(args, regressors)
+    MODELDIR = modeldir(args, model)
+
+    if args.protocol == 'training_biasedChoiceWorld':
+        DATA_SAVEDIR = HOMEDIR + f'/data/processed/{args.lab}/{args.subject_id}/{args.protocol}'
+        if not os.path.exists(DATA_SAVEDIR): 
+            os.makedirs(DATA_SAVEDIR)
+        pickle.dump(data_dict, open(DATA_SAVEDIR+'/data.pkl', 'wb'))
     # sys.exit()
 
     # train_trajectory = loader.load_train_data()
@@ -642,23 +622,37 @@ if __name__=='__main__':
 
     # Load params from compiled entries table
     if 'stimIntensity' in regressors:
-        parsed_entries_file = './postprocessing/parsed_slurm_entries_wnoisecomponent_stimIntensity.pkl'
+        parsed_entries_file = './postprocessing/parsed_slurm_entries_stimIntensity.pkl'
+        args.protocol = 'stimIntensity_regressors'
     else:
         parsed_entries_file = './postprocessing/parsed_slurm_entries_2.pkl'
     entries = pd.read_pickle(parsed_entries_file)
     sub_entries = entries.query(
-        f"lab == '{args.lab}' and model == '{model}' and subject_id == {args.subject_id} and protocol == '{args.protocol}'"
+        f"lab == '{args.lab}' and model == '{model}' and subject_id == {args.subject_id} and protocol == '{"training" if "training" in args.protocol else args.protocol}'"
         ).iloc[0]
 
     params_array = jnp.array(sub_entries['params_array'])
     lengths = sub_entries['params_lengths']
     params_name = parameters.get_param_name(model.__repr__())
     params = parameters.array_to_params(params_name, params_array, lengths)
+
+    if bool(args.remove_Q):
+        try:
+            params = params._replace(log_Q=-10.0 * jnp.ones_like(params.log_Q))
+        except AttributeError:
+            logging.warning(f"Model {model} does not have Q parameter to remove.")
+    if bool(args.remove_baseline):
+        try:
+            params = params._replace(baseline=jnp.zeros_like(params.baseline))
+        except AttributeError:
+            logging.warning(f"Model {model} does not have baseline parameter to remove.")
     logging.info(f"Loaded params: {params}")
 
     evaluate_model(args, model, params, X, Y, R, day_flags, held_out_trials = data['held_out_trials'])
 
-    generate_all_prior_trajectories(args, model, params, X, Y, R, day_flags, use_posterior_latents=True)
+    generate_posterior_trajectories(args, model, params, X, Y, R, day_flags)
+
+    # generate_all_prior_trajectories(args, model, params, X, Y, R, day_flags, use_posterior_latents=True)
 
     # decompose_learning_noise(args, model, params, X, Y, R, day_flags)
 
