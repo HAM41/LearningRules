@@ -1,0 +1,8 @@
+name: learning
+channels:
+  - defaults
+dependencies:
+  - scipy
+  - seaborn
+  - ipykernel
+prefix: /home/vg0233/.conda/envs/learning
