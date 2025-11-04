@@ -24,6 +24,12 @@ def load_model(args: argparse.Namespace):
     elif args.model_class == "AC":
         model = models.AC(beta_dim=1)
         args.learning_rule = 'reinforce'
+    elif args.model_class == "RVBF":
+        model = models.RVBF()
+    elif args.model_class == "TimeVarRVBF":
+        model = models.TimeVarRVBF()
+    elif args.model_class == "HRL":
+        model = models.HRL()
     else:
         raise ValueError(f"Model class {args.model_class} not recognized.")
     return model

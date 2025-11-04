@@ -1,4 +1,4 @@
-from typing import NamedTuple, Union, Mapping, Optional, Tuple, List
+from typing import NamedTuple, Type, Union, Tuple, List
 import jax.numpy as jnp
 import numpy as np
 
@@ -10,8 +10,6 @@ class ParamsGLMLearn(NamedTuple):
     log_sigma: Union[float, ParameterProperties]
     log_sigma_day: Union[float, ParameterProperties]
     log_alpha: Union[float, jnp.ndarray, ParameterProperties]
-    # z_0: float = 0.0
-    # p: float = 5.0
 
 class ParamsPsytrack(NamedTuple):
     log_sigma: float
@@ -166,9 +164,9 @@ def get_param_name(model_repr) -> str:
     if match:
         # Prepend "Params" to the matched class name
         return f"Params{match.group(1)}"
-    return None
+    return ""
 
-def label_to_parameterclass(name: str) -> NamedTuple:
+def label_to_parameterclass(name: str) -> Type[NamedTuple]:
     name = name.lower()
     if name == 'ac':
         return ParamsAC
@@ -195,28 +193,8 @@ def label_to_parameterclass(name: str) -> NamedTuple:
     else:
         raise ValueError(f"Unknown parameter class name: {name}")
 
-def get_params_labels(name: str) -> List[str]:
+def get_params_labels(name: str) -> tuple[str, ...]:
     return label_to_parameterclass(name)._fields
-
-class GLMLearn_():
-    def __init__(self, log_sigma: float=-1.0, alpha: float=0.0, not_trainable: list=[]) -> None:
-        self.params = ParamsGLMLearn(log_sigma=log_sigma, alpha=alpha)
-        self.props = ParamsGLMLearn(log_sigma=ParameterProperties(), alpha=ParameterProperties())
-        for param in not_trainable:
-            getattr(self.props, param).trainable = False
-        
-    def update_params(self, **kwargs) -> None:
-        '''passes trainable kwargs to self.params._replace'''
-        for key in kwargs:
-            if not getattr(self.props, key).trainable:
-                raise ValueError(f"Parameter '{key}' is not trainable")
-        
-        self.params = self.params._replace(**kwargs)
-
-    @handle_none_params
-    def some_output(self, x: float, params: Optional[ParamsGLMLearn]=None) -> jnp.ndarray:
-        return jnp.array([x, params.alpha, params.log_sigma])
-    
         
 if __name__=='__main__':
     # model = GLMLearn_(alpha=0.1, log_sigma=-2, not_trainable=[])
@@ -228,7 +206,7 @@ if __name__=='__main__':
     # print(model.params)
     # print(model.some_output(1.0))
 
-    params = ParamsGLMLearn(log_sigma=jnp.array([-2.0]), log_alpha=jnp.array([-3.5, -2.0]), log_sigma_day=-2.0)
+    params = ParamsPsytrack(log_sigma=-2.0, log_sigma_day=-2.0)
     params_array, lengths = params_to_array(params)
     print(params_array, lengths)
     # print(params.from_array(params_array, lengths))
@@ -236,5 +214,6 @@ if __name__=='__main__':
     print(array_to_params(params, params_array, lengths))
 
     print("Attributes of ParamsGLMLearn:", ParamsGLMLearn._fields)
+    print(label_to_parameterclass("psytrack").__name__)
     # print(get_param_name("ParamsGLMLearn(log_sigma=0.0, log_alpha=0.0)"))
 
