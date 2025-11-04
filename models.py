@@ -8,6 +8,7 @@ from typing import Tuple, Optional, Iterable, Union, NamedTuple
 from jaxtyping import Array, Float, Bool
 from functools import partial
 from tqdm import tqdm
+from ibl import Trajectory, trim_trajectory
 
 
 
@@ -589,9 +590,11 @@ class QLearning():
         # V = 0.2 * jnp.ones((2, N))
         return self.merge_latent(m, V[0], V[1])
         
-    def marginal_log_likelihood(self, key, params, X, Y, R=None, day_flags=None,
+    def marginal_log_likelihood(self, key, params, 
+                                trajectory: Trajectory,
                                 N_particles=1000, verbose=False, return_logliks = False):
         '''Use scan to make computation more efficient.'''
+        X, Y, R, day_flags = trajectory.X, trajectory.Y, trajectory.R, trajectory.day_flags
         if X.ndim == 1:
             T = len(X)
         else:
@@ -681,12 +684,14 @@ class QLearning():
 
             V = self.update_values(V, x=X[t], y=Y[t], m=m[t])
         return X, jnp.stack(Y), m, jnp.stack(Vs)
-    
-    def sample_forward(self, key, params, X: Float[Array, "T M"], day_flags: Bool[Array, "T"], z_0=None):
+
+    def sample_forward(self, key, params, trajectory: Trajectory, z_0=None):
         '''
         Forward pass through the model from initial state, sampling decisions.
         '''
         assert self.reward_func is not None, "Reward function, (x_t, y_t) -> r_t, must be defined."
+        X = trajectory.X
+        day_flags = trajectory.day_flags
         if z_0 is None:
             z_0 = self.sample_initial(key, X=X[0], params=params).squeeze()
        
@@ -722,10 +727,11 @@ class QLearning():
     def posterior_samples(self, 
             key, 
             params, 
-            X, Y, R=None, day_flags=None,
+            trajectory: Trajectory,
             N_particles=1000, return_history=True, posterior_type='smooth', verbose=False,
             LAG=False, correct_bias=False
             ):
+        X, Y, R, day_flags = trajectory.X, trajectory.Y, trajectory.R, trajectory.day_flags
         if X.ndim == 1:
             T = len(X)
             M = 1
@@ -795,12 +801,13 @@ class QLearning():
     
     def filter(self, 
             key, params, 
-            X: Float[Array, "T M"], Y: Float[Array, "T"], R: Float[Array, "T"], day_flags: Bool[Array, "T"], 
+            trajectory: Trajectory,
             N_particles=1000
             ):
         '''
         return p(w_{1:T} | y_{1:T}, x_{1:T}) under the prior, using the true data.
         '''
+        X, Y, R, day_flags = trajectory.X, trajectory.Y, trajectory.R, trajectory.day_flags
         if X.ndim == 1:
             T = len(X)
             M = 1
@@ -838,12 +845,13 @@ class QLearning():
     
     def filtering_MLL(self, 
             key, params, 
-            X: Float[Array, "T M"], Y: Float[Array, "T"], R: Float[Array, "T"], day_flags: Bool[Array, "T"], 
+            trajectory: Trajectory,
             N_particles=1000
             ):
         '''
         return p(w_{1:T} | y_{1:T}, x_{1:T}) under the prior, using the true data.
         '''
+        X, Y, R, day_flags = trajectory.X, trajectory.Y, trajectory.R, trajectory.day_flags
         if X.ndim == 1:
             T = len(X)
             M = 1
@@ -880,13 +888,14 @@ class QLearning():
 
     def forward_pass(self, 
             key, params, 
-            X: Float[Array, "T M"], Y: Float[Array, "T"], R: Float[Array, "T"], day_flags: Bool[Array, "T"], 
+            trajectory: Trajectory,
             N_particles: int=1000, predict_Y: bool=False, correct_bias=None, return_Z: bool=False,
             ):
         '''
         Make a forward pass in the model, either using the animal decisions (predict_Y=False) or sampling decisions
         (predict_Y=True). Predicition time-step to time-step likelihoods are returned.
         '''
+        X, Y, R, day_flags = trajectory.X, trajectory.Y, trajectory.R, trajectory.day_flags
         T = len(X)
 
         if predict_Y:
@@ -1102,12 +1111,6 @@ class GLMLearn():
     
     def emission_likelihood(self, z, x, y, params=None):
         '''p(y | z, x)'''
-        # _x = x.copy()
-        # _x = _x.at[..., 0].set(tanh_inv_transform(_x[..., 0]))
-        # _x = _x.at[..., 1].set(tanh_inv_transform(_x[..., 1]))
-
-        # _x = _x.at[..., 0].set(tanh_transform(_x[..., 0], params.p))
-        # _x = _x.at[..., 1].set(tanh_transform(_x[..., 1], params.p))
         return bernoulli_GLM_likelihood(z, x, y)
 
     def emission_loglikelihood(self, z, x, y, params=None):
@@ -1116,7 +1119,8 @@ class GLMLearn():
     # @handle_none_params
     def log_joint(
             self, 
-            X: jnp.ndarray, Y: jnp.ndarray, Z: jnp.ndarray, 
+            trajectory: Trajectory,
+            Z: jnp.ndarray, 
             params: ParamsGLMLearn, R: Optional[jnp.ndarray]=None,
             day_flags: Optional[jnp.ndarray]=None,
             ) -> float:
@@ -1124,8 +1128,8 @@ class GLMLearn():
         Evaluate `log p(Y, Z | X, R, theta) = log p(y_{1:T}, z_{1:T} | x_{1:T}, r_{1:T}, theta)`. 
 
         parameters:
-            X: array, stimulus, of shape (T, input_dim)
-            Y: array, decisions, of shape (T, output_dim)
+            trajectory.X: array, stimulus, of shape (T, input_dim)
+            trajectory.Y: array, decisions, of shape (T, output_dim)
             Z: array, latent variables, of shape (T, latent_dim) = (T, input_dim + 1)
             params: ParamsGLMLearn, model parameters
 
@@ -1134,6 +1138,7 @@ class GLMLearn():
         #? Add potentially to parent class
         '''
         # Format arguments
+        X, Y, R, day_flags = trajectory.X, trajectory.Y, trajectory.R, trajectory.day_flags
         T = len(Y)
         if R is None:
             R = [None]*T
@@ -1156,17 +1161,19 @@ class GLMLearn():
         )(Z, X, Y)
         
         # Combine to obtain log p(y_{0:T}, z_{0:T})
-        log_joint = log_pyz.sum() + log_pz0 + log_pzz.sum()
+        out = log_pyz.sum() + log_pz0 + log_pzz.sum()
 
-        return log_joint
-    
-    def posterior_samples(self, 
-            key, 
-            params, 
-            X, Y, R=None, day_flags=None,
+        return out
+
+    def posterior_samples(
+            self,
+            key,
+            params,
+            trajectory: Trajectory,
             N_particles=1000, return_history=True, posterior_type='smooth', verbose=False,
             LAG=False, correct_bias=True,
             ):
+        X, Y, R, day_flags = trajectory.X, trajectory.Y, trajectory.R, trajectory.day_flags
         if X.ndim == 1:
             T = len(X)
             M = 1
@@ -1258,9 +1265,10 @@ class GLMLearn():
 
         return z_history, log_lik
 
-    def marginal_log_likelihood(self, key, params, X, Y, R=None, day_flags=None,
+    def marginal_log_likelihood(self, key, params, trajectory: Trajectory,
                                 N_particles=1000, verbose=False, return_logliks = False):
         '''Use scan to make computation more efficient.'''
+        X, Y, R, day_flags = trajectory.X, trajectory.Y, trajectory.R, trajectory.day_flags
         if X.ndim == 1:
             T = len(X)
             M = 1
@@ -1328,9 +1336,10 @@ class GLMLearn():
         else:
             return marginal_log_lik
     
-    def posterior_samples_scan(self, key, params, X, Y, R=None, day_flags=None,
+    def posterior_samples_scan(self, key, params, trajectory: Trajectory,
                                 N_particles=1000, verbose=False, correct_bias=True):
         '''Use scan to make computation more efficient.'''
+        X, Y, R, day_flags = trajectory.X, trajectory.Y, trajectory.R, trajectory.day_flags
         if X.ndim == 1:
             T = len(X)
             M = 1
@@ -1453,9 +1462,10 @@ class GLMLearn():
         return score
     
     def next_step_prediction_score(
-            self, key, params, X, Y, R=None, day_flags=None,
+            self, key, params, trajectory: Trajectory,
             N_particles=1000, verbose=False):
         '''Use scan to make computation more efficient.'''
+        X, Y, R, day_flags = trajectory.X, trajectory.Y, trajectory.R, trajectory.day_flags
         if X.ndim == 1:
             T = len(X)
             M = 1
@@ -1499,9 +1509,10 @@ class GLMLearn():
     
     
     def two_step_prediction_score(
-            self, key, params, X, Y, R=None, day_flags=None,
+            self, key, params, trajectory: Trajectory,
             N_particles=1000, verbose=False):
         '''Use scan to make computation more efficient.'''
+        X, Y, R, day_flags = trajectory.X, trajectory.Y, trajectory.R, trajectory.day_flags
         if X.ndim == 1:
             T = len(X)
             M = 1
@@ -1555,8 +1566,8 @@ class GLMLearn():
         log_lik += jnp.log(jnp.mean(self.emission_likelihood(tilde_z_t, X[-1], Y[-1])))
 
         return scores, log_lik
-    
-    def sample_forward(self, key, params, X: Float[Array, "T M"], day_flags: Bool[Array, "T"], z_0=None):
+
+    def sample_forward(self, key, params, trajectory: Trajectory, z_0=None):
         '''
         Forward pass through the model from initial state, sampling decisions.
         '''
@@ -1564,6 +1575,7 @@ class GLMLearn():
         if z_0 is None:
             z_0 = self.sample_initial(key, params, N=1, d=self.latent_dim-1).squeeze()
             assert z_0.shape == (self.latent_dim,)
+        X, day_flags = trajectory.X, trajectory.day_flags
        
         T = len(X)
         latent_dim = z_0.shape[0]
@@ -1600,13 +1612,14 @@ class GLMLearn():
 
     def forward_pass(self, 
             key, params, 
-            X: Float[Array, "T M"], Y: Float[Array, "T"], R: Float[Array, "T"], day_flags: Bool[Array, "T"], 
+            trajectory: Trajectory,
             N_particles: int=1000, predict_Y: bool=False, correct_bias: bool=True, return_Z: bool=False
             ):
         '''
         Make a forward pass in the model, either using the animal decisions (predict_Y=False) or sampling decisions
         (predict_Y=True). Predicition time-step to time-step likelihoods are returned.
         '''
+        X, Y, R, day_flags = trajectory.X, trajectory.Y, trajectory.R, trajectory.day_flags
         T, M = X.shape
 
         if predict_Y:
@@ -1703,12 +1716,13 @@ class GLMLearn():
 
     def filtering_MLL(self, 
             key, params, 
-            X: Float[Array, "T M"], Y: Float[Array, "T"], R: Float[Array, "T"], day_flags: Bool[Array, "T"], 
+            trajectory: Trajectory,
             N_particles=1000
             ):
         '''
         return p(w_{1:T} | y_{1:T}, x_{1:T}) under the prior, using the true data.
         '''
+        X, Y, R, day_flags = trajectory.X, trajectory.Y, trajectory.R, trajectory.day_flags
         T, M = X.shape
 
         def scan_fn(carry, inputs):
@@ -1739,13 +1753,14 @@ class GLMLearn():
     def held_out_session_marginal_log_likelihood(self, 
             key, params, 
             t1, t2,
-            X, Y, R=None, day_flags=None,
+            trajectory: Trajectory,
             N_particles=1000):
         '''Compute the predictive marginal log likelihood of held out data.
             log p(y_{t1:t2} | y_{1:t1}, x_{1:t2}, theta)
         '''
+        trajectory_trimmed = trim_trajectory(trajectory, t2)
         _, logliks = self.marginal_log_likelihood(
-            key, params, X[:t2], Y[:t2], R[:t2], day_flags, N_particles,
+            key, params, trajectory_trimmed, N_particles,
             return_logliks = True,
             )
         return logliks[t1:t2].sum()
@@ -1753,32 +1768,35 @@ class GLMLearn():
     def held_out_trials_marginal_log_likelihood(self, 
             key, params, 
             held_out_trials,
-            X, Y, R=None, day_flags=None,
+            trajectory: Trajectory,
             N_particles=1000):
         '''Compute the predictive marginal log likelihood of held out data for each held out trial t,
             log p(y_{t} | y_{1:t-1}, x_{1:t}, theta)
         '''
         T = max(held_out_trials)
+        trajectory_trimmed = trim_trajectory(trajectory, T)
+
         _, logliks = self.marginal_log_likelihood(
-            key, params, X[:T], Y[:T], R[:T], day_flags[:T], N_particles,
+            key, params, trajectory_trimmed, N_particles,
             return_logliks = True,
             )
         return logliks[held_out_trials]
     
     def predict_trials_score(
             self, key, params,
-            X, Y, R, day_flags,
+            trajectory: Trajectory,
             held_out_interval, 
             N_particles=1000, verbose=False
             ):
         T_in, T_out = held_out_interval
-        assert T_out > 0 and T_out <= len(X), "Invalid held out interval."
+        assert T_out > 0 and T_out <= len(trajectory.X), "Invalid held out interval."
 
-        Y_masked = Y.copy()
+        Y_masked = trajectory.Y.copy()
         Y_masked[T_in:T_out] = jnp.nan
+        trajectory_trimmed = trim_trajectory(trajectory._replace(Y=Y_masked), T_out)
         Z_post, _ = self.posterior_samples(
             key, params, 
-            X[:T_out], Y_masked[:T_out], R[:T_out], day_flags[:T_out],
+            trajectory_trimmed,
             N_particles=N_particles, verbose=verbose, LAG=True,
             )
         
@@ -1789,7 +1807,7 @@ class GLMLearn():
         # liks = jnp.array(liks)
         liks = jax.vmap(
             lambda z, x, y: jnp.mean(self.emission_likelihood(z, x, y))
-            )(Z_post[:,T_in:,:].transpose(1,0,2), X[T_in:T_out], Y[T_in:T_out])
+            )(Z_post[:,T_in:,:].transpose(1,0,2), trajectory_trimmed.X[T_in:], trajectory_trimmed.Y[T_in:])
 
         # logliks = jax.vmap(
         #     lambda t: jnp.log(self.emission_likelihood(Z_post[:,t,:], X[t], Y[t]).mean())
@@ -1816,7 +1834,10 @@ class Psytrack(GLMLearn):
                                  jnp.multiply(jnp.exp(params.log_sigma_day), update_noise),
                                  jnp.multiply(jnp.exp(params.log_sigma), update_noise)
                                  )
-        return w + update_noise
+        if return_learning_signal:
+            return w + update_noise, jnp.zeros_like(w)
+        else:
+            return w + update_noise
     
     def dynamics_loglikelihood(self, z_next, z_prev, inputs, data, 
                                params: ParamsGLMLearn, day_flag=False, r=None):
@@ -2227,6 +2248,16 @@ class RVBF(GLMLearn):
         else:
             return w + learning_signal + update_noise
         
+    def sample_initial(self, key: PRNGKey, params, N: int, d: int=1):
+        '''Sample from the initial distribution p(z_0).
+        Args:
+            N: int, number of samples
+            d: int, number of regressors. Weights are of shape (d+1,), for the bias. 
+        '''
+        mean = 0. # could be made into a param
+        scale = jnp.exp(params.log_sigma)
+        return mean + scale * jax.random.normal(key, shape=(N, d+1,))
+        
 class TimeVarRVBF(GLMLearn):
     r'''
     RVBF model with time-varying learning rate (modulator = 'lr') or time-varying baseline (modulator = 'baseline').
@@ -2256,7 +2287,8 @@ class TimeVarRVBF(GLMLearn):
     def sample_initial(self, key: PRNGKey, params, N: int, d: int=1):
         '''Sample from the initial distribution p(z_0)'''
         beta = params.beta_0 + jnp.exp(params.log_sigma_0) * jax.random.normal(key, shape=(N, self.beta_dim))
-        w = super().sample_initial(key, params=None, N=N, d=d)
+        # w = super().sample_initial(key, params=None, N=N, d=d)
+        w = jnp.exp(params.log_sigma) * jax.random.normal(key, shape=(N, d+1,))
         z = self.merge_latent(beta, w)
         assert z.shape == (N, self.beta_dim + d + 1)
         return z
@@ -2496,8 +2528,9 @@ class DynamicGLMHMM():
         y = jax.random.bernoulli(key, p_R).astype(int)
         return y
 
-    def marginal_log_likelihood(self, key, params, X, Y, R=None, day_flags=None,
+    def marginal_log_likelihood(self, key, params, trajectory,
                             N_particles=1000, verbose=False, return_logliks = False):
+        X, Y, R, day_flags = trajectory.X, trajectory.Y, trajectory.R, trajectory.day_flags
         if X.ndim == 1:
             T = len(X)
             M = 1

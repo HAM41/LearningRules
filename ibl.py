@@ -24,10 +24,10 @@ logger = logging.getLogger(__name__)
 
 Y_L, Y_R = -1.0, 1.0 # Numerical value for the left, null, and right choices
 
-def tanh_transform(x, p=5):
+def tanh_transform(x, p: float=5.0) -> np.ndarray:
     return np.tanh(p*x)/np.tanh(p)
 
-def tanh_inv_transform(y, p=5):
+def tanh_inv_transform(y, p: float=5.0) -> np.ndarray:
     return np.arctanh(y*np.tanh(p))/p
 
 def load_IBL_behavioral_data(protocol: str='training') -> Tuple[pd.DataFrame, list]:
@@ -35,7 +35,7 @@ def load_IBL_behavioral_data(protocol: str='training') -> Tuple[pd.DataFrame, li
     Load data from IBL database for a given protocol, into a pandas dataframe.
     Select the `trainable` the subjects that moved to biasedChoiceWorld, thus attained status `Trained 1b`. 
     Args:
-        protocol: str, the protocol to load data from. Select from ['training', 'biasedChoiceWorld']
+        protocol: str, the protocol to load data from. Select from ['training', 'no_curriculum', 'training_biasedChoiceWorld']
     returns: 
         entries: pd.DataFrame, the data from the IBL database, with columns:
             ['lab', 'subject', 'date', 'contrastRight', 'choice', 'probabilityLeft', 'feedbackType', 'rewardVolume', 'contrastLeft']
@@ -46,7 +46,7 @@ def load_IBL_behavioral_data(protocol: str='training') -> Tuple[pd.DataFrame, li
     one = ONE(password='international')
 
     if protocol == 'no_curriculum':
-        # Select the eids associated with '2024_Q3_Pan_Vazquez_et_al' tag
+        # Select the eids associated with '2024_Q3_Pan_Vazquez_et_al' tag. Assumes cached. 
         one.load_cache(tag='2024_Q3_Pan_Vazquez_et_al')
 
         eids, infos = one.search(details=True)
@@ -56,7 +56,13 @@ def load_IBL_behavioral_data(protocol: str='training') -> Tuple[pd.DataFrame, li
         subjects = np.unique([info['subject'] for info in infos_biasedCW])
 
         # Get eids and infos for these subjects
-        eids, infos = one.search(subject=subjects, task_protocol=protocol, details=True)
+        if protocol == "training":
+            eids, infos = one.search(subject=subjects, task_protocol=protocol, details=True)
+        elif protocol == "training_biasedChoiceWorld":
+            # Return both training and biasedChoiceWorld protocols
+            eids, infos = one.search(subject=subjects, task_protocol=['training', 'biasedChoiceWorld'], details=True)
+        else:
+            raise Exception('Protocol not recognized. Select from ["training", "no_curriculum", "training_biasedChoiceWorld"].')
 
     # Select keys for trial data that are not time dependent (e.g. 'goCue_times')
     keys = ['contrastLeft', 'contrastRight', 'choice', 'probabilityLeft', 'feedbackType', 'rewardVolume']
@@ -255,7 +261,7 @@ def format_reward(X, Y, regressors, learning_rule) -> jnp.ndarray:
     R = jax.vmap(reward_func)(X, Y)
     return R
 
-class IBLDataTrajectory(NamedTuple):
+class Trajectory(NamedTuple):
     '''IBL single trajectory data, with T trials.'''
     X: Float[Array, "T M"]      # Regressors, M-dimensional
     Y: Float[Array, "T"]        # Choices, in {Y_L, Y_R}
@@ -296,8 +302,8 @@ def split_train_test_sessions(X, Y, R, day_flags, session_indices, held_out_sess
     R_test = jnp.concatenate(R_test, axis=0)
     day_flags_test = jnp.concatenate(day_flags_test, axis=0)
 
-    train_trajectory = IBLDataTrajectory(X_train, Y_train, R_train, day_flags_train)
-    test_trajectory = IBLDataTrajectory(X_test, Y_test, R_test, day_flags_test)
+    train_trajectory = Trajectory(X_train, Y_train, R_train, day_flags_train)
+    test_trajectory = Trajectory(X_test, Y_test, R_test, day_flags_test)
     return train_trajectory, test_trajectory
 
 def hold_out_trials(X, Y, R, day_flags, held_out_trials):
@@ -318,9 +324,21 @@ def hold_out_trials(X, Y, R, day_flags, held_out_trials):
 
     day_flags_train = jnp.asarray(day_flags).copy()
 
-    train_trajectory = IBLDataTrajectory(X_train, Y_train, R_train, day_flags_train)
+    train_trajectory = Trajectory(X_train, Y_train, R_train, day_flags_train)
     return train_trajectory
 
+def trim_trajectory(trajectory: Trajectory, T: int) -> Trajectory:
+    '''Trim trajectory up to T trials. If trajectory shorter than T, return original trajectory.'''
+    curr_T = trajectory.X.shape[0]
+    if curr_T <= T:
+        return trajectory
+    else:
+        return Trajectory(
+            X=trajectory.X[:T],
+            Y=trajectory.Y[:T],
+            R=trajectory.R[:T],
+            day_flags=trajectory.day_flags[:T]
+        )
 
 class IBLSingleTrajectoryLoader():
     def __init__(self, params, DOWNLOAD=False):
@@ -341,9 +359,9 @@ class IBLSingleTrajectoryLoader():
             data : dict
                 Dictionary to store the processed data, including:
                 - 'session_indices': jnp.array, session indices.
-                - 'trajectory': IBLDataTrajectory, trajectory data.
+                - 'trajectory': Trajectory, trajectory data.
                 - 'held_out_trials': jnp.array, indices of held-out trials.
-                - 'train_trajectory': IBLDataTrajectory, training trajectory data.
+                - 'train_trajectory': Trajectory, training trajectory data.
         Raises:
             FileNotFoundError
                 If the local data file is not found and DOWNLOAD is set to False.
@@ -383,7 +401,7 @@ class IBLSingleTrajectoryLoader():
         R = format_reward(X, Y, regressors, learning_rule)
         day_flags = models.set_day_flags(len(X), jnp.array(session_indices))
         self.data['session_indices'] = jnp.array(session_indices, dtype=jnp.int32)
-        self.data['trajectory']  = IBLDataTrajectory(X, Y, R, day_flags)
+        self.data['trajectory']  = Trajectory(X, Y, R, day_flags)
 
         #TODO : check that reward and (choice vs correctchoice) are correctly aligned, or reward and rewardVolume
 
