@@ -1,12 +1,12 @@
 # Inferring learning rules from decision-making data
 
-Inferring learning rules from sensory decision making data, focused on two-alternate force choice tasks. 
+Inferring learning rules from sensory decision making data, focused on two-alternate force choice tasks. See our associated preprint, [Inferring learning rules during de novo task learning](https://www.biorxiv.org/content/10.1101/2025.09.29.679295v1), for broad background and our modeling approach.
 
 All inference is done at a single animal level. To this end, most methods and fitting procedures revolve around the `Trajectory` data class (in `ibl.py`), with attributes
 - `X`: Regressors per trial, of shape `(T, D)`
 - `Y`: Animal's choice per trial, of shape `(T,)`
-- `R`: Animal's reward per trial, of shape `(T,)`
-- `day_flags`: Boolean flag indicating wether trial t is the beginning of a new session/day, boolean of shape `(T,)`
+- `R`: Animal's, or model's, reward per trial, of shape `(T,)`
+- `day_flags`: Boolean flag indicating whether trial t is the beginning of a new session/day, boolean of shape `(T,)`
 
 To use this code on another dataset, format the data in this `Trajectory` tuple and you should be able to get started on model fitting right away. 
 
