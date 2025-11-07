@@ -1,12 +1,5 @@
-
-import numpy as np
-import scipy as sp
-import seaborn as sns
-import matplotlib.pyplot as plt
 import pandas as pd
-import time
 from tqdm import tqdm
-import pickle
 import argparse
 
 import VR
@@ -15,16 +8,11 @@ from ibl import Trajectory
 import sys
 sys.path.append('../')
 import fit_utils
-import samplers
-import models, optim
+import models
 
 import sys
 import jax 
 import jax.numpy as jnp
-import jax.scipy as jsp
-# from scipy.optimize import minimize
-import jaxopt
-from itertools import combinations
 import psutil
 
 import tensorflow_probability.substrates.jax.distributions as tfd
@@ -38,75 +26,13 @@ logging.basicConfig(level=logging.INFO, format='[%(filename)s][%(asctime)s] %(le
 logger = logging.getLogger(__name__)
 
 import parameters
-from parameters import ParamsGLMLearn, ParameterProperties
+from parameters import ParamsGLMLearn
 import os, psutil
 process = psutil.Process()
-from multiprocessing import Pool
 
 from typing import List, Optional
 
 import optax 
-
-def callback_f(intermediate_result):
-    val = intermediate_result.fun
-    params = intermediate_result.x
-    logging.info(f'Likelihood: {-val:5.2f}, params: {ParamsGLMLearn(*params)}')
-    # print(intermediate_result.nit, intermediate_result.x, intermediate_result.fun)
-
-def pairs_to_triples(pairs):
-    triples = []
-    for pair in pairs:
-        expanded_vertex = [pair[0], pair[0], pair[1]]
-        triples.append(expanded_vertex)
-    return jnp.array(triples)
-
-def is_ndimensional_space(points):
-    # Convert the list of points to a NumPy array for easier manipulation
-    points_array = np.array(points)
-
-    # Check if the number of points is at least N+1
-    if len(points) < len(points_array[0]) + 1:
-        return False
-
-    # Compute vectors between the points
-    vectors = jnp.array([i[0]-i[1] for i in combinations(points_array, 2)])
-
-    # Compute the matrix rank to check for linear independence
-    rank = np.linalg.matrix_rank(vectors)
-
-    # If the rank is equal to N, the points form an N-dimensional space
-    return rank == len(points_array[0])
-
-def make_n_dimensional(points, key=None):
-    if key is None:
-        key = jax.random.PRNGKey(0)
-
-    # Convert the list of points to a NumPy array for easier manipulation
-    points_array = np.array(points)
-
-    # Check if the number of points is at least N+1
-    if len(points) < len(points_array[0]) + 1:
-        raise ValueError("The number of points must be at least N+1")
-
-    # If already n dimensional, just return the points
-    if is_ndimensional_space(points):
-        return points
-
-    # If the points do not form an N-dimensional space, perturb the last points
-
-    # Compute vectors between the points
-    vectors = jnp.array([i[0]-i[1] for i in combinations(points_array, 2)])
-
-    # Compute the matrix rank to check for linear independence
-    rank = np.linalg.matrix_rank(vectors)
-
-    rank_deficit = len(points_array[0]) - rank
-    for j in range(rank_deficit):
-        key, _ = jax.random.split(key)
-        perturbation = jax.random.normal(key, shape=(len(points_array[0]),))
-        points_array[-j-1] += perturbation
-
-    return points_array
 
 def fit_EM(
         model,
@@ -124,7 +50,6 @@ def fit_EM(
     m_step_optimizer = optax.adam(learning_rate=learning_rate)
     logging.info(f'M-step optimizer: adam, initial learning rate: {learning_rate}.')
 
-    liks = [] 
     params = initial_params
 
     def get_samples(params, subject_id):
@@ -135,40 +60,10 @@ def fit_EM(
             )
         return Zs.mean(0), lik
     
-    # def log_joint(params):
-    #     def log_joint_per_particle(z):
-    #         return model.log_joint(
-    #             X, Y, z, R=R, 
-    #             # params = ParamsGLMLearn(**_params),
-    #             params=params,
-    #             day_flags=day_flags,
-    #             )
-    
-    #     log_joint_MCvalues = jax.vmap(log_joint_per_particle)(Zs) 
-    #     # log_joint_MCvalues = jax.pmap(log_joint_per_particle)(Zs) 
-    #     val = jnp.mean(log_joint_MCvalues, axis=0)
-    #     return -val
-
-    # @jax.jit
     # @partial(jax.jit, static_argnums=(2,))
     def neg_log_joint(params, Z, subject_id):
-        # def _func(_Z):
         out = -model.log_joint(trajectories[subject_id], params=params)
         return out
-        # return jax.nn.logsumexp(jax.vmap(_func)(Z)) - jnp.log(N_particles)
-        # return jnp.mean(jax.vmap(_func)(Z))
-    
-    # def prediction_score(params, split=0.6, window=500):
-    #     split_ind = int(len(X) * split)
-    #     if split_ind + window > len(X):
-    #         window = len(X) - split - 1
-    #     score = model.score_predict(
-    #         key, params,
-    #         X_hist=X[:split_ind], Y_hist=Y[:split_ind], R_hist=R[:split_ind], day_flags=day_flags,
-    #         X_pred=X[split_ind:split_ind+window], Y_pred=Y[split_ind:split_ind+window],
-    #         N_particles=N_particles
-    #     )
-    #     return score
 
     def compute_noise_component(params, Z, subject_id):
         learning_updates = jax.vmap(lambda t: model.update_weights(
@@ -245,118 +140,8 @@ def fit_EM(
         # logging.info(f'[{iter_id} / M] Optim success: {res.success}. ELBO: {ELBO:.2f}. params: {res.x}')
         # ELBOs.append(ELBO)
         # # logging.info(f'[{iter_id}] Params: {res.x}')
-        
-        # liks.append(lik.item())
-
-    # result_dict = {
-    #     'params': params,
-    #     'T': T,
-    #     'N_particles': N_particles,
-    #     'seed': seed,
-    #     'liks': liks
-    # }
 
     return params, (best_val_per_subject, best_params_per_subject), opt_state
-
-def fit_LaplaceEM(X, Y, R=None, n_iters=200, model_kwargs={}, seed=0, N_particles=1000, session_indices=[]):
-    from jax.scipy.optimize import minimize
-    T, D = X.shape
-
-    current_params = [-1.0, -1.0, 0.5]
-
-    model = models.GLMLearn(seed=seed, **model_kwargs)
-    model.update_params_from_array(current_params)
-    logging.info("Getting initial MAP estimate")
-    (Zs, _), lik = samplers.bootstrap_filter(
-            N_particles, 
-            X, Y, 
-            model, 
-            R=R, session_indices=session_indices, 
-            return_history=True, verbose=True,
-    )
-    Z_MAP = jnp.mean(Zs, axis=0) # Initial estimate for Z_MAP
-
-    for iter_id in jnp.arange(n_iters):
-        model = models.GLMLearn(seed=seed, **model_kwargs)
-        model.update_params_from_array(current_params)
-
-        # E-step: 
-        def neg_log_posterior(Z_flat):
-            '''
-            posterior is proportional to joint
-            '''
-            Z = Z_flat.reshape((T, D+1))
-            val = model.log_joint(X, Y, Z, R=R, session_indices=session_indices)
-            return - val
-        
-        res = minimize(
-            neg_log_posterior,
-            x0 = Z_MAP.flatten(),
-            method='BFGS',
-            jac = jax.grad(neg_log_posterior),
-            options={'disp':101},
-            )
-        Z_MAP_flat = res.x
-        print(res)
-
-        Hinv = jnp.linalg.pinv(jax.hessian(neg_log_posterior)(Z_MAP_flat))
-        print(Hinv.shape)
-
-        # M-Step
-        def neg_log_joint(params_array):
-            val = model.log_joint(
-                X, Y, Z=Z_MAP_flat.reshape((T, D+1)), R=R, session_indices=session_indices,
-                params=ParamsGLMLearn._make(params_array), #ParamsGLMLearn(**params),
-                )
-            return - val
-
-        res = minimize(
-            neg_log_joint,
-            x0 = current_params,
-            method='L-BFGS-B',
-            jac = jax.grad(neg_log_joint),
-            bounds=[(-6,2), (-6,2), (0,1)],
-            )
-
-        logging.info(f'[{iter_id} - M] Optim success: {res.success}, Log-joint: {-res.fun:5.2f}, params: {res.x}')
-        current_params = res.x
-    return current_params     
-
-def fit_MLL(key, X, Y, R=None, model_kwargs={}, N_particles=10000, session_indices=[], initial_params=None):
-    model = models.GLMLearn(**model_kwargs)
-    T, D = X.shape
-
-    if initial_params is None:
-        initial_params = ParamsGLMLearn(log_sigma=-3.0, log_sigma_day=-1.0, alpha=0.5 * jnp.ones(D+1))
-
-    # Define objective function
-    @jax.jit
-    def neg_MLL(params):
-        '''Negative marginal log-likelihood, as a function of the parameters.'''
-        loglik = model.marginal_log_likelihood(
-                key, params, X, Y, R=R, session_indices=session_indices,
-                N_particles=N_particles,
-            )
-        # logging.info(f'Likelihood: {lik:5.2f}, memory: {process.memory_info().rss/1e6:5.2f} MB')
-        # logging.info(f'Func eval. Likelihood: {loglik}, params: {params}')
-        return - loglik
-
-    def callback(xk):
-        lik = -neg_MLL(xk)
-        logging.info(f'Marginal log-lik: {lik}, Params: {xk}')
-
-    # solver = jaxopt.ScipyMinimize(
-    #     method='Nelder-Mead',
-    #     jit=True,
-    #     fun=neg_MLL,
-    #     callback=callback,
-    #     )
-    logging.info(f'Fitting model with direct optimization of MLL.')
-    solver = jaxopt.BFGS(neg_MLL, verbose=True, maxiter=20)
-    res = solver.run(init_params=initial_params)
-    logging.info(f'Final params: {res.params}')
-    logging.info(f'Final state: {res.state}')
-    return res.params, res
 
 def find_initial(
         model, 
@@ -570,26 +355,9 @@ def find_initial(
     for i in range(5):
         logging.info(f'\tMLL: {-vals[sorted_indices[i]]:.2f}, Grid point: {grid_points[sorted_indices[i]]}')
 
-    # # Make initial simplex for nelder mead
-    # vertices = []
-    # for i in range(3+1):
-    #     vertex = grid_points[sorted_indices[i]]
-    #     vertices.append(vertex)
-    # # vertex_2 = grid_points[sorted_indices[1]]
-    # # vertex_3 = grid_points[sorted_indices[2]] + jax.random.normal(key, shape=(3,))*0.1 # add noise to ensure non-collinearity
-    # # vertex_3 = grid_points[sorted_indices[2]] + jax.random.normal(key, shape=(3,))*0.1 # add noise to ensure non-collinearity
-    # initial_simplex = jnp.stack(vertices, axis=0)
-    # initial_simplex = make_n_dimensional(initial_simplex, key=key)
-
     # Take lowest
     best_param_arrays = grid_points[sorted_indices[:return_top_n]]
     best_params = [array_to_params(params_array) for params_array in best_param_arrays]
-
-    # # Fix sigma
-    # logging.info("Fixing log sigma")
-    # best_params = [params._replace(log_sigma=-5.0) for params in best_params]
-
-    # logging.info(f'Best params: [log_alpha, log_sigma, log_sigma_day]={best_param_arrays[0]}, neg MLL: {vals[sorted_indices[0]]:.2f}, ')
     return best_params
 
 
@@ -613,42 +381,32 @@ def fit_optax(
     Returns:
         params: optimized parameters
     '''
-    # T, d = X.shape
-    # model = models.GLMLearn(**model_kwargs)
-    # model = models.TimeVarGLMLearn(**model_kwargs)
     key = jax.random.PRNGKey(seed)
     logging.info(f'Fitting model with optax gradient-ascent of MLL.')
 
     learning_rate = 0.01
-    scheduler = optax.exponential_decay(
-            init_value=learning_rate,
-            transition_steps=int(n_iters/2), # 2 cycles of decay
-            decay_rate=0.1,
-            transition_begin=10)
     
-    optimizer = optax.amsgrad(learning_rate=learning_rate)
-    logging.info(f'Optimizer: amsgrad. Minimize neg MLL. Learning rate: {learning_rate}.')
+    # scheduler = optax.exponential_decay(
+    #         init_value=learning_rate,
+    #         transition_steps=int(n_iters/2), # 2 cycles of decay
+    #         decay_rate=0.1,
+    #         transition_begin=10)
     # optimizer = optax.chain(
     #     # optax.scale_by_adam(),
     #     optax.scale_by_schedule(scheduler),
     # )
-    # logging.info(f'Starting optimization. Optimizer: adam + reduce_on_plateau, learning rate: {learning_rate}')
+    optimizer = optax.amsgrad(learning_rate=learning_rate)
+    logging.info(f'Optimizer: amsgrad. Minimize neg MLL. Learning rate: {learning_rate}.')
 
     # Define loss
     # @partial(jax.jit, static_argnums=(1,))
     def neg_MLL(params, subject_id):
         '''Negative marginal log-likelihood, as a function of the parameters.'''
-        # # Might need to add a loop over subjects
-        # loglik = model.marginal_log_likelihood(
-        #     key, params,
-        #     X, Y, R=R, day_flags=day_flags,
-        #     N_particles=N_particles,
-        #     verbose=False,
-        #     )
-
-        # Compute marginal log-likelihood with SMC, summing over subjects
-        loglik = 0.
+        # # Might need to add a loop over subjects, summing over subjects
         # for X_sub, Y_sub, R_sub, day_flags_sub in zip(X, Y, R, day_flags):
+
+        # Compute marginal log-likelihood with SMC
+        loglik = 0.
         loglik_sub = model.marginal_log_likelihood(
             key, params, 
             trajectories[subject_id],
@@ -688,16 +446,6 @@ def fit_optax(
         noise_component = w_post[1:] - learning_component[:-1]
         return noise_component
     
-    # @jax.jit
-    # def next_step_predict_score(params):
-    #     scores, _ = model.next_step_prediction_score(
-    #         key, params,
-    #         X, Y, R=R, day_flags=day_flags,
-    #         N_particles=N_particles,
-    #         verbose=False,
-    #     )
-    #     return -jnp.mean(scores)
-    
     # Initialize
     params = initial_params
     opt_state = optimizer.init(params)  # Obtain the `opt_state` that contains statistics for the optimizer.
@@ -716,15 +464,13 @@ def fit_optax(
     best_val_per_subject = [-jnp.inf]*len(trajectories)
     best_params_per_subject = [params]*len(trajectories)
     for i in range(n_iters):
-        # key, _ = jax.random.split(key)
-        # with Pool(10) as pool:
-        #     grads = pool.map(neg_evidence_value_and_grad, zip(X, Y, R, session_indices))
-        # print(grads)
+        # Select subject for SGD
         if len(trajectories) > 1:
             subject_id = jax.random.randint(jax.random.PRNGKey(i), shape=(), minval=0, maxval=len(trajectories)-1).item()
         else:
             subject_id = 0
 
+        # Compute grad
         neg_val, grad = jax.value_and_grad(lambda p: neg_MLL(p, subject_id))(params)
         val = -neg_val
         if val > best_val_per_subject[subject_id]:
@@ -732,27 +478,13 @@ def fit_optax(
             best_params_per_subject[subject_id] = params
 
         logging.info(f'[{i}] Subject {subject_id}, LL: {val:.4f}, L per trial: {jnp.exp(val/len(trajectories[subject_id].Y)):.4f}, params: {params}')
-        # if i % 10 == 0:
-        #     evaluate(params)
-            # logging.info(f'[{i}] \t2step score: {evaluate(params):.4f}')
-        # val, grad = jax.value_and_grad(next_step_predict_score)(params)
-
         updates, opt_state = optimizer.update(grad, opt_state, loss=neg_val)
         
-        # # Fix sigma
-        # updates = updates._replace(log_sigma=0.0)
+        # Apply updates
         params = optax.apply_updates(params, updates)
 
+        # Diagnostics
         if i % 20 == 0:
-            # if not isinstance(model, models.QLearning): # not implemented for Q-learning
-            #     Zs, _ = model.posterior_samples_scan(
-            #         key, params, 
-            #         X[subject_id], Y[subject_id], R[subject_id], day_flags[subject_id],
-            #         N_particles=N_particles, verbose=False, correct_bias=correct_bias,
-            #         )
-            #     Z = Zs.mean(0)
-            #     noise_component = compute_noise_component(params, Z, subject_id)
-            #     logging.info(f'[{i}] Noise component norm: {jnp.linalg.norm(noise_component):.2f}')
 
             # Forward pass liks and predicitions
 
@@ -776,93 +508,12 @@ def fit_optax(
 
     return params, (best_val_per_subject, best_params_per_subject), opt_state
 
-def parallel_fit():
-    # Load IBL data
-    df = pd.read_csv('./data/ibl_learning_processed.csv')
-    
-    lab = 'wittenlab'
-    lab_df = df[df['lab']=='wittenlab']
-    logging.info(f'Loaded IBL {lab} data.')
-
-    lab_subjects = np.unique(lab_df['subject'].values)
-
-    Xs, Ys, Rs = [], [], []
-    for subject in lab_subjects:
-        X, Y, sess_ind = ibl.get_mouse_design(
-            lab_df, subject=subject, 
-            regressors=['contrastLeft', 'contrastRight', 'previousChoice', 'previousRewarded'], # 'stimIntensity' #'contrastLeft', 'contrastRight',
-            )
-        # R = jnp.asarray(models.reward(X[:,1]-X[:,0], Y))
-        ER = jnp.asarray(models.effective_reward(X[:,1]-X[:,0]))
-        logging.info(f"Loaded subject {subject} data. T={len(Y)}.")
-
-        Xs.append(X)
-        Ys.append(Y)
-        Rs.append(ER)
-
-    # Start parallel fit
-    logging.info('Starting parallel fitting. PG learning rule.')
-    logging.info(f'CPU count: {os.cpu_count()}.')
-    with Pool() as pool:
-        results = pool.map(fit_MLL, zip(Xs, Ys, Rs))
-
-    for i, res in enumerate(results):
-        logging.info(f'Subject {lab_subjects[i]}: {res.x} at {res.nit} iterations. Likelihood: {-res.fun}')
-    
-    return results
-
-def plot_landscape(X, Y, R=None, model_kwargs={}, seed=0, N_particles=10000, day_flags=None):
-    def neg_MLL(params_array):
-        '''Negative marginal log-likelihood, as a function of the parameters.'''
-        # Instantiate model
-        model = models.GLMLearn(seed=seed, **model_kwargs)#, learning_rule='reinforce')
-        model.update_params_from_array(params_array)
-
-        # Compute marginal log-likelihood with SMC
-        _, lik = samplers.bootstrap_filter(
-            N_particles, 
-            X, Y, 
-            model, 
-            R=R, day_flags=day_flags, 
-            return_history=False, verbose=True
-            )
-        return -lik / len(Y)
-    
-    key = jax.random.PRNGKey(seed)
-
-    logging.info('Finding NM initial simplex.')
-    alphas = jnp.array([0.0, 0.001, 0.01, 0.025, 0.05, 0.1, 0.5])
-    logsigmas = jnp.array([-5.0, -4.0, -3.0, -2.0, -1.0])
-    logsigma_days = jnp.array([-2.0, -1.0, 0.0])
-
-    # Compute neg MLL over grid
-    grid_points = jnp.stack(jnp.meshgrid(logsigmas, logsigma_days, alphas), axis=-1).reshape(-1,3)
-    vals = jax.vmap(neg_MLL)(grid_points)
-
-    # for i, val in enumerate(vals):
-    #     logging.info(f'Params: {grid_points[i]}, neg MLL: {val:.2f}')
-
-    df = pd.DataFrame({'log_sigma':grid_points[:,0], 'log_sigma_day':grid_points[:,1], 'alpha':grid_points[:,-1], 'neg_MLL':vals})
-    print(df)
-
-    fig, axs = plt.subplots(figsize=[12,4], ncols=3, constrained_layout=True)
-
-    for i, log_sigma_day in enumerate(logsigma_days):
-        sub_df = df[df['log_sigma_day']==log_sigma_day]
-        plot_df = sub_df.pivot(index='log_sigma', columns='alpha', values='neg_MLL')
-        sns.heatmap(plot_df, annot=True, fmt=".3f", ax=axs[i], cmap='viridis_r')
-        axs[i].set_title(f'log_sigma_day: {log_sigma_day}')
-        # axs[].plot(plot_df['log_sigma'], plot_df['neg_MLL'], label=f'log_sigma_day: {log_sigma_day}')
-    # print(plot_df)
-    plt.savefig('landscape.png', dpi=300)
-    return vals
-
 def test_held_out_sessions(
         model, params,
         held_out_sessions: list,
         trajectory: Trajectory,
         session_indices: list=None,
-        N_particles: int=10000, 
+        N_particles: int=5000, 
         seed: int=0,
         ):
     '''
@@ -1155,8 +806,7 @@ if __name__=='__main__':
 
     logging.info(f"Model: {model}")
 
-    # ----------------------------------------------------------------
-
+    # ================================================================================
     # Step 1: Grid search
 
     logging.info('Starting fitting.')
@@ -1212,16 +862,9 @@ if __name__=='__main__':
 
         logging.info(f"Loaded params: {initial_params}")
 
+    # ================================================================================
+    # Step 2: Optimization of MLL with gradient ascent
 
-
-    # initial_params = top_gridsearch_params[-1]
-
-    # Step 2
-
-    # if args.all_subjects:
-    #     logging.info("Gradient computation is too expensive for all subjects. Skipping optimization.")
-    #     params = initial_params
-    # else:
     logging.info("-"*80)
     logging.info('Step 2: Optimization of MLL with gradient ascent.')
     if args.EM:
@@ -1257,7 +900,8 @@ if __name__=='__main__':
             )
         logging.info(f"'filter' Log-lik: {log_lik_filter:.2f}")
 
-    # Step 3
+    # ================================================================================
+    # Step 3: Parameter posterior sampling with MCMC
 
     logging.info("-"*80)
     logging.info('Step 3: Parameter posterior sampling with MCMC.')
@@ -1282,6 +926,7 @@ if __name__=='__main__':
     for i in range(len(posterior_means)):
         logging.info(f"alpha_{i}: mean = {posterior_means[i]:.2f}, med = {posterior_meds[i]:.2f}, CI = [{ci[i,0]:.2f}, {ci[i,1]:.2f}]")
 
+    # ================================================================================
     # Step 4 : Evaluation
 
     logging.info("-"*80)
@@ -1289,8 +934,6 @@ if __name__=='__main__':
 
     lengths = parameters.params_to_array(params)[1]
     for eval_params_array in [posterior_means, posterior_meds]:
-        # eval_params = params._replace(log_alpha=eval_log_alpha)
-        # eval_params = params.from_array(eval_params_array, lengths)
         eval_params = parameters.array_to_params(params, eval_params_array, lengths)
         logging.info(f'Params: {eval_params}')
 
@@ -1322,51 +965,6 @@ if __name__=='__main__':
         )
         logging.info(f'Prediction (prior predictive, sample Y) loglik: {prediction_loglik:.2f}, L per trial: {jnp.exp(prediction_loglik/len(full_trajectories[0].Y)):.4f}')
 
-        if not isinstance(model, models.QLearning):
-            Zs, loglik2 = model.posterior_samples(
-                key, params, 
-                full_trajectories[0],
-                N_particles=args.N_particles, verbose=False, LAG=True
-                )
-            Z = Zs.mean(0)
-            
-            learning_updates = jax.vmap(lambda t: model.update_weights(
-                key, Z[t], 
-                x=jnp.array(full_trajectories[0].X)[t], 
-                y=jnp.array(full_trajectories[0].Y)[t], 
-                r=jnp.array(full_trajectories[0].R)[t], 
-                day_flag=jnp.array(full_trajectories[0].day_flags)[t],
-                params=params, return_learning_signal=True,
-                )[1])(jnp.arange(len(full_trajectories[0].X)))
-            # learning_updates = learning_updates.mean(1)
-
-            if hasattr(model, 'split_latent'):
-                w_post = model.split_latent(Z)[-1]
-            else:
-                w_post = Z
-
-            if learning_updates.ndim == 1:
-                learning_updates = learning_updates[:, None]
-
-            learning_component = w_post[0] + jnp.cumsum(learning_updates, axis=0)
-            noise_component = w_post[1:] - learning_component[:-1]
-            logging.info(f'Noise component norm: {jnp.linalg.norm(noise_component):.2f}, per trial: {jnp.linalg.norm(noise_component)/len(full_trajectories[0].Y):.4f}')
-
-        # scores, loglik = model.next_step_prediction_score(
-        #     key, eval_params, 
-        #     X_train[0], Y_train[0], R=R_train[0], day_flags=day_flags_train[0],
-        #     N_particles=args.N_particles, verbose=True
-        #     )
-        # logging.info(f"Total log-likelihood: {loglik:.2f}, per trial: {loglik/len(Y_train[0]):.4f}")
-        # logging.info(f"Prediction score: {scores.mean():.4f} +/- {scores.std():.4f}, quartiles: {jnp.percentile(scores, jnp.array([25, 50, 75]))}")
-        
-        # scores2, _ = model.two_step_prediction_score(
-        #     key, eval_params,
-        #     X_train[0], Y_train[0], R=R_train[0], day_flags=day_flags_train[0], 
-        #     N_particles=args.N_particles, verbose=True
-        #     )
-        # logging.info(f"Two-step prediction score: {scores2.mean():.2f} +/- {scores2.std():.2f}, quartiles: {jnp.percentile(scores2, jnp.array([25, 50, 75]))}")
-
         # # Test
 
         # test_ll, test_lls = test(
@@ -1375,61 +973,3 @@ if __name__=='__main__':
         #     N_particles=args.N_particles
         #     )
         # logging.info(f"Test log-likelihood: {test_ll:.2f}, per trial: {test_lls.mean():.4f}")
-
-    # sys.exit()
-    
-    # for i, gridsearch_params in enumerate(top_gridsearch_params):
-    #     logging.info(f"Grid point #{i}: {gridsearch_params}")
-    
-    #     # # gridsearch_params = [-3.0, -5.0, -4.0]
-    #     # if isinstance(model, models.TimeVarGLMLearn):
-    #     #     initial_params = models.ParamsTimeVarGLMLearn(
-    #     #         beta_0=1.0,
-    #     #         log_alpha=gridsearch_params[0], 
-    #     #         log_sigma_0=gridsearch_params[1], 
-    #     #         log_sigma=gridsearch_params[1], 
-    #     #         log_sigma_day=gridsearch_params[2]
-    #     #         )
-    #     # else:
-    #     #     initial_params = ParamsGLMLearn(
-    #     #         log_sigma=gridsearch_params[1], 
-    #     #         log_sigma_day=gridsearch_params[2], 
-    #     #         log_alpha=gridsearch_params[0] * jnp.ones(X[0].shape[1]+1)
-    #     #         )
-    #     logging.info(f'Initial params: {initial_params}')
-
-    #     logging.info("Evaluating model prediction.")
-    #     scores, loglik = model.next_step_prediction_score(
-    #         key, initial_params, 
-    #         X_train[0], Y_train[0], R=R_train[0], day_flags=day_flags_train[0], 
-    #         N_particles=args.N_particles, verbose=True
-    #         )
-        
-    #     scores2, _ = model.two_step_prediction_score(
-    #         key, initial_params, 
-    #         X_train[0], Y_train[0], R=R_train[0], day_flags=day_flags_train[0],
-    #         N_particles=args.N_particles, verbose=True
-    #         )
-
-    #     logging.info(f"Prediction score: {scores.mean():.2f} +/- {scores.std():.2f}, quartiles: {jnp.percentile(scores, jnp.array([25, 50, 75]))}")
-    #     logging.info(f"Two-step prediction score: {scores2.mean():.2f} +/- {scores2.std():.2f}, quartiles: {jnp.percentile(scores2, jnp.array([25, 50, 75]))}")
-    #     logging.info(f"Total log-likelihood: {loglik:.2f}, likelihood per trial: {jnp.exp(loglik/len(Y)):.2f}")
-
-    #     # logging.info(f"Starting fitting. Model: GLM with '{args.learning_rule}' learning rule")
-    #     # params, res = fit_optax(
-    #     #     X_train[0], Y_train[0], R=R_train[0], session_indices=session_indices_train[0], 
-    #     #     N_particles=args.N_particles, model_kwargs={'learning_rule':args.learning_rule, 'z_0': z_0},
-    #     #     initial_params=initial_params, n_iters=200
-    #     #     )
-    #     # params, result_dict = fit_EM(
-    #     #     X_train[0], Y_train[0], R=R_train[0], session_indices=session_indices_train[0], 
-    #     #     N_particles=N_particles, model_kwargs={'learning_rule':args.learning_rule, 'z_0': z_0},
-    #     #     initial_params=initial_params,
-    #     #     posterior_type='smooth',
-    #     #     n_iters=20,
-    #     # )
-    #     # params, _ = fit_MLL(
-    #     #     key, X_train[0], Y_train[0], R=R_train[0], session_indices=session_indices_train[0],
-    #     #     N_particles=args.N_particles, model_kwargs={'learning_rule':args.learning_rule, 'z_0': z_0},
-    #     #     initial_params=initial_params,
-    #     #     )
