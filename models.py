@@ -9,8 +9,7 @@ from jaxtyping import Array, Float, Bool
 from functools import partial
 from tqdm import tqdm
 from ibl import Trajectory, trim_trajectory
-
-
+from constants import Choice
 
 import tensorflow_probability.substrates.jax.distributions as tfd
 
@@ -24,7 +23,7 @@ import logging
 logging.basicConfig(level=logging.INFO, format='[%(filename)s][%(asctime)s] %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-Y_L, Y_R = -1.0, 1.0 # Numerical value for the left, null, and right choices
+Y_L, Y_R = Choice.LEFT.value, Choice.RIGHT.value # Numerical value for the left, null, and right choices
 Y_vals = jnp.array([Y_L, Y_R])
 
 @jax.jit

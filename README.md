@@ -24,7 +24,7 @@ conda activate learning
 
 ### Model fitting
 
-To train a model, run `fit_ibl.py`. It accepts primarily the following arguments:
+To train a model, run `fit.py`. It accepts primarily the following arguments:
 - `N`: number of particles for SMC estimation of the marginal log-lik
 - `lab`: IBL lab to load from
 - `subject-id`: id within lab
@@ -32,7 +32,7 @@ To train a model, run `fit_ibl.py`. It accepts primarily the following arguments
 
 For example: to train a vectorized GLM policy model with policy-gradient learning dynamics, and output to `output.log`, run the following from your command line.
 ```
-python3 fit_ibl.py --N=5000 --model-class='RVBF' --vector-alpha > output.log 2>&1
+python3 fit.py --N=5000 --model-class='RVBF' --vector-alpha > output.log 2>&1
 ```
 
 This implementation currently *does not* save parameters per say, since the parameter count is always small I've been working with output files. You have to keep track of the logging file where this information is printed, and have it retrieved by other files.
@@ -46,7 +46,7 @@ Most postprocessing is done with `postprocessing/compute_posterior.py`. It has h
 - `--prior`: generate model prior predictive trajectories
 - `--load-from-file`: logging file containing the printed parameters
 
-To evaluate a specific fitted model, you must provide the same arguments that were called for `fit_ibl.py`, as well as a pointer to the output file containing the logged parameters. For instance, to evaluate the model we trained above, given outputs (incl. parameters) in the file `output.log`, run
+To evaluate a specific fitted model, you must provide the same arguments that were called for `fit.py`, as well as a pointer to the output file containing the logged parameters. For instance, to evaluate the model we trained above, given outputs (incl. parameters) in the file `output.log`, run
 ```
 python3 postprocessing/compute_posterior.py \
    --N=5000 --model-class='RVBF' --vector-alpha \

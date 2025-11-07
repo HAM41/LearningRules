@@ -15,14 +15,11 @@ import jax
 import jax.numpy as jnp
 import models
 import os; import sys
-
-HOMEDIR = '/home/vg0233/PillowLab/LearningRules/'
+from constants import Choice, HOMEDIR
 
 import logging
 logging.basicConfig(level=logging.INFO, format='[%(filename)s][%(asctime)s] %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-Y_L, Y_R = -1.0, 1.0 # Numerical value for the left, null, and right choices
 
 def tanh_transform(x, p: float=5.0) -> np.ndarray:
     return np.tanh(p*x)/np.tanh(p)
@@ -141,13 +138,13 @@ def format_regressor_data(df: pd.DataFrame, regressor_name:str) -> np.ndarray:
         data = tanh_transform(df['contrastRight'], p) # tanh transformation of right contrasts
     elif regressor_name == 'correctSide':
         # data = np.array(df['correctSide'])
-        data = np.where(df['contrastRight'] > df['contrastLeft'], Y_R, Y_L)
+        data = np.where(df['contrastRight'] > df['contrastLeft'], Choice.RIGHT.value, Choice.LEFT.value)
     elif regressor_name == 'previousChoice':
         y = np.array(df['choice'])
         data_temp = y[0:-1]
         data = np.concatenate(([0.0], data_temp))
     elif regressor_name == 'previousRewarded':
-        data_temp = np.where(df['contrastRight'] > df['contrastLeft'], Y_R, Y_L)[0:-1] # previous rewarded
+        data_temp = np.where(df['contrastRight'] > df['contrastLeft'], Choice.RIGHT.value, Choice.LEFT.value)[0:-1] # previous rewarded
         data = np.concatenate(([0.0], data_temp))
     
     assert len(data) == len(df), f"Data length mismatch: {len(data)} vs {len(df)}"
@@ -173,23 +170,23 @@ def get_mouse_design(
     X = np.zeros((data_temp.shape[0], len(regressors)))
     Y = np.array(data_temp['choice'])
     
-    if Y_L == -1.0:
+    if Choice.LEFT.value == -1.0:
         Y = 2 * Y - 1
         if np.sum(Y == 0.) > 0:
-            logger.warning(f"Warning: {np.sum(Y == 0.)}/{len(Y)} choices are 0.0, replaced with {Y_R}")
-            Y = np.where(Y==0., Y_R, Y)
+            logger.warning(f"Warning: {np.sum(Y == 0.)}/{len(Y)} choices are 0.0, replaced with {Choice.RIGHT.value}")
+            Y = np.where(Y==0., Choice.RIGHT.value, Y)
     else:
         if np.sum(Y == 0.5) > 0:
-            logger.warning(f"Warning: {np.sum(Y == 0.5)}/{len(Y)} choices are 0.0, replaced with {Y_R}")
-            Y = np.where(Y==0.5, Y_R, Y)
+            logger.warning(f"Warning: {np.sum(Y == 0.5)}/{len(Y)} choices are 0.0, replaced with {Choice.RIGHT.value}")
+            Y = np.where(Y==0.5, Choice.RIGHT.value, Y)
 
-    # Y = np.where(Y == 0., Y_L, Y) # make decision = 0 as Y_L
+    # Y = np.where(Y == 0., Choice.LEFT.value, Y) # make decision = 0 as Choice.LEFT.value
 
     # Ensure that notations match 
-    assert np.isin(Y, np.array([Y_L, Y_R])).all(), f"Choices must in {[Y_L, Y_R]} but got {np.unique(Y, return_counts=True)}"
+    assert np.isin(Y, np.array([Choice.LEFT.value, Choice.RIGHT.value])).all(), f"Choices must in {[Choice.LEFT.value, Choice.RIGHT.value]} but got {np.unique(Y, return_counts=True)}"
     
     _sub_df = data_temp.query("contrastRight != 0.0 and contrastLeft != 0.0")
-    _correct_choice = np.where(_sub_df["contrastRight"] > _sub_df["contrastLeft"], Y_R, Y_L)
+    _correct_choice = np.where(_sub_df["contrastRight"] > _sub_df["contrastLeft"], Choice.RIGHT.value, Choice.LEFT.value)
     _feedback = _correct_choice == np.array(_sub_df['choice']).astype(float)
     assert (_feedback == _sub_df["feedbackType"]).all(), f"Correct choice and feedbackType mismatch {np.sum(_feedback != data_temp["feedbackType"])}"
 
@@ -216,7 +213,7 @@ def load_session_indices(lab, subject_id):
         df.to_csv(f'IBL_{protocol}_protocol.csv', index=False)
         df = format_IBL_behavioral_data(df)
     else:
-        df = pd.read_csv(HOMEDIR + 'data/IBL_training_protocol.csv')
+        df = pd.read_csv(HOMEDIR / "data" / "IBL_training_protocol.csv")
         df = format_IBL_behavioral_data(df)
 
     assert lab in np.unique(df['lab'].values), f"Lab {lab} not found in data."
@@ -264,7 +261,7 @@ def format_reward(X, Y, regressors, learning_rule) -> jnp.ndarray:
 class Trajectory(NamedTuple):
     '''IBL single trajectory data, with T trials.'''
     X: Float[Array, "T M"]      # Regressors, M-dimensional
-    Y: Float[Array, "T"]        # Choices, in {Y_L, Y_R}
+    Y: Float[Array, "T"]        # Choices
     R: Float[Array, "T"]        # Rewards
     day_flags: Bool[Array, "T"] # Day flags, True if new day/session
 
@@ -383,9 +380,9 @@ class IBLSingleTrajectoryLoader():
             df.to_csv(f'data/IBL_{protocol}_protocol.csv', index=False)
         else:
             try:
-                df = pd.read_csv(HOMEDIR + f'data/IBL_{protocol}_protocol.csv')
+                df = pd.read_csv(HOMEDIR / "data" / f'IBL_{protocol}_protocol.csv')
             except FileNotFoundError:
-                logger.error(f"IBL '{protocol}' protocol data not found. Expected in {HOMEDIR+'data/'}. Use DOWNLOAD=True to download the data from the ONE api.")
+                logger.error(f"IBL '{protocol}' protocol data not found. Expected in {HOMEDIR+'/data/'}. Use DOWNLOAD=True to download the data from the ONE api.")
                 sys.exit(1)
         df = format_IBL_behavioral_data(df)
 
@@ -432,7 +429,7 @@ class IBLSingleTrajectoryLoader():
         return self.data['trajectory'], self.data['held_out_trials']
     
 def get_number_subjects(lab):
-    df = pd.read_csv(HOMEDIR + 'data/IBL_training_protocol.csv')
+    df = pd.read_csv(HOMEDIR / 'data' / 'IBL_training_protocol.csv')
     df = format_IBL_behavioral_data(df)
     assert lab in np.unique(df['lab'].values), f"Lab {lab} not found in data."
     lab_df = df[df['lab']==lab]
@@ -440,7 +437,7 @@ def get_number_subjects(lab):
     return len(lab_subjects)
 
 def load_session_indices(lab, subject_id):
-    df = pd.read_csv(HOMEDIR + 'data/IBL_training_protocol.csv')
+    df = pd.read_csv(HOMEDIR / 'data' / 'IBL_training_protocol.csv')
     df = format_IBL_behavioral_data(df)
     assert lab in np.unique(df['lab'].values), f"Lab {lab} not found in data."
     lab_df = df[df['lab']==lab]
@@ -465,8 +462,7 @@ def trajectory_length(lab, subject_id):
 
 
 if __name__=='__main__':
-    HOMEDIR = '/home/vg0233/PillowLab/LearningRules/'
-    logging.warning(f"Y_L and Y_R are set to {Y_L} and {Y_R} as global variables.")
+    logging.warning(f"Choice.LEFT.value and Choice.RIGHT.value are set to {Choice.LEFT.value} and {Choice.RIGHT.value} as global variables.")
 
     # df = pd.read_csv(HOMEDIR + 'data/IBL_training_protocol.csv')
     # num_unique_animals = df['subject'].nunique()
@@ -485,7 +481,7 @@ if __name__=='__main__':
     # print(all_n_sessions)
     # # jnp.save(HOMEDIR + 'data/IBL_trajectory_lengths.npy', jnp.array(all_n_sessions))
 
-    df = pd.read_csv(HOMEDIR + 'data/IBL_no_curriculum_protocol.csv')
+    df = pd.read_csv(HOMEDIR / 'data' / 'IBL_no_curriculum_protocol.csv')
     # print(df.sort_values(by=['subject', 'date', 'session'], ignore_index=True))
 
     # first_subject = df['subject'].values[0]
