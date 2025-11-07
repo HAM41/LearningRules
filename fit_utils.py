@@ -1,5 +1,9 @@
 import models
 import argparse
+import numpy as np
+import jax
+import jax.numpy as jnp
+from itertools import combinations
 
 def load_model(args: argparse.Namespace):
     if args.model_class == "GLMLearn":
@@ -33,3 +37,51 @@ def load_model(args: argparse.Namespace):
     else:
         raise ValueError(f"Model class {args.model_class} not recognized.")
     return model
+
+def is_ndimensional_space(points):
+    # Convert the list of points to a NumPy array for easier manipulation
+    points_array = np.array(points)
+
+    # Check if the number of points is at least N+1
+    if len(points) < len(points_array[0]) + 1:
+        return False
+
+    # Compute vectors between the points
+    vectors = jnp.array([i[0]-i[1] for i in combinations(points_array, 2)])
+
+    # Compute the matrix rank to check for linear independence
+    rank = np.linalg.matrix_rank(vectors)
+
+    # If the rank is equal to N, the points form an N-dimensional space
+    return rank == len(points_array[0])
+
+def make_n_dimensional(points, key=None):
+    if key is None:
+        key = jax.random.PRNGKey(0)
+
+    # Convert the list of points to a NumPy array for easier manipulation
+    points_array = np.array(points)
+
+    # Check if the number of points is at least N+1
+    if len(points) < len(points_array[0]) + 1:
+        raise ValueError("The number of points must be at least N+1")
+
+    # If already n dimensional, just return the points
+    if is_ndimensional_space(points):
+        return points
+
+    # If the points do not form an N-dimensional space, perturb the last points
+
+    # Compute vectors between the points
+    vectors = jnp.array([i[0]-i[1] for i in combinations(points_array, 2)])
+
+    # Compute the matrix rank to check for linear independence
+    rank = np.linalg.matrix_rank(vectors)
+
+    rank_deficit = len(points_array[0]) - rank
+    for j in range(rank_deficit):
+        key, _ = jax.random.split(key)
+        perturbation = jax.random.normal(key, shape=(len(points_array[0]),))
+        points_array[-j-1] += perturbation
+
+    return points_array
