@@ -2,9 +2,7 @@ import pandas as pd
 from tqdm import tqdm
 import argparse
 
-import VR
 import ibl
-from ibl import Trajectory
 import sys
 sys.path.append('../')
 import fit_utils
@@ -26,7 +24,7 @@ logging.basicConfig(level=logging.INFO, format='[%(filename)s][%(asctime)s] %(le
 logger = logging.getLogger(__name__)
 
 import parameters
-from parameters import ParamsGLMLearn
+from parameters import Trajectory
 import os, psutil
 process = psutil.Process()
 
@@ -285,9 +283,10 @@ def find_initial(
             baseline_val = baseline * jnp.ones((d+1,)) if vector_alpha else baseline
             log_sigma = log_sigma * jnp.ones((d+1,)) if vector_alpha else log_sigma
             log_sigma_day = log_sigma_day * jnp.ones((d+1,)) if vector_alpha else log_sigma_day
-            # w0_val = jnp.zeros((d+1,)) if vector_alpha else jnp.zeros((1,))
+            w_0_val = jnp.zeros((d+1,))
             params = parameters.ParamsRVBF(
-                log_alpha=log_alpha_val, log_sigma=log_sigma, log_sigma_day=log_sigma_day, log_Q=log_q * jnp.ones((d+1,)), baseline=baseline_val,
+                log_alpha=log_alpha_val, log_sigma=log_sigma, log_sigma_day=log_sigma_day, 
+                log_Q=log_q * jnp.ones((d+1,)), baseline=baseline_val, w_0=w_0_val
             )
         elif isinstance(model, models.TimeVarRVBF):
             log_alpha, log_sigma, log_sigma_day, log_sigma_0, baseline = params_array
@@ -296,10 +295,10 @@ def find_initial(
             log_sigma = log_sigma * jnp.ones((d+1,)) if vector_alpha else log_sigma
             log_sigma_day = log_sigma_day * jnp.ones((d+1,)) if vector_alpha else log_sigma_day
             log_q = -5.0
-            # w0_val = jnp.zeros((d+1,)) if vector_alpha else jnp.zeros((1,))
+            w_0_val = jnp.zeros((d+1,))
             params = parameters.ParamsTimeVarRVBF(
                 log_alpha=log_alpha_val, log_sigma=log_sigma, log_sigma_day=log_sigma_day, log_Q=log_q * jnp.ones((d+1,)), 
-                baseline=baseline_val, log_sigma_0=log_sigma_0, #w0=w0_val
+                baseline=baseline_val, log_sigma_0=log_sigma_0, w_0=w_0_val
             )
         elif isinstance(model, models.HRL):
             log_alpha, log_sigma, log_sigma_day, log_sigma_0, q0 = params_array
@@ -313,15 +312,11 @@ def find_initial(
                 baseline_0=0., baseline_1=baseline_val,
                 q0=q0,
             )
-        elif isinstance(model, models.POGLMLearn):
-            log_alpha, log_sigma, log_sigma_day = params_array
-            log_alpha_val = log_alpha * jnp.ones((d+1,)) if vector_alpha else log_alpha
-            log_sigma_m = log_sigma * jnp.ones((d+1,)) if vector_alpha else log_sigma
-            params = parameters.ParamsPOGLMLearn(log_alpha=log_alpha_val, log_sigma=log_sigma, log_sigma_day=log_sigma_day, log_sigma_m=log_sigma_m)
         else:
             log_alpha, log_sigma, log_sigma_day = params_array
             log_alpha_val = log_alpha * jnp.ones((d+1,)) if vector_alpha else log_alpha
-            params = ParamsGLMLearn(log_alpha=log_alpha_val, log_sigma=log_sigma, log_sigma_day=log_sigma_day)#, p=p)
+            w_0_val = jnp.zeros((d+1,))
+            params = parameters.ParamsGLMLearn(log_alpha=log_alpha_val, log_sigma=log_sigma, log_sigma_day=log_sigma_day, w_0=w_0_val)
         return params
     
     logging.info(f"Memory available: {psutil.virtual_memory().available/1e6} MB")
@@ -412,6 +407,7 @@ def fit_optax(
             trajectories[subject_id],
             N_particles=N_particles,
             verbose=False,
+            differentiable=True,
         )
         loglik += loglik_sub
         return -loglik
@@ -855,7 +851,7 @@ if __name__=='__main__':
                 log_sigma_day=loaded_params.log_sigma_day,
                 log_Q=loaded_params.log_Q,
                 baseline=loaded_params.baseline,
-                # w0=loaded_params.w0,
+                # w_0=loaded_params.w_0,
             )
         else:
             initial_params = loaded_params            
@@ -876,7 +872,7 @@ if __name__=='__main__':
         model,
         train_trajectories,
         N_particles=args.N_particles,
-        initial_params=initial_params, n_iters=20,
+        initial_params=initial_params, n_iters=200,
         )
     logging.info(f'Final params: {optax_final_params}')
     for sub in range(len(train_trajectories)):

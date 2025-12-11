@@ -13,3 +13,5 @@ postprocessing/posterior/
 figures/
 slurm_outs/
 *.slurm
+*.log
+*.pkl
