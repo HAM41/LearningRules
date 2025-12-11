@@ -8,8 +8,8 @@ from typing import Tuple, Optional, Iterable, Union, NamedTuple
 from jaxtyping import Array, Float, Bool
 from functools import partial
 from tqdm import tqdm
-from ibl import Trajectory, trim_trajectory
 from constants import Choice
+import functools
 
 import tensorflow_probability.substrates.jax.distributions as tfd
 
@@ -17,7 +17,7 @@ import os
 os.environ['JAX_PLATFORMS']='cpu'
 
 import parameters
-from parameters import ParamsGLMLearn, ParamsPsytrack, ParamsTimeVarGLMLearn #, handle_none_params
+from parameters import ParamsGLMLearn, ParamsPsytrack, ParamsTimeVarGLMLearn, Trajectory, trim_trajectory #, handle_none_params
 
 import logging
 logging.basicConfig(level=logging.INFO, format='[%(filename)s][%(asctime)s] %(levelname)s - %(message)s')
@@ -378,39 +378,51 @@ def sample_one_particle_gumbel(
     z_new = y @ tilde_z_t
     return z_new
 
-
+@functools.partial(jax.jit, static_argnames=("temperature", "straight_through"))
 def resample_particles_gumbel_vmap(
     rng,
     tilde_z_t: jnp.ndarray,    # shape (N, M)
     log_tilde_w_t: jnp.ndarray,# shape (N,)
     temperature: float = 0.5,
-    straight_through: bool = True
+    straight_through: bool = True,
+    eps: float = 1e-10,
 ) -> jnp.ndarray:
     """
     Resamples N new particles via Gumbel-Softmax, returning shape (N, M).
     Does so without building an (N x N) matrix.
     """
-    # Convert log-weights to normalized probabilities
+    N, M = tilde_z_t.shape
+
+    # 1) compute probabilities once
     max_log_w = jnp.max(log_tilde_w_t)
     logw_stable = log_tilde_w_t - max_log_w
     w = jnp.exp(logw_stable)
-    p = w / jnp.sum(w)  # shape (N,)
+    p = w / jnp.sum(w)
 
-    N = tilde_z_t.shape[0]
-    subkeys = jax.random.split(rng, N)
+    # precompute log p once
+    log_p = jnp.log(p + eps)
 
-    # We'll vmap over 'N' draws:
-    def single_draw(subkey):
-        return sample_one_particle_gumbel(
-            subkey,
-            p=p,
-            tilde_z_t=tilde_z_t,
-            temperature=temperature,
-            straight_through=straight_through
-        )
+    # 2) one key per sample (N samples)
+    keys = jax.random.split(rng, N)
 
-    # shape: (N, M)
-    z_new = jax.vmap(single_draw)(subkeys)
+    def sample_one(key):
+        # gumbel over categories (N,)
+        g = jax.random.gumbel(key, shape=(N,))
+        logits = log_p + g
+        y_soft = jax.nn.softmax(logits / temperature)
+
+        if straight_through:
+            idx = jnp.argmax(y_soft)
+            y_hard = jnp.zeros_like(y_soft).at[idx].set(1.0)
+            y = y_hard + lax.stop_gradient(y_soft - y_hard)
+        else:
+            y = y_soft
+
+        # (N,) @ (N, M) -> (M,)
+        return y @ tilde_z_t
+
+    # 3) Vectorize over samples
+    z_new = jax.vmap(sample_one)(keys)
     return z_new
 
 from functools import partial
@@ -1085,7 +1097,7 @@ class GLMLearn():
             N: int, number of samples
             d: int, number of regressors. Weights are of shape (d+1,), for the bias. 
         '''
-        return jax.random.normal(key, shape=(N, d+1,))
+        return params.w_0 + jax.random.normal(key, shape=(N, d+1,))
     
     # @handle_none_params
     def dynamics_loglikelihood(self, z_next, z_prev, inputs, data, 
@@ -1265,7 +1277,8 @@ class GLMLearn():
         return z_history, log_lik
 
     def marginal_log_likelihood(self, key, params, trajectory: Trajectory,
-                                N_particles=1000, verbose=False, return_logliks = False):
+                                N_particles=1000, verbose=False, return_logliks = False, 
+                                differentiable: bool=False):
         '''Use scan to make computation more efficient.'''
         X, Y, R, day_flags = trajectory.X, trajectory.Y, trajectory.R, trajectory.day_flags
         if X.ndim == 1:
@@ -1291,14 +1304,16 @@ class GLMLearn():
             p = jnp.exp(log_tilde_w_t - jnp.max(log_tilde_w_t))
             
             # 2. Update step : resample with replacement N particles according the importance weights
-            z_t = jax.random.choice(subkey1, tilde_z_t, shape=(N_particles,), p=p)
-            # z_t = resample_particles_gumbel_scan(
-            #     rng=subkey1,
-            #     tilde_z_t=tilde_z_t,
-            #     log_tilde_w_t=log_tilde_w_t,
-            #     temperature=0.5,
-            #     straight_through=True
-            # )
+            if differentiable:
+                z_t = resample_particles_gumbel_vmap(
+                    rng=subkey1,
+                    tilde_z_t=tilde_z_t,
+                    log_tilde_w_t=log_tilde_w_t,
+                    temperature=0.5,
+                    straight_through=True
+                )
+            else:
+                z_t = jax.random.choice(subkey1, tilde_z_t, shape=(N_particles,), p=p)
 
             # -- Update log-likelihood estimate
             log_lik = logmeanexp(log_tilde_w_t)
