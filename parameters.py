@@ -1,6 +1,35 @@
 from typing import NamedTuple, Type, Union, Tuple, List
 import jax.numpy as jnp
 import numpy as np
+from jaxtyping import Array, Float, Bool
+
+# Data
+
+class Trajectory(NamedTuple):
+    '''IBL single trajectory data, with T trials.'''
+    X: Float[Array, "T M"]      # Regressors, M-dimensional
+    Y: Float[Array, "T"]        # Choices
+    R: Float[Array, "T"]        # Rewards
+    day_flags: Bool[Array, "T"] # Day flags, True if new day/session
+
+    def __len__(self) -> int:
+        """Return number of trials (length of Y)."""
+        return len(self.Y)
+
+def trim_trajectory(trajectory: Trajectory, T: int) -> Trajectory:
+    '''Trim trajectory up to T trials. If trajectory shorter than T, return original trajectory.'''
+    curr_T = trajectory.X.shape[0]
+    if curr_T <= T:
+        return trajectory
+    else:
+        return Trajectory(
+            X=trajectory.X[:T],
+            Y=trajectory.Y[:T],
+            R=trajectory.R[:T],
+            day_flags=trajectory.day_flags[:T]
+        )
+
+# Params
 
 class ParameterProperties():
     def __init__(self, trainable: bool=True) -> None:
@@ -10,6 +39,7 @@ class ParamsGLMLearn(NamedTuple):
     log_sigma: Union[float, ParameterProperties]
     log_sigma_day: Union[float, ParameterProperties]
     log_alpha: Union[float, jnp.ndarray, ParameterProperties]
+    w_0: jnp.ndarray = jnp.zeros((2,))
 
 class ParamsPsytrack(NamedTuple):
     log_sigma: float
@@ -94,6 +124,7 @@ class ParamsRVBF(NamedTuple):
     log_alpha: Union[float, jnp.ndarray]
     log_Q: jnp.ndarray
     baseline: Union[float, jnp.ndarray]
+    w_0: jnp.ndarray = jnp.zeros((5,)) #! magic dim val
 
 class ParamsTimeVarRVBF(NamedTuple):
     log_sigma: Union[float, jnp.ndarray]
@@ -103,6 +134,7 @@ class ParamsTimeVarRVBF(NamedTuple):
     baseline: Union[float, jnp.ndarray]
     beta_0: Union[float, jnp.ndarray] = 0.0
     log_sigma_0: float = -5.0
+    w_0: jnp.ndarray = jnp.zeros((5,)) #! magic dim val
 
 class ParamsHRL(NamedTuple):
     log_sigma: Union[float, jnp.ndarray]

@@ -9,13 +9,13 @@ Useful links:
 '''
 import numpy as np
 import pandas as pd
-from typing import NamedTuple, List, Tuple, Optional
-from jaxtyping import Array, Float, Bool
+from typing import List, Tuple, Optional
 import jax
 import jax.numpy as jnp
 import models
 import os; import sys
 from constants import Choice, HOMEDIR
+from parameters import Trajectory
 
 import logging
 logging.basicConfig(level=logging.INFO, format='[%(filename)s][%(asctime)s] %(levelname)s - %(message)s')
@@ -258,13 +258,6 @@ def format_reward(X, Y, regressors, learning_rule) -> jnp.ndarray:
     R = jax.vmap(reward_func)(X, Y)
     return R
 
-class Trajectory(NamedTuple):
-    '''IBL single trajectory data, with T trials.'''
-    X: Float[Array, "T M"]      # Regressors, M-dimensional
-    Y: Float[Array, "T"]        # Choices
-    R: Float[Array, "T"]        # Rewards
-    day_flags: Bool[Array, "T"] # Day flags, True if new day/session
-
 def split_train_test_sessions(X, Y, R, day_flags, session_indices, held_out_sessions):
     '''
     Split per session, then concatenate held_out_sessions into test set, and others into training set.
@@ -323,19 +316,6 @@ def hold_out_trials(X, Y, R, day_flags, held_out_trials):
 
     train_trajectory = Trajectory(X_train, Y_train, R_train, day_flags_train)
     return train_trajectory
-
-def trim_trajectory(trajectory: Trajectory, T: int) -> Trajectory:
-    '''Trim trajectory up to T trials. If trajectory shorter than T, return original trajectory.'''
-    curr_T = trajectory.X.shape[0]
-    if curr_T <= T:
-        return trajectory
-    else:
-        return Trajectory(
-            X=trajectory.X[:T],
-            Y=trajectory.Y[:T],
-            R=trajectory.R[:T],
-            day_flags=trajectory.day_flags[:T]
-        )
 
 class IBLSingleTrajectoryLoader():
     def __init__(self, params, DOWNLOAD=False):
