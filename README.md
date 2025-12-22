@@ -17,6 +17,7 @@ To use this code on another dataset, format the data in this `Trajectory` tuple 
 conda env create -f environment.yml
 conda activate learning
 ```
+This should take below 30 minutes on most modern Linux systems and clusters.
 
 **Option 2**: For plain venv/pip, use `requirements.txt`. 
 
@@ -34,8 +35,9 @@ For example: to train a vectorized GLM policy model with policy-gradient learnin
 ```
 python3 fit.py --N=5000 --model-class='RVBF' --vector-alpha > output.log 2>&1
 ```
+The run time varies with recording length, but be within hours for typical recordings of >10,000 trials on academic clusters. To test execution on your machine, please see `demos/fit_demo.py`, which is a simpler fitting script on a randomly generated dataset.  
 
-This implementation currently *does not* save parameters per say, since the parameter count is always small I've been working with output files. You have to keep track of the logging file where this information is printed, and have it retrieved by other files.
+This implementation currently *does not* save parameters per say, since the parameter count is always small we've been working with output files. You have to keep track of the logging file where this information is printed, and have it retrieved by other files. 
 
 ### Model postprocessing
 
@@ -52,3 +54,5 @@ python3 postprocessing/compute_posterior.py \
    --N=5000 --model-class='RVBF' --vector-alpha \
    --load-from-file='output.log' --evaluate
 ```
+
+The run time varies with recording length, but be within minutes for typical recordings of >10,000 trials on academic clusters. 

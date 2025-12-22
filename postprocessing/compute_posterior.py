@@ -17,7 +17,7 @@ import fit_utils
 import VR
 import ibl
 import models, parameters
-from fit_ibl import posterior_mcmc
+from fit import posterior_mcmc
 
 import logging
 logging.basicConfig(level=logging.INFO, format='[%(filename)s][%(asctime)s] %(levelname)s - %(message)s')
