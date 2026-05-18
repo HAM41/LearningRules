@@ -337,7 +337,16 @@ def find_initial(
     
     # Compute neg MLL over grid
     if vmap:
-        vals = jax.vmap(neg_MLL)(grid_points)
+        # Chunked vmap so progress is visible. Each chunk is one fused JAX call;
+        # the first chunk pays the JIT compile, subsequent chunks reuse the cache.
+        chunk_size = min(32, grid_points.shape[0])
+        n_chunks = (grid_points.shape[0] + chunk_size - 1) // chunk_size
+        vmapped = jax.vmap(neg_MLL)
+        chunks = []
+        for c in tqdm(range(n_chunks), desc='Grid search (vmap chunks)'):
+            chunk = grid_points[c * chunk_size:(c + 1) * chunk_size]
+            chunks.append(vmapped(chunk))
+        vals = jnp.concatenate(chunks)
     else:
         vals = []
         for params in tqdm(grid_points, desc='Grid search'):
@@ -459,7 +468,8 @@ def fit_optax(
     # Optimize
     best_val_per_subject = [-jnp.inf]*len(trajectories)
     best_params_per_subject = [params]*len(trajectories)
-    for i in range(n_iters):
+    pbar = tqdm(range(n_iters), desc='fit_optax')
+    for i in pbar:
         # Select subject for SGD
         if len(trajectories) > 1:
             subject_id = jax.random.randint(jax.random.PRNGKey(i), shape=(), minval=0, maxval=len(trajectories)-1).item()
@@ -474,6 +484,7 @@ def fit_optax(
             best_params_per_subject[subject_id] = params
 
         logging.info(f'[{i}] Subject {subject_id}, LL: {val:.4f}, L per trial: {jnp.exp(val/len(trajectories[subject_id].Y)):.4f}, params: {params}')
+        pbar.set_postfix(LL=f'{float(val):.2f}', subj=subject_id)
         updates, opt_state = optimizer.update(grad, opt_state, loss=neg_val)
         
         # Apply updates
