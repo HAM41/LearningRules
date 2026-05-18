@@ -1900,12 +1900,14 @@ class TimeVarGLMLearn(GLMLearn):
     def sample_initial(self, key: PRNGKey, params, N: int, d: int=1):
         '''Sample from the initial distribution p(z_0)'''
         beta = params.beta_0 + jnp.exp(params.log_sigma_0) * jax.random.normal(key, shape=(N, self.beta_dim))
-        w = super().sample_initial(key, params=None, N=N, d=d)
+        # Avoid super().sample_initial(params=None): the parent dereferences
+        # params.w_0, but these subclasses' Params types don't define w_0.
+        w = jax.random.normal(key, shape=(N, d + 1))
         z = self.merge_latent(beta, w)
         assert z.shape == (N, self.beta_dim + d + 1)
         return z
         
-    def update_weights(self, key: PRNGKey, z, x, params, y=None, r=None, day_flag=False, return_learning_signal=False):
+    def update_weights(self, key: PRNGKey, z, x, params, y=None, r=None, day_flag=False, return_learning_signal=False, correct_bias=False, **kwargs):
         beta_t, w_t = self.split_latent(z)
         key, beta_key, w_key = jax.random.split(key, 3)
         
@@ -1916,6 +1918,21 @@ class TimeVarGLMLearn(GLMLearn):
         
         # learning_signal = jnp.multiply(jnp.exp(log_learning_rate), regression_gradient(w_t, x, y, r, params))
         # learning_signal = jnp.multiply(jnp.exp(params.log_alpha), regression_gradient(w_t, x, y, params, r1=beta_t[:,1], r0=beta_t[:,0]))
+
+        # Time-varying learning rate: same switch as GLMLearn.update_weights but
+        # using log_learning_rate (=log_alpha + beta_t) in place of params.log_alpha.
+        if self.learning_rule == 'reinforce':
+            learning_signal = jnp.multiply(jnp.exp(log_learning_rate), reinforce(w_t, x, y, r))
+        elif self.learning_rule == 'policy_gradient':
+            learning_signal = jnp.multiply(jnp.exp(log_learning_rate), policy_gradient(w_t, x, r))
+        elif self.learning_rule == 'maximum_likelihood':
+            learning_signal = jnp.multiply(jnp.exp(log_learning_rate), maximum_likelihood(w_t, x))
+        elif self.learning_rule == 'max_ent':
+            learning_signal = jnp.multiply(jnp.exp(log_learning_rate), max_ent(w_t, x, y, r))
+        elif self.learning_rule == 'max_ent_mc':
+            learning_signal = jnp.multiply(jnp.exp(log_learning_rate), max_ent_MC(w_t, x, y, r))
+        else:
+            raise ValueError(f"Learning rule {self.learning_rule} not implemented.")
 
          # Add noise
         update_noise = jax.random.normal(w_key, shape=w_t.shape)
@@ -1938,6 +1955,10 @@ class TimeVarGLMLearn(GLMLearn):
             learning_signal = learning_signal - jnp.multiply(sigmoid(beta_t), forget_term)
         else:
             learning_signal = learning_signal - forget_term
+
+        # If requested, suppress learning/noise on the bias dimension (col 0)
+        learning_signal = jnp.where(correct_bias, learning_signal.at[..., 0].set(0.0), learning_signal)
+        update_noise = jnp.where(correct_bias, update_noise.at[..., 0].set(0.0), update_noise)
 
         w_t = w_t + learning_signal + update_noise
         beta_t = beta_t + jnp.exp(params.log_sigma_0) * jax.random.normal(beta_key, shape=beta_t.shape)
@@ -2009,7 +2030,9 @@ class AC(GLMLearn):
     def sample_initial(self, key: PRNGKey, params, N: int, d: int=1):
         '''Sample from the initial distribution p(z_0)'''
         beta = params.beta_0 + jnp.exp(params.log_sigma_0) * jax.random.normal(key, shape=(N, self.beta_dim))
-        w = super().sample_initial(key, params=None, N=N, d=d)
+        # Avoid super().sample_initial(params=None): the parent dereferences
+        # params.w_0, but these subclasses' Params types don't define w_0.
+        w = jax.random.normal(key, shape=(N, d + 1))
         z = self.merge_latent(beta, w)
         assert z.shape == (N, self.beta_dim + d + 1)
         return z
@@ -2131,7 +2154,9 @@ class GLMBaseLearn(GLMLearn):
 
     def sample_initial(self, key: PRNGKey, params, N: int, d: int=1):
         '''Sample from the initial distribution p(z_0)'''
-        w = super().sample_initial(key, params=None, N=N, d=d)
+        # Avoid super().sample_initial(params=None): the parent dereferences
+        # params.w_0, but these subclasses' Params types don't define w_0.
+        w = jax.random.normal(key, shape=(N, d + 1))
         if self.time_var:
             beta = params.baseline_weights + jnp.exp(params.log_sigma_0) * jax.random.normal(key, shape=(N, self.beta_dim))
             z = self.merge_latent(beta, w)
@@ -2396,7 +2421,9 @@ class GLMHMMLearn(GLMLearn):
     def sample_initial(self, key: PRNGKey, params, N: int, d: int=1):
         '''Sample from the initial distribution p(z_0)'''
         state = jax.random.choice(key, 2, shape=(N,), p=self.construct_pi0(params))
-        w = super().sample_initial(key, params=None, N=N, d=d)
+        # Avoid super().sample_initial(params=None): the parent dereferences
+        # params.w_0, but these subclasses' Params types don't define w_0.
+        w = jax.random.normal(key, shape=(N, d + 1))
         return self.merge_latent(state, w)
     
     def construct_A(self, params):
@@ -2679,7 +2706,9 @@ class HRL(GLMLearn):
         '''Sample from the initial distribution p(z_0)'''
         q0 = params.q0 + jnp.exp(params.log_sigma_0) * jax.random.normal(key, shape=(N,))
         option = jax.random.bernoulli(key, p=jax.nn.sigmoid(q0)).astype(int)
-        w = super().sample_initial(key, params=None, N=N, d=d)
+        # Avoid super().sample_initial(params=None): the parent dereferences
+        # params.w_0, but these subclasses' Params types don't define w_0.
+        w = jax.random.normal(key, shape=(N, d + 1))
         return self.merge_latent(option, q0, w)
 
     def bias_correction(self, z):
