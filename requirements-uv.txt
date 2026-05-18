@@ -1,0 +1,57 @@
+# Portable requirements for LearningRules + clickdv loader, CPU only.
+# Derived from requirements.txt with:
+#   - conda-build "@ file:///work/..." lines replaced with plain version specs
+#   - +cuda12 jaxlib suffix dropped (project forces JAX_PLATFORMS=cpu anyway)
+#   - nvidia-*-cu12 GPU runtime wheels dropped
+#   - mkl-* dropped (Intel-MKL specific, not needed for CPU jax)
+# Use with:  uv pip install -r requirements-uv.txt
+
+# --- core jax stack pinned to upstream versions ---
+jax==0.4.23
+jaxlib==0.4.23
+jaxopt==0.8.3
+jaxtyping==0.2.34
+optax==0.1.9
+chex==0.1.85
+ml-dtypes==0.3.2
+tensorflow-probability==0.23.0
+dm-tree==0.1.8
+toolz==0.12.1
+opt-einsum==3.3.0
+typeguard==2.13.3
+
+# --- scientific python ---
+numpy>=1.26,<2
+scipy==1.11.4
+pandas==2.1.4
+h5py==3.11.0
+tables                              # pytables, for read_hdf
+numba==0.60.0
+llvmlite==0.43.0
+numexpr
+Bottleneck
+
+# --- plotting ---
+matplotlib
+seaborn==0.13.2
+Pillow
+
+# --- IBL loader (used by ibl.py) ---
+ONE-api==2.9.1
+iblutil==1.12.1
+
+# --- jupyter / cli niceties ---
+ipykernel==6.29.5
+ipython==8.26.0
+tqdm==4.66.1
+psutil==5.9.8
+rich==13.8.1
+colorlog==6.8.2
+PyYAML==6.0.2
+
+# --- ML/eval ---
+scikit-learn==1.5.2
+joblib==1.4.2
+absl-py==2.1.0
+flatbuffers==24.3.25
+typing_extensions==4.9.0
